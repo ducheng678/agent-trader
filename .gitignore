@@ -1,0 +1,58 @@
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+!**/.env.example
+*~
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
+
+# Local agent and indexing state
+.agents/
+.codex
+.gitnexus/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# JavaScript
+**/node_modules/
+**/dist/
+**/.vite/
+
+# Runtime state, market data, and logs
+logs/
+data/
+downloads/
+runtime/
+web_trade/runtime/
+*.log
+*.jsonl
+*.pid
+*.sock
+
+# Temporary analysis and replay artifacts
+/tmp_*
+/tmp-*
+*.bak
+*.bad
+/Capture.JPG
+/*.xlsx
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
