@@ -1,0 +1,47 @@
+{
+  "profiles": {
+    "BRENTOIL": {
+      "name": "brent",
+      "timezone": "Europe/London",
+      "helper_reset_timezone": "America/New_York",
+      "helper_reset_time": "16:00",
+      "pre_disabled_weekday_reset_time": "06:00",
+      "low_liquidity_windows": [
+        "23:00-08:00"
+      ],
+      "low_liquidity_weekdays": [
+        "sat",
+        "sun"
+      ],
+      "low_liquidity_trade_disabled_weekdays": [],
+      "normal_liquidity_windows": [
+        "08:00-23:00"
+      ],
+      "reset_skip_weekdays": [],
+      "normal_liquidity_r_min_atr_multiple": 1.5,
+      "normal_liquidity_r_max_atr_multiple": 2.5,
+      "low_liquidity_r_min_atr_multiple": 2.5,
+      "low_liquidity_r_max_atr_multiple": 3.0,
+      "normal_liquidity_tp1_r_multiple": 1.0,
+      "normal_liquidity_tp2_r_multiple": 2.0,
+      "normal_liquidity_tp1_close_fraction": 0.3,
+      "normal_liquidity_tp2_close_fraction": 0.4,
+      "normal_liquidity_post_tp1_stop_r_multiple": -0.4,
+      "normal_liquidity_post_tp2_locked_r_multiple": 1.0,
+      "normal_liquidity_trailing_soft_atr_multiple": 2.5,
+      "normal_liquidity_trailing_hard_atr_multiple": 3.5,
+      "low_liquidity_tp1_r_multiple": 0.75,
+      "low_liquidity_tp2_r_multiple": 1.25,
+      "low_liquidity_tp1_close_fraction": 0.4,
+      "low_liquidity_tp2_close_fraction": 0.4,
+      "low_liquidity_post_tp1_stop_r_multiple": -0.4,
+      "low_liquidity_post_tp2_locked_r_multiple": 0.75,
+      "low_liquidity_trailing_soft_atr_multiple": 1.5,
+      "low_liquidity_trailing_hard_atr_multiple": 2.5,
+      "aliases": [
+        "BRENTOIL-USDC",
+        "xyz:BRENTOIL"
+      ]
+    }
+  }
+}
