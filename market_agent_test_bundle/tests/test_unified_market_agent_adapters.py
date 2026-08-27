@@ -1593,7 +1593,7 @@ def test_engine_passive_playbook_includes_helper_analysis_even_with_live_positio
     assert passive_payload["market_mainline_context"]["diagnostic_instruments"] == ["DXY"]
     assert passive_payload["trigger_event"]["headline"] == "ceasefire headline"
 
-def test_engine_adds_stable_prompt_cache_key_for_system_prompt(uma):
+def test_engine_adds_stable_prompt_cache_key_for_request_family(uma):
     captured = {}
 
     class FakeResponses:
@@ -1623,16 +1623,39 @@ def test_engine_adds_stable_prompt_cache_key_for_system_prompt(uma):
     request("shared system prompt", "first user payload")
     first_key = captured["prompt_cache_key"]
     assert captured["input"][0]["role"] == "system"
+    assert first_key == "market-agent-playbook-gpt-5-4"
 
     request("shared system prompt", "second user payload")
     assert captured["prompt_cache_key"] == first_key
 
     request("changed system prompt", "third user payload")
-    assert captured["prompt_cache_key"] != first_key
+    assert captured["prompt_cache_key"] == first_key
 
     engine.prompt_cache_enabled = False
     request("shared system prompt", "cache disabled")
     assert "prompt_cache_key" not in captured
+
+
+def test_playbook_system_prompt_keeps_variant_guidance_after_shared_prefix(uma):
+    engine = object.__new__(uma.DiscretionaryLLMEngine)
+    engine.execute_now_confidence_threshold = 0.65
+
+    active_prompt = engine._build_system_prompt("verified", "manual_request")
+    passive_prompt = engine._build_system_prompt("verified", "passive_event_trigger")
+    shared_prefix_length = next(
+        (
+            index
+            for index, (active_char, passive_char) in enumerate(
+                zip(active_prompt, passive_prompt)
+            )
+            if active_char != passive_char
+        ),
+        min(len(active_prompt), len(passive_prompt)),
+    )
+
+    assert shared_prefix_length > 2000
+    assert active_prompt.index("Think the probability") == shared_prefix_length
+    assert passive_prompt.index("When recent_events is not empty") == shared_prefix_length
 
 
 def test_langchain_runtime_forwards_prompt_cache_key(monkeypatch):

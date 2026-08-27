@@ -103,14 +103,17 @@ def build_prompt_cache_key(
     model: str,
     input_messages: List[Dict[str, Any]],
 ) -> str:
-    system_prompt = _system_prompt_text(input_messages)
-    if not system_prompt:
+    if not _system_prompt_text(input_messages):
         return ""
     safe_prefix = PROMPT_CACHE_KEY_COMPONENT_RE.sub("-", str(prefix or "").strip()).strip("-_") or "market-agent"
     safe_phase = PROMPT_CACHE_KEY_COMPONENT_RE.sub("-", str(phase or "").strip()).strip("-_") or "request"
-    digest_input = "\x1f".join((str(model or ""), str(phase or ""), system_prompt))
-    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
-    return f"{safe_prefix}-{safe_phase}-{digest}"[:PROMPT_CACHE_KEY_MAX_LENGTH].rstrip("-_")
+    safe_model = PROMPT_CACHE_KEY_COMPONENT_RE.sub("-", str(model or "").strip()).strip("-_") or "model"
+    cache_key = f"{safe_prefix}-{safe_phase}-{safe_model}"
+    if len(cache_key) <= PROMPT_CACHE_KEY_MAX_LENGTH:
+        return cache_key
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
+    max_prefix_length = PROMPT_CACHE_KEY_MAX_LENGTH - len(digest) - 1
+    return f"{cache_key[:max_prefix_length].rstrip('-_')}-{digest}"
 
 
 RELATION_ENTITY_RE = re.compile(r"\b(?:U\.S\.|US|[A-Z][A-Za-z]+)[-.–—](?:[A-Z][A-Za-z]+|[A-Z]{2,})\b")
@@ -2179,7 +2182,6 @@ class DiscretionaryLLMEngine:
             "Foremost, do not chase strength or weakness! Avoid buying after an already extended rise or shorting after an already extended drop unless the entry and execution logic are still clearly coherent. "
             "entry_plan is the only market-intent plan you should design from a flat baseline. Focus on market direction, entry, stop-loss, and execution logic. "
             "Use only long, short, or no_trade in entry_plan.action_decision. Every entry_decision long/short action must include entry_price and stop_loss_price. "
-            f"{trigger_guidance}"
             "chart_summaries may include local candle-derived summaries aligned with supplied chart screenshots. Treat chart_summaries as the source of truth for price/technical analysis. "
             f"{chart_image_guidance}"
             "Set scenario.observe_when_all.low and scenario.observe_when_all.high as a single observation zone. Observation starts only when price trades inside that low-high range. "
@@ -2189,6 +2191,7 @@ class DiscretionaryLLMEngine:
             "entry_price and execute_when_all.condition.level must stay logically coherent when level is used: for example, do not place a long entry_price materially below an upward execution trigger, and do not place a short entry_price materially above a downward execution trigger. "
             "For price_between or sustained_between, keep entry_price logically coherent with the low/high band instead of level. "
             "For practical market semantics such as holding above a level, losing a level, or failing on a retest, use sustained_* / cross_* with optional min_ratio and tolerance_bps when useful; do not interpret these ideas as requiring every sampled tick to be perfectly on one side unless you explicitly want a very strict rule. "
+            f"{trigger_guidance}"
             f"{verify}"
         )
 

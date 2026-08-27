@@ -58,7 +58,7 @@ flock
 
 Runtime configuration is read from `.env`.
 
-Prompt caching is enabled by default. The stable system prompt remains the first input item and every Responses request receives a deterministic cache key derived from the model, phase, and system prompt.
+Prompt caching is enabled by default. The stable system prompt remains the first input item, dynamic request context stays after it, and every Responses request receives a deterministic cache key derived from the model and request phase.
 
 ```env
 OPENAI_PROMPT_CACHE_ENABLED=true
