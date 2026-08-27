@@ -1592,3 +1592,79 @@ def test_engine_passive_playbook_includes_helper_analysis_even_with_live_positio
     )
     assert passive_payload["market_mainline_context"]["diagnostic_instruments"] == ["DXY"]
     assert passive_payload["trigger_event"]["headline"] == "ceasefire headline"
+
+def test_engine_adds_stable_prompt_cache_key_for_system_prompt(uma):
+    captured = {}
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            return SimpleNamespace(id="resp_prompt_cache")
+
+    engine = object.__new__(uma.DiscretionaryLLMEngine)
+    engine.client = SimpleNamespace(responses=FakeResponses())
+    engine.openai_max_attempts = 1
+    engine.openai_retry_delay_seconds = 0.0
+    engine.prompt_cache_enabled = True
+    engine.prompt_cache_key_prefix = "market-agent"
+
+    def request(system_prompt, user_prompt):
+        return engine._responses_create_with_retry(
+            phase="playbook",
+            timeout_seconds=1.0,
+            model="gpt-5.4",
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+            ],
+        )
+
+    request("shared system prompt", "first user payload")
+    first_key = captured["prompt_cache_key"]
+    assert captured["input"][0]["role"] == "system"
+
+    request("shared system prompt", "second user payload")
+    assert captured["prompt_cache_key"] == first_key
+
+    request("changed system prompt", "third user payload")
+    assert captured["prompt_cache_key"] != first_key
+
+    engine.prompt_cache_enabled = False
+    request("shared system prompt", "cache disabled")
+    assert "prompt_cache_key" not in captured
+
+
+def test_langchain_runtime_forwards_prompt_cache_key(monkeypatch):
+    from langchain import chat_models
+    from market_agent.langchain_runtime import LangChainResponsesRuntime
+
+    captured = {}
+
+    class FakeModel:
+        def invoke(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(
+                id="resp_prompt_cache",
+                content="{}",
+                content_blocks=[],
+                usage_metadata={},
+                response_metadata={},
+            )
+
+    monkeypatch.setattr(chat_models, "init_chat_model", lambda *args, **kwargs: FakeModel())
+
+    runtime = LangChainResponsesRuntime(api_key="test-key")
+    runtime.create(
+        timeout=1.0,
+        model="gpt-5.4",
+        input=[
+            {"role": "system", "content": [{"type": "input_text", "text": "shared system prompt"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "dynamic payload"}]},
+        ],
+        prompt_cache_key="market-agent-playbook-deadbeef",
+    )
+
+    assert captured["messages"][0].type == "system"
+    assert captured["kwargs"]["prompt_cache_key"] == "market-agent-playbook-deadbeef"

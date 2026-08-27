@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -67,6 +68,51 @@ BARE_URL_RE = re.compile(r"https?://\S+")
 DOMAIN_CITATION_PARENS_RE = re.compile(r"\s*\(([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?:/[^)]*)?\)")
 EMPTY_PARENS_RE = re.compile(r"\(\s*\)")
 WHITESPACE_RE = re.compile(r"\s+")
+
+PROMPT_CACHE_KEY_COMPONENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
+PROMPT_CACHE_KEY_MAX_LENGTH = 64
+
+
+def _system_prompt_text(input_messages: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for message in input_messages or []:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "") or "").strip().lower() not in {"system", "developer"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if content:
+                parts.append(content)
+            continue
+        for item in content or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type", "") or "").strip() not in {"input_text", "text"}:
+                continue
+            text = str(item.get("text", "") or "")
+            if text:
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def build_prompt_cache_key(
+    *,
+    prefix: str,
+    phase: str,
+    model: str,
+    input_messages: List[Dict[str, Any]],
+) -> str:
+    system_prompt = _system_prompt_text(input_messages)
+    if not system_prompt:
+        return ""
+    safe_prefix = PROMPT_CACHE_KEY_COMPONENT_RE.sub("-", str(prefix or "").strip()).strip("-_") or "market-agent"
+    safe_phase = PROMPT_CACHE_KEY_COMPONENT_RE.sub("-", str(phase or "").strip()).strip("-_") or "request"
+    digest_input = "\x1f".join((str(model or ""), str(phase or ""), system_prompt))
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
+    return f"{safe_prefix}-{safe_phase}-{digest}"[:PROMPT_CACHE_KEY_MAX_LENGTH].rstrip("-_")
+
+
 RELATION_ENTITY_RE = re.compile(r"\b(?:U\.S\.|US|[A-Z][A-Za-z]+)[-.–—](?:[A-Z][A-Za-z]+|[A-Z]{2,})\b")
 CAPITALIZED_ENTITY_RE = re.compile(
     r"\b(?:U\.S\.|US|[A-Z]{2,8}|[A-Z][A-Za-z0-9'’]*)"
@@ -311,6 +357,8 @@ class DiscretionaryLLMEngine:
         self.openai_retry_delay_seconds = max(0.0, float(os.getenv("OPENAI_RETRY_DELAY_SECONDS", "2") or 2.0))
         self.active_model = os.getenv("OPENAI_ACTIVE_MODEL", "gpt-5.4")
         self.passive_model = os.getenv("OPENAI_PASSIVE_MODEL", "gpt-5.4")
+        self.prompt_cache_enabled = str(os.getenv("OPENAI_PROMPT_CACHE_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+        self.prompt_cache_key_prefix = str(os.getenv("OPENAI_PROMPT_CACHE_KEY_PREFIX", "market-agent") or "market-agent").strip()
         self.symbol = ""
         self.default_search_mode = os.getenv("OPENAI_SEARCH_MODE", "context_only").lower()
         self.active_search_mode = os.getenv("OPENAI_ACTIVE_SEARCH_MODE", self.default_search_mode).lower()
@@ -396,7 +444,22 @@ class DiscretionaryLLMEngine:
         )
         return passive_timeout if trigger_reason == "passive_event_trigger" else active_timeout
 
+    def _build_prompt_cache_key(self, *, phase: str, create_kwargs: Dict[str, Any]) -> str:
+        if not bool(getattr(self, "prompt_cache_enabled", True)):
+            return ""
+        return build_prompt_cache_key(
+            prefix=str(getattr(self, "prompt_cache_key_prefix", "market-agent") or "market-agent"),
+            phase=phase,
+            model=str(create_kwargs.get("model", "") or ""),
+            input_messages=list(create_kwargs.get("input") or []),
+        )
+
     def _responses_create_with_retry(self, *, phase: str, timeout_seconds: Optional[float] = None, **create_kwargs) -> Any:
+        request_kwargs = dict(create_kwargs)
+        if not request_kwargs.get("prompt_cache_key"):
+            prompt_cache_key = self._build_prompt_cache_key(phase=phase, create_kwargs=request_kwargs)
+            if prompt_cache_key:
+                request_kwargs["prompt_cache_key"] = prompt_cache_key
         max_attempts = max(1, int(getattr(self, "openai_max_attempts", 3) or 3))
         timeout_seconds = max(1.0, float(timeout_seconds if timeout_seconds is not None else 180.0))
         retry_delay_seconds = max(0.0, float(getattr(self, "openai_retry_delay_seconds", 0.0) or 0.0))
@@ -408,8 +471,8 @@ class DiscretionaryLLMEngine:
             try:
                 def invoke_once():
                     if hasattr(self.client, "create"):
-                        return self.client.create(timeout=timeout_seconds, **create_kwargs)
-                    return self.client.responses.create(timeout=timeout_seconds, **create_kwargs)
+                        return self.client.create(timeout=timeout_seconds, **request_kwargs)
+                    return self.client.responses.create(timeout=timeout_seconds, **request_kwargs)
 
                 workflow = getattr(self, "llm_workflow", None)
                 response = workflow.run_single(invoke_once) if workflow is not None else invoke_once()

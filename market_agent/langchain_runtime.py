@@ -189,6 +189,9 @@ class LangChainResponsesRuntime:
                 invoke_kwargs["parallel_tool_calls"] = bool(
                     create_kwargs["parallel_tool_calls"]
                 )
+        prompt_cache_key = str(create_kwargs.get("prompt_cache_key") or "").strip()
+        if prompt_cache_key:
+            invoke_kwargs["prompt_cache_key"] = prompt_cache_key
         message = model.invoke(
             _to_langchain_messages(list(create_kwargs.get("input") or [])),
             **invoke_kwargs,

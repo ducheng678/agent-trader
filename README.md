@@ -58,6 +58,13 @@ flock
 
 Runtime configuration is read from `.env`.
 
+Prompt caching is enabled by default. The stable system prompt remains the first input item and every Responses request receives a deterministic cache key derived from the model, phase, and system prompt.
+
+```env
+OPENAI_PROMPT_CACHE_ENABLED=true
+OPENAI_PROMPT_CACHE_KEY_PREFIX=market-agent
+```
+
 Important proxy keys:
 
 ```env
