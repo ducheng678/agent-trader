@@ -203,3 +203,15 @@ pytest -q \
   market_agent_test_bundle/tests/test_unified_market_agent_replay.py \
   market_agent_test_bundle/tests/test_unified_market_agent_passive_irrelevant_openai.py
 ```
+
+## Production Backend
+
+The agent runtime is decomposed into named modules for runtime, model routing, tool calling, prompt/context engineering, memory/state, RAG, and structured output. A FastAPI production backend adds authenticated asynchronous task submission, idempotency, SQLite WAL task/event persistence, a bounded TTL cache, retrying workers, a message-bus boundary, structured logs, health checks, and Prometheus metrics.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for module ownership, API contracts, configuration, and deployment replacement points.
+
+Run locally after installing the root requirements:
+
+```bash
+MARKET_AGENT_API_TOKEN=local-token python -m market_agent.backend
+```

@@ -16,6 +16,10 @@ langgraph==1.2.11
 hyperliquid-python-sdk==0.23.0
 eth-account==0.13.7
 
+# Production API and runtime
+fastapi==0.124.2
+uvicorn[standard]==0.38.0
+
 # Chart rendering
 matplotlib==3.10.9
 pillow==12.1.1
