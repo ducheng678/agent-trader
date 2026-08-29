@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,9 +34,12 @@ class BackendSettings:
     cache_max_entries: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_CACHE_MAX_ENTRIES", 1024))
     cache_default_ttl_seconds: float = field(default_factory=lambda: _float_value("MARKET_AGENT_CACHE_TTL_SECONDS", 60.0))
     task_workers: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TASK_WORKERS", 4))
+    task_queue_capacity: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TASK_QUEUE_CAPACITY", 128))
     task_max_attempts: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TASK_MAX_ATTEMPTS", 3))
     task_retry_delay_seconds: float = field(default_factory=lambda: _float_value("MARKET_AGENT_TASK_RETRY_DELAY_SECONDS", 1.0))
     api_token: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_API_TOKEN"))
+    api_host: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_API_HOST", "127.0.0.1"))
+    api_port: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_API_PORT", 8080))
     environment: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_ENVIRONMENT", "development").lower())
 
     @classmethod
@@ -45,14 +49,25 @@ class BackendSettings:
     def validate(self) -> "BackendSettings":
         if self.cache_max_entries < 1:
             raise ConfigurationError("cache_max_entries must be at least 1")
-        if self.cache_default_ttl_seconds <= 0:
-            raise ConfigurationError("cache_default_ttl_seconds must be positive")
+        if not math.isfinite(self.cache_default_ttl_seconds) or self.cache_default_ttl_seconds <= 0:
+            raise ConfigurationError("cache_default_ttl_seconds must be finite and positive")
         if self.task_workers < 1:
             raise ConfigurationError("task_workers must be at least 1")
+        if self.task_queue_capacity < 0:
+            raise ConfigurationError("task_queue_capacity cannot be negative")
+        if self.task_workers + self.task_queue_capacity > 9999:
+            raise ConfigurationError("combined task worker and queue capacity cannot exceed 9999")
         if self.task_max_attempts < 1:
             raise ConfigurationError("task_max_attempts must be at least 1")
-        if self.task_retry_delay_seconds < 0:
-            raise ConfigurationError("task_retry_delay_seconds cannot be negative")
-        if self.environment in {"production", "prod", "staging"} and not self.api_token:
-            raise ConfigurationError("MARKET_AGENT_API_TOKEN is required outside local development")
+        if not math.isfinite(self.task_retry_delay_seconds) or self.task_retry_delay_seconds < 0:
+            raise ConfigurationError("task_retry_delay_seconds must be finite and non-negative")
+        if not 1 <= self.api_port <= 65535:
+            raise ConfigurationError("api_port must be between 1 and 65535")
+        normalized_host = str(self.api_host).strip().lower()
+        if not normalized_host or normalized_host != str(self.api_host).lower():
+            raise ConfigurationError("api_host must be non-empty and cannot contain surrounding whitespace")
+        local_hosts = {"127.0.0.1", "localhost", "::1"}
+        environment = str(self.environment).strip().lower()
+        if (environment in {"production", "prod", "staging"} or normalized_host not in local_hosts) and not str(self.api_token).strip():
+            raise ConfigurationError("MARKET_AGENT_API_TOKEN is required outside local-only development")
         return self

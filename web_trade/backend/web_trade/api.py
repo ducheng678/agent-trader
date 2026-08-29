@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -63,8 +65,22 @@ def _bad_request(exc: ValueError) -> HTTPException:
 
 
 def create_app(service: WebTradeService | Any | None = None) -> FastAPI:
-    app = FastAPI(title="Private Hyperliquid Trade Web", version="0.1.0")
-    trade_service = service if service is not None else WebTradeService()
+    trade_service = service
+    service_lock = RLock()
+
+    def get_trade_service() -> Any:
+        nonlocal trade_service
+        with service_lock:
+            if trade_service is None:
+                trade_service = WebTradeService()
+            return trade_service
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        get_trade_service()
+        yield
+
+    app = FastAPI(title="Private Hyperliquid Trade Web", version="0.1.0", lifespan=lifespan)
 
     @app.get("/api/health")
     def health() -> Dict[str, str]:
@@ -72,15 +88,15 @@ def create_app(service: WebTradeService | Any | None = None) -> FastAPI:
 
     @app.get("/api/session", dependencies=[Depends(_require_token)])
     def session() -> Dict[str, Any]:
-        return _public_session(trade_service.session())
+        return _public_session(get_trade_service().session())
 
     @app.get("/api/markets", dependencies=[Depends(_require_token)])
     def markets() -> Any:
-        return trade_service.markets()
+        return get_trade_service().markets()
 
     @app.get("/api/account", dependencies=[Depends(_require_token)])
     def account() -> Any:
-        payload = trade_service.account()
+        payload = get_trade_service().account()
         if isinstance(payload, dict):
             payload = dict(payload)
             payload["account_address"] = None
@@ -88,7 +104,7 @@ def create_app(service: WebTradeService | Any | None = None) -> FastAPI:
 
     @app.get("/api/account/history", dependencies=[Depends(_require_token)])
     def account_history(window_days: int = 90) -> Any:
-        payload = trade_service.account_history(window_days=window_days)
+        payload = get_trade_service().account_history(window_days=window_days)
         if isinstance(payload, dict):
             payload = dict(payload)
             payload.pop("account_address", None)
@@ -96,11 +112,11 @@ def create_app(service: WebTradeService | Any | None = None) -> FastAPI:
 
     @app.get("/api/market/{symbol}/snapshot", dependencies=[Depends(_require_token)])
     def market_snapshot(symbol: str, interval: str = "1m", window_seconds: int = 3600) -> Any:
-        return trade_service.market_snapshot(symbol, interval=interval, window_seconds=window_seconds)
+        return get_trade_service().market_snapshot(symbol, interval=interval, window_seconds=window_seconds)
 
     @app.get("/api/market/{symbol}/book", dependencies=[Depends(_require_token)])
     def market_book(symbol: str) -> Any:
-        return trade_service.market_book(symbol)
+        return get_trade_service().market_book(symbol)
 
     @app.get("/api/market/{symbol}/bars", dependencies=[Depends(_require_token)])
     def market_bars(
@@ -111,7 +127,7 @@ def create_app(service: WebTradeService | Any | None = None) -> FastAPI:
         count_back: Optional[int] = None,
     ) -> Any:
         try:
-            return trade_service.market_bars(
+            return get_trade_service().market_bars(
                 symbol,
                 resolution=resolution,
                 from_s=from_s,
@@ -123,30 +139,30 @@ def create_app(service: WebTradeService | Any | None = None) -> FastAPI:
 
     @app.get("/api/favorites/markets", dependencies=[Depends(_require_token)])
     def favorite_markets() -> Any:
-        return trade_service.favorite_markets()
+        return get_trade_service().favorite_markets()
 
     @app.put("/api/favorites/markets", dependencies=[Depends(_require_token)])
     def update_favorite_markets(request: FavoritesRequest) -> Any:
-        return trade_service.update_favorite_markets(request.symbols)
+        return get_trade_service().update_favorite_markets(request.symbols)
 
     @app.get("/api/positions/{symbol}/margin-limits", dependencies=[Depends(_require_token)])
     def margin_limits(symbol: str, safety_buffer_usd: Optional[float] = None) -> Any:
         try:
-            return trade_service.margin_limits(symbol, safety_buffer_usd=safety_buffer_usd)
+            return get_trade_service().margin_limits(symbol, safety_buffer_usd=safety_buffer_usd)
         except ValueError as exc:
             raise _bad_request(exc) from exc
 
     @app.post("/api/positions/{symbol}/leverage", dependencies=[Depends(_require_token)])
     def rebalance_leverage(symbol: str, request: LeverageRequest) -> Any:
         try:
-            return trade_service.rebalance_leverage(symbol, request.leverage)
+            return get_trade_service().rebalance_leverage(symbol, request.leverage)
         except ValueError as exc:
             raise _bad_request(exc) from exc
 
     @app.post("/api/positions/{symbol}/margin", dependencies=[Depends(_require_token)])
     def update_margin(symbol: str, request: MarginRequest) -> Any:
         try:
-            return trade_service.update_isolated_margin(
+            return get_trade_service().update_isolated_margin(
                 symbol,
                 request.direction,
                 request.amount_usd,
@@ -158,7 +174,7 @@ def create_app(service: WebTradeService | Any | None = None) -> FastAPI:
     @app.post("/api/positions/{symbol}/tpsl", dependencies=[Depends(_require_token)])
     def set_position_tpsl(symbol: str, request: TpslRequest) -> Any:
         try:
-            return trade_service.set_position_tpsl(
+            return get_trade_service().set_position_tpsl(
                 symbol=symbol,
                 take_profit_price=request.take_profit_price,
                 stop_loss_price=request.stop_loss_price,
@@ -169,7 +185,7 @@ def create_app(service: WebTradeService | Any | None = None) -> FastAPI:
     @app.post("/api/orders", dependencies=[Depends(_require_token)])
     def place_order(request: OrderRequest) -> Any:
         try:
-            return trade_service.place_order(
+            return get_trade_service().place_order(
                 symbol=request.symbol,
                 order_type=request.order_type,
                 side=request.side,

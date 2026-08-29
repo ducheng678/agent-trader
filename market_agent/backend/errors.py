@@ -6,6 +6,7 @@ from typing import Any
 class BackendError(Exception):
     status_code = 500
     error_code = "backend_error"
+    retryable = False
 
     def __init__(self, message: str, details: dict[str, Any] | None = None):
         super().__init__(message)
@@ -41,6 +42,18 @@ class AuthenticationError(BackendError):
 class DependencyUnavailableError(BackendError):
     status_code = 503
     error_code = "dependency_unavailable"
+    retryable = True
+
+
+class RetryableTaskError(BackendError):
+    status_code = 503
+    error_code = "retryable_task_error"
+    retryable = True
+
+
+class TaskQueueFullError(BackendError):
+    status_code = 429
+    error_code = "task_queue_full"
 
 
 class UnknownTaskError(NotFoundError):

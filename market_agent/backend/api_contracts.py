@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
+
+NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+IdempotencyKey = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)]
 
 
 class ApiModel(BaseModel):
@@ -11,7 +14,19 @@ class ApiModel(BaseModel):
 
 class TaskSubmissionRequest(ApiModel):
     payload: dict[str, Any] = Field(default_factory=dict)
-    idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
+    idempotency_key: IdempotencyKey | None = None
+
+
+class GeneratePlaybookPayload(ApiModel):
+    user_query: NonEmptyText
+    event_tape: list[dict[str, Any]]
+    trigger_reason: NonEmptyText
+    trigger_event: dict[str, Any] | None = None
+    recent_events: list[dict[str, Any]] | None = None
+    trade_symbol_context: dict[str, Any] | None = None
+    active_symbol: str | None = None
+    has_live_position: StrictBool = False
+    prefetched_passive_event_judge: dict[str, Any] | None = None
 
 
 class TaskAcceptedResponse(ApiModel):

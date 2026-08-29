@@ -7,8 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, Mapping, Optional
 
-import fcntl
-
+from .file_locking import exclusive_file_lock
 from .models import HedgeCycleState
 
 
@@ -92,15 +91,10 @@ class CycleStateStore:
 
     @contextmanager
     def transaction(self) -> Iterator[CycleTransaction]:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+", encoding="utf-8") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        with exclusive_file_lock(self.lock_path):
             transaction = CycleTransaction(self._read_unlocked(), self._write_unlocked)
-            try:
-                yield transaction
-                transaction.flush()
-            finally:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            yield transaction
+            transaction.flush()
 
     def load_all(self) -> Dict[str, HedgeCycleState]:
         with self.transaction() as transaction:

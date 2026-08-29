@@ -20,7 +20,7 @@
 | Configuration | `market_agent/backend/settings.py` | Validates environment-driven runtime settings. |
 | Durable state | `market_agent/backend/database.py` | SQLite WAL job/event repository with idempotency protection. |
 | Cache | `market_agent/backend/cache.py` | Thread-safe bounded TTL/LRU cache behind a cache interface. |
-| Async work | `market_agent/backend/task_queue.py` | Bounded worker pool, retries, task state transitions, and event publication. |
+| Async work | `market_agent/backend/task_queue.py` | Bounded admission queue and worker pool, classified retries, task state transitions, and event publication. |
 | Message queue boundary | `market_agent/backend/message_bus.py` | Typed event envelope and swappable message-bus interface. |
 | Logging and monitoring | `market_agent/backend/observability.py` | JSON logs, request correlation, Prometheus text metrics, and timings. |
 | Error boundary | `market_agent/backend/errors.py` | Typed domain errors mapped to consistent API responses. |
@@ -37,7 +37,7 @@
 | `GET` | `/v1/tasks/{job_id}/events` | Fetch the task audit/event stream. |
 | `GET` | `/metrics` | Prometheus-compatible operational metrics. |
 
-Authenticated endpoints use `Authorization: Bearer <MARKET_AGENT_API_TOKEN>`. The token is required in production and staging. Send `Idempotency-Key` or `idempotency_key` in the JSON request body when a caller may retry a submission.
+Authenticated endpoints use `Authorization: Bearer <MARKET_AGENT_API_TOKEN>`. The token is required in production, staging, and whenever the API binds to a non-loopback host. Send `Idempotency-Key` or `idempotency_key` in the JSON request body when a caller may retry a submission. If both locations are present, their normalized values must match. A matching replay returns the original job even while new submissions are being rejected by backpressure.
 
 The initial registered task is `generate_playbook`. It accepts the existing LLM runtime inputs (`user_query`, `event_tape`, `trigger_reason`, and the optional context fields), then returns the existing validated playbook and report. It does not place an order or enable live trading.
 
@@ -48,10 +48,10 @@ pip install -r requirements.txt
 MARKET_AGENT_API_TOKEN=local-token python -m market_agent.backend
 ```
 
-Use `MARKET_AGENT_ENVIRONMENT=production` together with a non-empty `MARKET_AGENT_API_TOKEN` for production settings validation. The default durable store is `runtime/market_agent_backend.sqlite3`; SQLite WAL, a busy timeout, and short write transactions make it a sensible single-node baseline.
+Use `MARKET_AGENT_ENVIRONMENT=production` together with a non-empty `MARKET_AGENT_API_TOKEN` for production settings validation. `MARKET_AGENT_API_HOST` and `MARKET_AGENT_API_PORT` control the listener. `MARKET_AGENT_TASK_WORKERS` controls worker concurrency and `MARKET_AGENT_TASK_QUEUE_CAPACITY` bounds waiting work; their combined in-memory capacity cannot exceed 9999. The default durable store is `runtime/market_agent_backend.sqlite3`; SQLite WAL, a busy timeout, and short write transactions make it a sensible single-process, single-node baseline.
 
 ## Scaling Boundaries
 
-The default implementation intentionally has no mandatory external service. `JobRepository`, `CacheBackend`, and `MessageBus` form replacement seams for PostgreSQL, Redis, and a durable external broker/worker system when horizontal scale or cross-process delivery is required. Keep the HTTP/API contracts and task names stable while replacing those adapters.
+The default implementation intentionally has no mandatory external service and must run with one application process. Do not start multiple Uvicorn workers against the built-in in-memory executor: recovery ownership is process-local. `JobRepository`, `CacheBackend`, and `MessageBus` form replacement seams for PostgreSQL, Redis, and a durable external broker/worker system when horizontal scale or cross-process delivery is required. Keep the HTTP/API contracts and task names stable while replacing those adapters.
 
-Operational signals include structured request/job-correlated logs, task and HTTP counters, duration summaries, cache gauges, durable task events, health probes, and `/metrics`. Task handlers are executed by a bounded worker pool with exponential retry backoff; errors are persisted and exposed as task state rather than being silently discarded. On startup/handler registration, unfinished durable tasks are recovered with at-least-once delivery semantics, so task handlers should remain idempotent.
+Operational signals include structured request/job-correlated logs, task and HTTP counters, duration summaries, cache gauges, durable task events, health probes, and `/metrics`. Task handlers are admitted through bounded backpressure. Only errors explicitly marked retryable, such as `RetryableTaskError` and dependency-unavailable errors, receive exponential retry backoff; validation and unclassified failures terminate after one attempt. Errors are persisted and exposed as task state rather than being silently discarded. On startup/handler registration, unfinished durable tasks are recovered with at-least-once delivery semantics, so task handlers should remain idempotent. Terminal task retention is operator-managed; the runtime does not delete task history automatically.

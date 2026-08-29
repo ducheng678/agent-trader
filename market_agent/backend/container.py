@@ -31,9 +31,11 @@ class BackendContainer:
         message_bus = InMemoryMessageBus()
         task_queue = BackgroundTaskQueue(
             repository=repository,
+            cache=cache,
             message_bus=message_bus,
             metrics=metrics,
             max_workers=resolved_settings.task_workers,
+            queue_capacity=resolved_settings.task_queue_capacity,
             default_max_attempts=resolved_settings.task_max_attempts,
             retry_delay_seconds=resolved_settings.task_retry_delay_seconds,
         )
@@ -45,18 +47,26 @@ class BackendContainer:
             metrics=metrics,
             task_queue=task_queue,
         )
-        from market_agent.backend.agent_service import register_agent_tasks
+        try:
+            from market_agent.backend.agent_service import register_agent_tasks
 
-        container.agent_service = register_agent_tasks(task_queue)
+            container.agent_service = register_agent_tasks(task_queue)
+        except BaseException:
+            container.shutdown()
+            raise
         return container
 
     def readiness(self) -> dict[str, str]:
-        database_status = "ok" if self.repository.healthcheck() else "failed"
+        try:
+            database_status = "ok" if self.repository.healthcheck() else "failed"
+        except Exception:
+            database_status = "failed"
         cache_stats = self.cache.stats()
         self.metrics.set_gauge("market_agent_cache_entries", cache_stats.size)
         self.metrics.set_gauge("market_agent_cache_hits_total", cache_stats.hits)
         self.metrics.set_gauge("market_agent_cache_misses_total", cache_stats.misses)
-        return {"database": database_status, "task_queue": "ok", "cache": "ok"}
+        task_queue_status = "ok" if self.task_queue.is_healthy() else "failed"
+        return {"database": database_status, "task_queue": task_queue_status, "cache": "ok"}
 
     def shutdown(self) -> None:
         self.task_queue.shutdown(wait=True)

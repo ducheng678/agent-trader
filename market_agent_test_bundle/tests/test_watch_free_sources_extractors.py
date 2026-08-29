@@ -1324,6 +1324,7 @@ def test_spglobal_pmi_watcher_poll_enriches_new_items_with_article_summary(monke
 
 
 def test_nyt_watcher_poll_preserves_feed_summary(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRADE_SYMBOLS", "BRENTOIL")
     watcher = NytWatcher("nyt_test", "https://www.nytimes.com/section/business")
     monkeypatch.setattr(
         watcher,

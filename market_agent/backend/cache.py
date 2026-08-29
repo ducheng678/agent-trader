@@ -68,6 +68,7 @@ class TTLCache:
             return
         normalized_key = str(key)
         with self._lock:
+            self._purge_expired()
             self._entries[normalized_key] = _CacheEntry(value=value, expires_at=time.monotonic() + lifetime)
             self._entries.move_to_end(normalized_key)
             while len(self._entries) > self._max_entries:

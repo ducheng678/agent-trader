@@ -97,7 +97,11 @@ class MetricsRegistry:
     def _render_labels(labels: tuple[tuple[str, str], ...]) -> str:
         if not labels:
             return ""
-        encoded = ",".join(f'{key}="{value.replace(chr(34), chr(92) + chr(34))}"' for key, value in labels)
+
+        def escape(value: str) -> str:
+            return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+        encoded = ",".join(f'{key}="{escape(value)}"' for key, value in labels)
         return "{" + encoded + "}"
 
     def render_prometheus(self) -> str:

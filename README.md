@@ -206,7 +206,7 @@ pytest -q \
 
 ## Production Backend
 
-The agent runtime is decomposed into named modules for runtime, model routing, tool calling, prompt/context engineering, memory/state, RAG, and structured output. A FastAPI production backend adds authenticated asynchronous task submission, idempotency, SQLite WAL task/event persistence, a bounded TTL cache, retrying workers, a message-bus boundary, structured logs, health checks, and Prometheus metrics.
+The agent runtime is decomposed into named modules for runtime, model routing, tool calling, prompt/context engineering, memory/state, RAG, and structured output. A FastAPI production backend adds authenticated asynchronous task submission, idempotency, SQLite WAL task/event persistence, a bounded TTL cache, bounded task admission, classified retries, a message-bus boundary, structured logs, health checks, and Prometheus metrics. The built-in executor is a single-process baseline; horizontal deployment requires the documented external database, cache, and broker adapters.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module ownership, API contracts, configuration, and deployment replacement points.
 

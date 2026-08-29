@@ -5,12 +5,13 @@ import json
 import sqlite3
 import threading
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from market_agent.backend.errors import IdempotencyConflictError
+from market_agent.backend.errors import IdempotencyConflictError, ValidationError
 
 T = TypeVar("T")
 
@@ -29,6 +30,17 @@ def _json_load(value: str | None) -> Any:
 
 def _payload_fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_json_dump(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _normalize_idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValidationError("idempotency key cannot be blank")
+    if len(normalized) > 256:
+        raise ValidationError("idempotency key cannot exceed 256 characters")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -112,13 +124,17 @@ class JobRepository:
             check_same_thread=False,
             uri=self._uses_uri,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 10000")
-        if not self._uses_uri:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = NORMAL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            if not self._uses_uri:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = NORMAL")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     def _initialize(self) -> None:
         connection = self._connect()
@@ -186,13 +202,18 @@ class JobRepository:
     def _transaction(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         with self._lock:
             connection = self._connect()
+            transaction_started = False
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                transaction_started = True
                 result = operation(connection)
                 connection.execute("COMMIT")
+                transaction_started = False
                 return result
             except BaseException:
-                connection.execute("ROLLBACK")
+                if transaction_started:
+                    with suppress(sqlite3.Error):
+                        connection.execute("ROLLBACK")
                 raise
             finally:
                 connection.close()
@@ -212,6 +233,27 @@ class JobRepository:
                 {"job_id": existing.job_id},
             )
 
+    def find_idempotent_job(
+        self,
+        task_name: str,
+        payload: dict[str, Any],
+        idempotency_key: str | None,
+    ) -> JobRecord | None:
+        normalized_key = _normalize_idempotency_key(idempotency_key)
+        if normalized_key is None:
+            return None
+        fingerprint = _payload_fingerprint(dict(payload or {}))
+        connection = self._connect()
+        try:
+            row = connection.execute("SELECT * FROM jobs WHERE idempotency_key = ?", (normalized_key,)).fetchone()
+            if row is None:
+                return None
+            existing = self._to_job(row)
+            self._validate_existing_job(existing, str(task_name), fingerprint)
+            return existing
+        finally:
+            connection.close()
+
     def create_or_get_job(
         self,
         task_name: str,
@@ -221,7 +263,7 @@ class JobRepository:
         request_id: str,
     ) -> tuple[JobRecord, bool]:
         normalized_payload = dict(payload or {})
-        normalized_key = str(idempotency_key).strip() if idempotency_key else None
+        normalized_key = _normalize_idempotency_key(idempotency_key)
         fingerprint = _payload_fingerprint(normalized_payload)
 
         def operation(connection: sqlite3.Connection) -> tuple[JobRecord, bool]:

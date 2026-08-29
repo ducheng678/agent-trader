@@ -175,3 +175,19 @@ def test_api_exposes_file_backed_favorites_routes(monkeypatch):
     assert before.json()[0]["symbol"] == "BTC"
     assert after.status_code == 200
     assert after.json() == [{"symbol": "BTC", "display_name": "BTC-USDC"}]
+
+
+def test_create_app_defers_default_service_initialization(monkeypatch):
+    from web_trade.backend.web_trade import api as api_module
+
+    calls = {"count": 0}
+
+    class FailingService:
+        def __init__(self):
+            calls["count"] += 1
+            raise RuntimeError("service initialized")
+
+    monkeypatch.setattr(api_module, "WebTradeService", FailingService)
+    application = api_module.create_app()
+    assert application.title == "Private Hyperliquid Trade Web"
+    assert calls["count"] == 0

@@ -51,6 +51,13 @@ class InMemoryMessageBus:
 
     def publish(self, message: MessageEnvelope) -> None:
         with self._lock:
-            subscribers = tuple(self._handlers.get(message.topic, ())) + tuple(self._handlers.get("*", ()))
+            wildcard = () if message.topic == "*" else tuple(self._handlers.get("*", ()))
+            subscribers = tuple(self._handlers.get(message.topic, ())) + wildcard
+        failures: list[Exception] = []
         for handler in subscribers:
-            handler(message)
+            try:
+                handler(message)
+            except Exception as exc:
+                failures.append(exc)
+        if failures:
+            raise RuntimeError(f"{len(failures)} message subscriber(s) failed") from failures[0]

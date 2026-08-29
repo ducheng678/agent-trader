@@ -8,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -59,7 +59,7 @@ class Event:
     attachments: list[dict[str, Any]] = field(default_factory=list)
     local_files: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
-    seen_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    seen_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
 
 
 class StateStore:

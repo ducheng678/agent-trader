@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable
+from threading import RLock
 from typing import Any
 
+from pydantic import ValidationError as PydanticValidationError
+
+from market_agent.backend.api_contracts import GeneratePlaybookPayload
 from market_agent.backend.errors import ValidationError
 from market_agent.backend.task_queue import BackgroundTaskQueue
 
@@ -11,41 +14,42 @@ from market_agent.backend.task_queue import BackgroundTaskQueue
 class AgentPlaybookService:
     def __init__(self, engine_factory: Callable[[], Any] | None = None) -> None:
         self._engine_factory = engine_factory
-        self._thread_local = threading.local()
+        self._engine: Any = None
+        self._engine_lock = RLock()
 
     def _get_engine(self) -> Any:
-        engine = getattr(self._thread_local, "engine", None)
-        if engine is None:
-            factory = self._engine_factory
-            if factory is None:
-                from market_agent.agent_runtime import DiscretionaryLLMEngine
+        with self._engine_lock:
+            if self._engine is None:
+                factory = self._engine_factory
+                if factory is None:
+                    from market_agent.agent_runtime import DiscretionaryLLMEngine
 
-                factory = DiscretionaryLLMEngine
-            engine = factory()
-            self._thread_local.engine = engine
-        return engine
+                    factory = DiscretionaryLLMEngine
+                self._engine = factory()
+            return self._engine
 
     def generate_playbook(self, payload: dict[str, Any]) -> dict[str, Any]:
-        required_fields = ("user_query", "event_tape", "trigger_reason")
-        missing = [field for field in required_fields if field not in payload]
-        if missing:
-            raise ValidationError("generate_playbook payload is missing required fields", {"missing": missing})
-        event_tape = payload["event_tape"]
-        if not isinstance(event_tape, list):
-            raise ValidationError("event_tape must be a list")
-        engine = self._get_engine()
-        playbook, report = engine.get_playbook(
-            user_query=str(payload["user_query"]),
-            event_tape=event_tape,
-            trigger_reason=str(payload["trigger_reason"]),
-            trigger_event=payload.get("trigger_event"),
-            recent_events=payload.get("recent_events"),
-            trade_symbol_context=payload.get("trade_symbol_context"),
-            active_symbol=payload.get("active_symbol"),
-            has_live_position=bool(payload.get("has_live_position", False)),
-            prefetched_passive_event_judge=payload.get("prefetched_passive_event_judge"),
-        )
-        return {"playbook": playbook.to_dict(), "report": report}
+        try:
+            request = GeneratePlaybookPayload.model_validate(payload)
+        except PydanticValidationError as exc:
+            raise ValidationError(
+                "generate_playbook payload is invalid",
+                {"errors": exc.errors(include_url=False, include_input=False)},
+            ) from exc
+        with self._engine_lock:
+            engine = self._get_engine()
+            playbook, report = engine.get_playbook(
+                user_query=request.user_query,
+                event_tape=request.event_tape,
+                trigger_reason=request.trigger_reason,
+                trigger_event=request.trigger_event,
+                recent_events=request.recent_events,
+                trade_symbol_context=request.trade_symbol_context,
+                active_symbol=request.active_symbol,
+                has_live_position=request.has_live_position,
+                prefetched_passive_event_judge=request.prefetched_passive_event_judge,
+            )
+            return {"playbook": playbook.to_dict(), "report": report}
 
 
 def register_agent_tasks(task_queue: BackgroundTaskQueue) -> AgentPlaybookService:
