@@ -138,6 +138,105 @@ State reducers are deterministic. Parallel specialist reports merge by task iden
 - `workflow_coordinator_agent.py`: bounded decomposition, scheduling, conflict resolution, rescheduling, and final summaries.
 - `workflow_context_summary.py`: source selection, typed summaries, completeness checks, and handoff hashes.
 - `workflow_audit.py`: append-only audit events, redaction, persistence, and trace queries.
+- `workflow_long_term_memory.py`: three-layer event, knowledge, and decision memory with governed promotion and retrieval.
+
+## Three-Layer Long-Term Memory
+
+Long-term memory follows a governed three-layer hierarchy:
+
+1. The event layer stores immutable raw material: normalized external events, market snapshots, source records, specialist reports, tool results, timestamps, provenance, hashes, and uncertainty. Corrections append a superseding record rather than rewriting history.
+2. The knowledge layer stores distilled reusable experience: validated patterns, operational rules, counterexamples, applicability constraints, confidence, evidence links, version, effective time, expiry, and invalidation reason. It contains no unsupported live market facts.
+3. The decision layer stores trading lessons: the accepted or rejected playbook, risk-gate reasons, evidence and knowledge versions used, execution outcome when available, post-decision evaluation, and the lesson learned from the buy, sell, wait, or no-trade result.
+
+Memory flows upward only through a governed promotion pipeline. Agents may propose an event normalization, knowledge candidate, or decision lesson, but they cannot mutate durable memory directly. The coordinator validates the proposal, deterministic policy checks provenance, minimum evidence, schema, duplication, contradictions, and retention rules, and the memory repository performs the append-only write. Knowledge promotion normally requires multiple supporting event records or one explicitly authoritative source plus outcome validation. Decision lessons remain provisional until an outcome or review closes them.
+
+Retrieval is task-scoped. The coordinator searches decision lessons first for closely matching completed situations, then knowledge for reusable rules, then event records for supporting raw evidence. Results retain memory IDs, evidence IDs, timestamps, versions, confidence, and staleness. Retrieved records pass through the context selector and `ContextSummary`; raw long-term memory is never forwarded wholesale to a specialist or inserted into the system prompt.
+
+Contradictory knowledge is not overwritten. The repository creates a conflict set, lowers effective confidence, and returns it to the coordinator for a bounded reconciliation task. Superseded or expired knowledge remains auditable but is excluded from normal retrieval. A memory result that is stale, weak, contradictory, or insufficient cannot justify a live trade and resolves to `不知道` or `no_trade`.
+
+Every memory read, candidate proposal, duplicate decision, promotion, rejection, conflict, supersession, expiry, and decision-outcome update is recorded in the full-chain audit trail. Memory payloads use the same secret redaction and tenant/scope boundaries as audit data. Retention, maximum rows, compaction, and archival are deterministic background policies; compaction never removes evidence required by an active knowledge or decision record.
+
+### Storage Architecture by Layer
+
+PostgreSQL is the production system of record for all three layers so promotion, evidence links, decision outcomes, and audit references can share transactions and enforced foreign keys. Layers use separate tables, indexes, retention rules, repository interfaces, and database roles; they do not share an untyped document bucket.
+
+The event layer uses append-only, time-partitioned PostgreSQL tables keyed by tenant/scope, event type, observed time, source ID, and content hash. JSONB stores bounded normalized attributes, while frequently filtered fields remain typed columns. Large source documents, chart images, response bodies, and binary tool artifacts live in S3-compatible object storage with immutable object version, URI, media type, byte length, checksum, encryption key reference, and retention class stored in the event row. Monthly partitions, BRIN indexes on time, B-tree indexes on source/symbol/hash, and duplicate uniqueness constraints support ingestion and replay. Hot partitions retain full normalized payloads; archival moves closed partitions and unreferenced objects according to policy without deleting evidence referenced by active knowledge or decisions.
+
+The knowledge layer uses versioned PostgreSQL relational tables for knowledge items, revisions, evidence links, counterexamples, conflicts, applicability constraints, approvals, supersession, and expiry. Search combines PostgreSQL full-text search with `pgvector` embeddings; exact aliases and deterministic token overlap remain available and take precedence for curated operational answers. Embeddings are derived data tied to the knowledge revision and embedding-model version, never the canonical text. HNSW or IVFFlat vector indexes are rebuilt by versioned background jobs, while B-tree indexes cover status, category, scope, version, effective time, and expiry. A knowledge revision cannot become active unless its cited event rows exist and promotion policy passes.
+
+The decision layer uses strongly typed PostgreSQL transaction tables for decision requests, accepted/rejected playbooks, risk-gate records, selected knowledge revisions, cited event records, execution references, outcome snapshots, review status, and final lessons. Foreign keys freeze the exact knowledge revisions and event IDs used at decision time. Unique workflow/decision IDs provide idempotency, and indexes cover symbol, action, decision time, outcome status, strategy version, and review state. Decisions are append-only by revision: outcome and lesson updates create linked records instead of overwriting the original rationale.
+
+Redis is an optional acceleration layer for exact seed answers, hot knowledge-query results, recent decision summaries, duplicate-suppression keys, and short-lived distributed locks. Every cache entry contains source revision/version and TTL; a cache miss or Redis outage falls back to the system of record. Redis never owns canonical memory and cannot authorize a trade.
+
+The message queue transports asynchronous memory work such as event normalization, knowledge-candidate generation, embedding creation, decision-outcome reconciliation, expiry review, and archival. Messages use an outbox table, idempotency key, schema version, retry/dead-letter policy, and trace ID. A queued message is not evidence of a completed memory write.
+
+Local development and tests use SQLite WAL behind the same repository interfaces. Event and decision layers use typed relational tables; knowledge uses versioned tables plus FTS5 when available and deterministic exact/token retrieval otherwise. Large artifacts use a configured local object directory containing content-addressed immutable files. SQLite mode does not pretend to provide production distributed locking or vector similarity; tests that require PostgreSQL, pgvector, Redis, or object storage are opt-in integration tests.
+
+Database roles are least-privilege: ingestion appends events, the promotion worker proposes and activates knowledge through stored repository operations, the decision service appends decisions/outcomes, and ordinary specialist agents receive no database credentials. Encryption in transit and at rest, tenant/scope predicates, bounded query limits, backup/restore drills, partition maintenance, object lifecycle, and migration versioning are mandatory production controls.
+
+### Governed Forgetting
+
+Forgetting is a policy-driven lifecycle, not an untracked delete. Every record has tenant/scope, retention class, created/effective/last-used times, reference count, legal-hold flag, lifecycle state, and policy version. The lifecycle is `active -> decayed -> superseded_or_expired -> archived -> tombstoned -> purged`. Each transition is idempotent and audited with the selected policy and affected evidence IDs.
+
+Event memory forgets primarily by age, importance, duplication, and reference reachability. Recommended defaults are configurable: duplicate/transient normalized events remain hot for 30 days; ordinary market events remain hot for 180 days and cold-archived for two years; source records required by active knowledge, an open decision, an unresolved outcome, audit policy, or legal hold are protected regardless of age. Large objects follow the event retention class and use object-store lifecycle rules. Content-addressed objects are deleted only when no protected row references the checksum.
+
+Knowledge memory forgets through time decay before deletion. Effective retrieval confidence is computed from base confidence, evidence freshness, contradiction state, observed outcome quality, and category-specific half-life. Suggested starting half-lives are 30 days for regime-specific knowledge, 180 days for market-behavior heuristics, and no automatic decay for curated operational/safety policy until a new version supersedes it. A record falling below the retrieval threshold becomes inactive, remains available for audit and conflict analysis, and is archived after a configurable grace period. Repeated validated use can refresh last-used time but cannot erase contradictory evidence or raise confidence without a new reviewed revision.
+
+Decision memory preserves the decision, evidence versions, risk result, execution/outcome, and lesson as one reachable chain. Open positions, incomplete outcomes, disputes, and lessons referenced by active knowledge are protected. Completed decisions default to a seven-year retention class for production deployments, configurable to jurisdiction and tenant policy; after expiry they may be anonymized into aggregate evaluation statistics before the identifiable chain is tombstoned. Anonymization is a governed transformation with its own source hash and audit event, not silent mutation.
+
+Capacity forgetting complements time retention. Each tenant/scope has byte and row budgets per layer. When a budget is approached, deterministic scoring prefers eviction of duplicate, low-confidence, stale, unreferenced, low-utility records while protecting authoritative evidence, counterexamples, rare failure modes, active conflicts, and records required for reproducibility. Cache eviction never changes durable-memory lifecycle state.
+
+A scheduled memory-lifecycle worker evaluates policies in bounded batches using an outbox/idempotency key, distributed lease, checkpoint cursor, maximum runtime, retry limit, and dead-letter queue. The default run is dry-run capable and emits counts/bytes by proposed transition before mutation. Purge requires expiry plus grace period, zero protected references, no legal hold, successful archive verification when archival is required, and a transactional tombstone. Physical purge covers PostgreSQL rows eligible for deletion, derived embeddings/search indexes, Redis keys, local files, object-store versions, and expired backup generations according to their independent retention schedules.
+
+Retrieval filters inactive/tombstoned records by default and reports when relevant memory was excluded as stale or conflicted. Forgetting cannot turn missing evidence into confidence: if required memory has expired or was purged, the coordinator records the gap and returns `不知道` or `no_trade`. Metrics cover active/decayed/archived/tombstoned rows, protected references, lifecycle lag, purge failures, dead-letter jobs, reclaimed bytes, and retrieval misses caused by expiry.
+
+Administrative restore, legal hold, tenant erasure, and policy change operations use authenticated service interfaces, two-person approval where configured, and full audit. A policy change never retroactively purges data in the same transaction; it first produces an impact report and then runs through the normal lifecycle worker.
+
+### Retrieval and Application Closed Loop
+
+Long-term memory retrieval and application follows four mandatory stages.
+
+Stage 1, receive the new task: the coordinator normalizes the user objective, immutable constraints, tenant/scope, locale, symbols, time horizon, task type, risk class, required evidence types, and maximum memory token budget. It creates a traceable `MemoryQuery` and checks the exact high-frequency seed cache first for safe informational intents. Live trading requests never terminate from a cached trading answer.
+
+Stage 2, vector retrieval: the memory service embeds the normalized task with the configured embedding model/version and performs filtered Top-K retrieval. It first searches completed decision lessons for comparable situations and active knowledge revisions for reusable experience; it follows their evidence links into the event layer when raw support is required. Filters enforce tenant/scope, symbol/market applicability, lifecycle state, effective/expiry time, knowledge version, legal visibility, and maximum staleness before similarity search. Recommended defaults are configurable `decision_k=5`, `knowledge_k=8`, and `event_evidence_k=12`.
+
+Vector similarity is a candidate generator rather than the acceptance rule. Hybrid ranking combines vector similarity, full-text or exact-alias match, evidence authority, confidence, freshness decay, outcome validation, applicability, contradiction penalty, diversity, and source coverage. Exact curated aliases outrank approximate matches. Near-duplicate candidates are collapsed by canonical hash. Results below the minimum final score are excluded, and conflicting high-ranked memories create a coordinator conflict instead of being averaged into false certainty.
+
+Stage 3, context injection: the selector builds a bounded `CoreExperienceSummary` rather than injecting raw retrieved rows. It contains the task-relevant lesson or rule, applicability and non-applicability conditions, supporting and contradicting evidence IDs, decision/knowledge revision IDs, confidence, freshness, conflict status, omitted-result counts, retrieval scores, and a deterministic hash. The summary is treated as untrusted data, appears only after the stable system prompt in dynamic user content, and is wrapped with an instruction that retrieved memory cannot override system, tool, schema, risk, or user constraints. Numeric facts, units, negation, timestamps, and provenance must survive summarization.
+
+The memory token budget is allocated deterministically across layers, with decision lessons and active knowledge receiving priority and event evidence retained for verification. When the budget is exceeded, diversity-aware compression keeps the strongest supporting item, strongest counterexample, and authoritative evidence before additional similar items. The audit store records the query hash, embedding version, filters, candidate IDs and scores, reranking factors, selected IDs, omissions, and injected-summary hash without storing secrets or private reasoning.
+
+Stage 4, execute and update: specialists execute only from the typed task plus `CoreExperienceSummary`. Their reports cite the memory/evidence IDs actually used and mark ignored or contradicted memory. The coordinator and deterministic risk gate produce the response. The workflow immediately appends new raw observations and reports to event memory and appends a provisional decision record. Execution results or later evaluation update the decision through linked outcome records. Only the governed promotion pipeline may convert validated outcomes into a knowledge revision or finalized decision lesson.
+
+The closed loop prevents self-reinforcing errors. Model output cannot be written back as validated knowledge merely because it retrieved and repeated an earlier model output. Promotion requires independent evidence or a verified outcome, excludes the candidate's own descendants from support counts, records negative outcomes and `no_trade` lessons, and checks for circular provenance. Retrieval effectiveness is measured using later outcomes, conflict rate, abstention accuracy, citation coverage, and stale-memory rejection; these metrics may propose ranking changes but cannot silently rewrite historical scores or memory content.
+
+If embedding generation or vector search fails, retrieval degrades to exact aliases, PostgreSQL full-text search, deterministic token overlap, then no memory. If memory is missing, stale, weak, or contradictory, the task continues only with independently supplied current evidence; otherwise the terminal answer is `不知道` or `no_trade`. No retrieval failure triggers invention.
+
+### Agent Capability and Permission Model
+
+Permissions are deny-by-default and enforced outside prompts. Each node receives a short-lived `CapabilityContext` containing workflow/task/tenant scope, permitted read views, permitted tools, allowed graph-state output keys, call/tool/cost limits, and expiry. Repository credentials, exchange credentials, unrestricted database handles, environment variables, and general tool registries are never placed in an agent context.
+
+An agent `write` means returning its strict result for one allowed invocation-state key. Specialists do not write durable storage. LangGraph reducers validate actor, task ID, schema, and destination key before accepting a result. Durable audit, cache, queue, object, database, and memory operations are performed only by deterministic services with separate service identities.
+
+| Actor | Read permissions | Allowed actions / graph writes | Explicit denials |
+| --- | --- | --- | --- |
+| coordinator agent | normalized request, policy catalog, budget snapshot, typed summaries, specialist reports, conflict bundle, audit health | create/revise bounded tasks, select permitted model policy, write coordinator plan/route/final summary, request approved services | no raw credentials, raw unrestricted memory, direct database/cache/queue writes, web/exchange calls, risk bypass, order mutation |
+| context selector/summarizer | task-scoped source records, permitted retrieved-memory records and provenance | write one `ContextSummary`/`CoreExperienceSummary` for the assigned task | no model tools by default, no memory promotion, no source mutation, no arbitrary conversation dump |
+| market-context agent | current task summary, bounded event inputs, allowed market scope | read-only `web_search` within query/tool caps; write `MarketContextResult` | no order/exchange tools, no memory/database/cache writes, no filesystem/network client outside registered search |
+| event-filter agent | trigger-event and recent-event summary, duplicate fingerprints | write `EventAssessment` | no tools, chart reads, direction/prices, durable writes |
+| fundamental agent | event/market/core-experience summaries and evidence references | write `FundamentalAnalysis` | no chart pixels, execution values, tools, durable writes |
+| technical agent | bounded chart text/images, market snapshot, core-experience summary | write direction-neutral `TechnicalAnalysis` | no web tools, event reinterpretation, final direction, durable writes |
+| decision-planner agent | validated fundamental/technical reports and bounded summaries | write `DecisionDraft` | no tools, size/leverage, execution, durable writes |
+| escalation-reviewer agent | conflict bundle, cited summaries, deterministic rule result | write `EscalationReview` | no new facts/tools, symbol changes, risk bypass, execution, durable writes |
+| deterministic risk gate | validated graph state and budget/audit health | write `RiskAssessment` only | no model/tool calls, no durable writes, no policy override |
+| playbook assembler | accepted state and exact normalization/cap policy | write final invocation result | no model/tools, no execution or durable memory writes |
+| memory promotion service | audited candidates, source events, outcomes, promotion policy | append event/knowledge/decision revisions through scoped repository operations | no arbitrary SQL, no model decision authority, no deletion or lifecycle override |
+| memory lifecycle worker | lifecycle metadata, references, legal holds, retention policy | archive/tombstone/purge only records selected by validated plan | no model calls, no active/protected record purge, no knowledge promotion, no decision changes |
+| audit writer | redacted typed audit event | append only | no update/delete and no unredacted secrets |
+
+Tool dispatch validates the capability at call time, not only task creation. Capability IDs are included in audit events; tokens themselves are never logged. A task reschedule receives a new capability and cannot reuse an expired or broader prior grant. Parallel agents receive isolated contexts.
+
+Static tests reject forbidden imports and direct client/repository calls. Runtime tests attempt unauthorized state keys, tools, tenant IDs, memory writes, SQL handles, and exchange operations and require a typed permission denial plus audit event. Permission failure is non-retryable at the same grant; the coordinator may only reschedule after deterministic policy issues a corrected narrower capability.
 
 ## Acceptance Criteria
 
@@ -150,3 +249,6 @@ State reducers are deterministic. Parallel specialist reports merge by task iden
 - Retry, timeout, attempt, and cost limits are enforced at both task and workflow scope.
 - Budget exhaustion reaches local knowledge and then `不知道` or `no_trade` without hallucinated content.
 - Final output includes evidence references, uncertainty, routing summary, and trace identifier without exposing private reasoning.
+- Long-term memory is separated into immutable event material, distilled knowledge, and outcome-linked decision lessons.
+- No agent writes durable memory directly; every promotion is coordinator-reviewed, policy-validated, source-linked, and audited.
+- Retrieval returns versioned, freshness-aware records that are summarized before specialist handoff.
