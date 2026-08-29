@@ -59,3 +59,4 @@ web_trade/runtime/
 .idea/
 .vscode/
 *.swp
+.worktrees/
