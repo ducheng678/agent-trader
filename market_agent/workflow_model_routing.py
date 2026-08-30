@@ -96,9 +96,9 @@ _POLICIES: Mapping[str, AgentExecutionPolicy] = MappingProxyType(
         "technical": _policy("technical", (TERRA, LUNA), 40, 105, 2, 3, 1400, "0.12", 0),
         "decision_planner": _policy("decision_planner", (TERRA, LUNA), 30, 85, 2, 3, 1100, "0.10", 0),
         "escalation": _policy("escalation", (SOL, TERRA, LUNA), 60, 155, 2, 4, 1400, "0.25", 0),
-        "fundamental_reflection": _policy("fundamental_reflection", (LUNA,), 20, 45, 1, 1, 400, "0.02", 0),
-        "technical_reflection": _policy("technical_reflection", (LUNA,), 20, 45, 1, 1, 400, "0.02", 0),
-        "decision_reflection": _policy("decision_reflection", (LUNA,), 20, 45, 1, 1, 400, "0.02", 0),
+        "reflect_decision": _policy("reflect_decision", (LUNA,), 20, 45, 1, 1, 400, "0.02", 0),
+        "reflect_escalation_if_used": _policy("reflect_escalation_if_used", (LUNA,), 20, 45, 1, 1, 400, "0.02", 0),
+        "reflect_coordinator_summary": _policy("reflect_coordinator_summary", (LUNA,), 20, 45, 1, 1, 400, "0.02", 0),
     }
 )
 

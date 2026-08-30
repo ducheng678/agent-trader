@@ -1,8 +1,9 @@
 import os
 import re
 from dataclasses import dataclass
-from decimal import Decimal
-from typing import Any, Dict, List, Literal, Optional
+from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
+from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from market_agent.constants import (
     DEFAULT_CHART_IMAGE_DETAIL,
@@ -44,20 +45,20 @@ class UsageTokens:
             raise ValueError("cached input tokens cannot exceed input tokens")
 
 
-WORKFLOW_MODEL_PRICING_USD_PER_1M: dict[str, dict[PricingBand, ModelPricing]] = {
-    "gpt-5.6-sol": {
+WORKFLOW_MODEL_PRICING_USD_PER_1M: Mapping[str, Mapping[PricingBand, ModelPricing]] = MappingProxyType({
+    "gpt-5.6-sol": MappingProxyType({
         "short": ModelPricing(Decimal("4.00"), Decimal("0.40"), Decimal("5.00"), Decimal("20.00")),
         "long": ModelPricing(Decimal("8.00"), Decimal("0.80"), Decimal("10.00"), Decimal("30.00")),
-    },
-    "gpt-5.6-terra": {
+    }),
+    "gpt-5.6-terra": MappingProxyType({
         "short": ModelPricing(Decimal("2.00"), Decimal("0.20"), Decimal("2.50"), Decimal("12.00")),
         "long": ModelPricing(Decimal("4.00"), Decimal("0.40"), Decimal("5.00"), Decimal("18.00")),
-    },
-    "gpt-5.6-luna": {
+    }),
+    "gpt-5.6-luna": MappingProxyType({
         "short": ModelPricing(Decimal("0.20"), Decimal("0.02"), Decimal("0.25"), Decimal("1.20")),
         "long": ModelPricing(Decimal("0.40"), Decimal("0.04"), Decimal("0.50"), Decimal("1.80")),
-    },
-}
+    }),
+})
 
 
 def workflow_model_pricing(model: str, band: PricingBand) -> ModelPricing:
@@ -78,10 +79,13 @@ def estimate_workflow_usage_cost(model: str, band: PricingBand, usage: UsageToke
         + Decimal(usage.cached_input_tokens) * pricing.cached_input
         + Decimal(usage.cache_write_tokens) * pricing.cache_write
         + Decimal(usage.output_tokens) * pricing.output
-    ) / Decimal(1_000_000) + Decimal(usage.web_search_tool_calls) * Decimal('10.00') / Decimal(1_000)
+    ) / Decimal(1_000_000) + Decimal(usage.web_search_tool_calls) * get_openai_web_search_tool_price_usd_per_1k_decimal() / Decimal(1_000)
 
 
 def get_openai_model_pricing(model: str) -> Optional[Dict[str, float]]:
+    model_key = str(model or "").strip().lower()
+    if not model_key or model_key in WORKFLOW_MODEL_PRICING_USD_PER_1M:
+        return None
     override_input = os.getenv("OPENAI_PRICE_INPUT_PER_1M_USD", "").strip()
     override_cached = os.getenv("OPENAI_PRICE_CACHED_INPUT_PER_1M_USD", "").strip()
     override_output = os.getenv("OPENAI_PRICE_OUTPUT_PER_1M_USD", "").strip()
@@ -90,17 +94,6 @@ def get_openai_model_pricing(model: str) -> Optional[Dict[str, float]]:
             "input": float(override_input),
             "cached_input": float(override_cached),
             "output": float(override_output),
-        }
-    model_key = str(model or "").strip().lower()
-    if not model_key:
-        return None
-    if model_key in WORKFLOW_MODEL_PRICING_USD_PER_1M:
-        pricing = workflow_model_pricing(model_key, 'short')
-        return {
-            'input': float(pricing.input),
-            'cached_input': float(pricing.cached_input),
-            'cache_write': float(pricing.cache_write),
-            'output': float(pricing.output),
         }
     if model_key in DEFAULT_OPENAI_MODEL_PRICING_USD_PER_1M:
         return dict(DEFAULT_OPENAI_MODEL_PRICING_USD_PER_1M[model_key])
@@ -113,11 +106,19 @@ def get_openai_model_pricing(model: str) -> Optional[Dict[str, float]]:
     return None
 
 
+def get_openai_web_search_tool_price_usd_per_1k_decimal() -> Decimal:
+    raw_price = os.getenv("OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD", str(DEFAULT_OPENAI_WEB_SEARCH_TOOL_PRICE_USD_PER_1K)).strip()
+    try:
+        price = Decimal(raw_price)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("web search tool price must be a non-negative finite decimal") from exc
+    if not price.is_finite() or price < 0:
+        raise ValueError("web search tool price must be a non-negative finite decimal")
+    return price
+
+
 def get_openai_web_search_tool_price_usd_per_1k() -> float:
-    return max(
-        0.0,
-        float(os.getenv("OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD", str(DEFAULT_OPENAI_WEB_SEARCH_TOOL_PRICE_USD_PER_1K))),
-    )
+    return float(get_openai_web_search_tool_price_usd_per_1k_decimal())
 
 
 def _response_attr(value: Any, key: str, default: Any = None) -> Any:
