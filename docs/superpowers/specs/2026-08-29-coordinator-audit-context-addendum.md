@@ -72,6 +72,7 @@ Every workflow transition writes an append-only audit event. Required event cate
 - tool call requested, allowed, completed, or denied;
 - structured output validation result;
 - retry, timeout, cancellation, and cost reservation or settlement;
+- exponential-backoff ceiling, full-jitter/server delay, scheduled/actual wait, and circuit-breaker state/probe/rejection/recovery;
 - local knowledge lookup and evidence selected;
 - fallback tier entered and unknown returned;
 - specialist conflict detected and coordinator resolution selected;

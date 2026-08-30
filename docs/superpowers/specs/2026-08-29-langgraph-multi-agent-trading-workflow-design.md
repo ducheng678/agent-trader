@@ -254,7 +254,7 @@ def run(
 ) -> AgentRunResult: ...
 ```
 
-`AgentExecutionPolicy` contains the ordered model tiers, effort per tier, per-attempt timeout, node timeout, maximum attempts per tier, maximum total attempts, maximum output tokens, node cost cap, tool-call cap, retryable error classes, and backoff base/cap.
+`AgentExecutionPolicy` contains the ordered model tiers, effort per tier, per-attempt timeout, node timeout, maximum attempts per tier, maximum total attempts, maximum output tokens, node cost cap, tool-call cap, retryable error classes, exponential-backoff base/cap, jitter mode, and circuit-breaker policy.
 
 Defaults:
 
@@ -273,7 +273,11 @@ Active workflows have a 300-second and $0.75 cap. Passive workflows have a 130-s
 
 Retryable failures are request timeout, connection failure, HTTP 408/409/429/5xx, empty response, and strict-schema parse failure. Auth, permission, invalid request, refusal, deterministic rule failure, knowledge insufficiency, and budget exhaustion are not retried.
 
-Backoff uses full jitter with an exponential cap and is clamped to remaining node/workflow time. No retry or fallback starts unless its minimum timeout and conservative cost reservation fit.
+Backoff uses capped exponential full jitter: for retry number `n`, the random source selects uniformly from `[0, min(backoff_cap, backoff_base * 2 ** (n - 1))]`. A valid server `Retry-After` is a lower bound, so the scheduled delay is the greater of it and the jittered delay. If that delay plus the minimum next-attempt timeout does not fit the remaining node/workflow deadline, or the conservative reservation does not fit remaining node/workflow cost, the retry is skipped. The random and monotonic-clock providers are injectable for deterministic tests. Audit records the classified failure, retry number, exponential ceiling, server delay, selected delay, actual delay, remaining deadlines/budgets, and skip reason.
+
+`market_agent/workflow_circuit_breaker.py` provides a thread-safe `CircuitBreakerRegistry.before_call/record_success/record_failure/snapshot` interface. Breakers are isolated by dependency, provider, model tier, and tool so one failing model or tool does not suppress healthy lower tiers. Each breaker has `closed`, `open`, and `half_open` states, a bounded rolling window, minimum sample count, failure-count/ratio thresholds, open cooldown, and maximum concurrent half-open probes. Only classified infrastructure failures, throttling, timeouts, connection failures, and repeated strict-output failures affect the breaker; user validation, knowledge insufficiency, deterministic rejection, and budget denial do not.
+
+An open breaker performs no external call, consumes no model-cost reservation, writes an audited circuit rejection, and immediately follows the configured lower-model/local-knowledge/unknown degradation path. After cooldown, only the configured number of budget-authorized half-open probes may run. A successful probe closes and resets the breaker; a classified failure reopens it with bounded cooldown. Every state transition, probe admission/rejection, failure classification, cooldown, and recovery is audited. Production instances coordinate ephemeral breaker state through Redis atomic operations and TTLs, with a process-local thread-safe implementation for development and as a bounded fallback if Redis is unavailable; breaker state is never a source of trading truth or authorization.
 
 `WorkflowBudgetLedger` is the only authority that may start a call. Before every attempt it reserves worst-case cost from conservative input tokens, maximum output/reasoning tokens, selected-model prices, and maximum tool calls. Success settles to actual usage. Timeout or lost connection consumes the full reservation because the server may have completed the request. Reservations and settlement use `Decimal` and are concurrency-safe for parallel nodes.
 
@@ -313,6 +317,8 @@ New files:
 - `workflow_budget.py`: deadlines, Decimal reservations, calls/tools/cost.
 - `workflow_agent_runner.py`: cache, timeout, retry, tier fallback, knowledge fallback, and usage.
 - `workflow_response_cache.py`: in-memory LRU and SQLite exact cache.
+- `workflow_semantic_request_cache.py`: historical request embeddings, strict similarity/compatibility lookup, metadata, and expiry.
+- `workflow_circuit_breaker.py`: isolated closed/open/half-open dependency protection and bounded probes.
 - `local_knowledge_base.py`: deterministic curated retrieval.
 - `market_context_agent.py`, `event_filter_agent.py`, `fundamental_direction_agent.py`, `technical_structure_agent.py`, `decision_planner_agent.py`, and `escalation_reviewer_agent.py`: one prompt and node each.
 - `workflow_risk_gate.py`: deterministic rejection/escalation.

@@ -131,19 +131,19 @@ def test_referenced_event_cannot_be_purged(worker, repo):
 
 ### Task 7: Fixed/Semantic Answers and Resilient Agent Runner
 
-**Files:** Create `workflow_response_cache.py`, `workflow_semantic_request_cache.py`, `local_knowledge_base.py`, `workflow_agent_runner.py`, two knowledge JSON files; modify `langchain_runtime.py`; test `test_workflow_cache_knowledge.py`, `test_workflow_semantic_request_cache.py`, `test_workflow_agent_runner.py`.
+**Files:** Create `workflow_response_cache.py`, `workflow_semantic_request_cache.py`, `workflow_circuit_breaker.py`, `local_knowledge_base.py`, `workflow_agent_runner.py`, two knowledge JSON files; modify `langchain_runtime.py`; test `test_workflow_cache_knowledge.py`, `test_workflow_semantic_request_cache.py`, `test_workflow_circuit_breaker.py`, `test_workflow_agent_runner.py`.
 
-**Interfaces:** `ResponseCache.get/put/lookup_seed`, `SemanticRequestCache.lookup/store/expire`, `LocalKnowledgeBase.lookup`, and `AgentRunner.run`.
+**Interfaces:** `ResponseCache.get/put/lookup_seed`, `SemanticRequestCache.lookup/store/expire`, `CircuitBreakerRegistry.before_call/record_success/record_failure/snapshot`, `LocalKnowledgeBase.lookup`, and `AgentRunner.run`.
 
-- [ ] **Step 1:** Test fixed aliases/TTL/unsafe categories; semantic vector storage, strict `>0.95` threshold, metadata, tenant/version/context gates, deterministic ties, hard expiry and cleanup; plus strict schema parsing, rejection of prose/fences/extra fields, 408/409/429/5xx retry, auth nonretry, timeout cost, downgrade, knowledge fallback, unknown, and unhealthy-audit denial.
+- [ ] **Step 1:** Test fixed aliases/TTL/unsafe categories; semantic vector storage, strict `>0.95` threshold, metadata, tenant/version/context gates, deterministic ties, hard expiry and cleanup; capped exponential full jitter, `Retry-After`, deadline/cost checks; closed/open/half-open circuit transitions, isolated keys, bounded probes and audited fast fallback; plus strict schema parsing, rejection of prose/fences/extra fields, 408/409/429/5xx retry, auth nonretry, timeout cost, downgrade, knowledge fallback, unknown, and unhealthy-audit denial.
 ```python
 def test_trade_result_is_not_cacheable(cache):
     with pytest.raises(UnsafeCacheEntryError):
         cache.put(key(), CachedAnswer(category="trade_decision", answer="long"), policy())
 ```
 - [ ] **Step 2:** Run both focused files; expect failure.
-- [ ] **Step 3:** Implement safe seeds, LRU/SQLite exact retrieval, PostgreSQL/pgvector semantic retrieval with local repository fallback, request/response/model/schema metadata, category TTLs and invalidation, audit/reserve-before-call, bounded retries/deadlines, tiers, knowledge, unknown, and usage.
-- [ ] **Step 4:** Run focused and `-k "prompt_cache or semantic_cache or request_timeout"` tests.
+- [ ] **Step 3:** Implement safe seeds, LRU/SQLite exact retrieval, PostgreSQL/pgvector semantic retrieval with local repository fallback, request/response/model/schema metadata, category TTLs and invalidation, audit/reserve-before-call, capped exponential full jitter, Redis-coordinated/process-local circuit breakers, bounded retries/deadlines, tiers, knowledge, unknown, and usage.
+- [ ] **Step 4:** Run focused and `-k "prompt_cache or semantic_cache or request_timeout or circuit_breaker or retry"` tests.
 - [ ] **Step 5:** Commit `feat: add resilient cached agent runner`.
 
 ### Task 8: Capability Enforcement
