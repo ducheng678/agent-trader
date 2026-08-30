@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from market_agent.workflow_context_summary import select_context, summarize_context
+from datetime import datetime, timezone
+
+import pytest
+from pydantic import ValidationError
+
+from market_agent.workflow_context_summary import ContextRecord, ContextSelection, NormalizedClaim, select_context, summarize_context
 
 
 def records() -> list[dict[str, object]]:
@@ -87,3 +92,52 @@ def test_summary_is_deterministic_and_represents_missing_evidence_as_insufficien
     assert first.summary.unresolved_questions == ("insufficient source evidence",)
     assert first.summary.omitted_sections[0].section == "source_records"
     assert first.summary.omitted_sections[0].count == 0
+
+
+def test_context_rejects_unbounded_inputs_and_binds_hashes_to_selected_records_and_policy():
+    with pytest.raises(ValueError):
+        select_context(records(), max_records=31)
+    selection = select_context(records(), max_records=2)
+    with pytest.raises(ValidationError):
+        ContextSelection(
+            records=selection.records,
+            selected_ids=("source-b",),
+            omitted_ids=selection.omitted_ids,
+            selected_count=2,
+            omitted_count=1,
+            selected_record_hash=selection.selected_record_hash,
+            all_input_hash=selection.all_input_hash,
+            selection_policy_version=selection.selection_policy_version,
+        )
+
+
+def test_summary_recomputes_selection_and_marks_unresolved_conflicts_incomplete():
+    claim = NormalizedClaim(
+        claim_id="claim-1",
+        source_id="source-1",
+        observed_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        value="BTC has support at 60,000",
+        unit="USD",
+        negated=False,
+        untrusted_data=True,
+    )
+    selection = select_context(
+        [
+            ContextRecord(record_id="source-1", claim=claim, relevance=0.9, conflict_group_id="conflict-1", conflict_description="sources disagree", conflict_unresolved=True),
+            ContextRecord(record_id="source-2", claim=claim.model_copy(update={"claim_id": "claim-2", "source_id": "source-2"}), relevance=0.8, conflict_group_id="conflict-1", conflict_description="sources disagree", conflict_unresolved=True),
+        ],
+        max_records=2,
+    )
+    forged = selection.model_copy(update={"selected_record_hash": "forged"})
+    forged_ids = selection.model_copy(update={"selected_ids": ("forged",)})
+
+    with pytest.raises(ValueError, match="selection"):
+        summarize_context(forged, workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+    with pytest.raises(ValidationError, match="selection"):
+        summarize_context(forged_ids, workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+    handoff = summarize_context(selection, workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+
+    assert handoff.summary.completeness.value == "incomplete"
+    assert handoff.summary.conflicts == ("conflict-1: sources disagree",)
+    assert handoff.contradicting_evidence
+    assert handoff.output_hash != handoff.input_hash

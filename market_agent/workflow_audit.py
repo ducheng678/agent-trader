@@ -1,22 +1,52 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import re
 import sqlite3
-from typing import Any, Mapping
+from typing import Iterable, Literal
 
-from pydantic import Field, JsonValue, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from market_agent.workflow_contracts import ContractModel, NonNegativeFinite, NonNegativeInt, PositiveInt, ShortText
 
 
-_REDACTED = "[REDACTED]"
-_SENSITIVE_FIELD_FRAGMENTS = ("authorization", "credential", "secret", "token", "password", "api_key", "apikey", "private_key", "cookie", "reasoning", "analysis")
+_MAX_PAGE_SIZE = 100
+_MAX_PAYLOAD_BYTES = 4096
+_UNSAFE_VALUE = re.compile(r"(?:authorization\s*[:=]|bearer\s+\S+|cookie\s*[:=]|(?:api[ _-]?key|credential|secret|token|private[ _-]?key)\s*[:=]|https?://\S+[?&](?:token|key|secret|signature)=)", re.IGNORECASE)
 
 
 class AuditUnavailableError(RuntimeError):
     pass
+
+
+def _require_safe_text(value: str) -> str:
+    if _UNSAFE_VALUE.search(value):
+        raise ValueError("audit values cannot contain credentials, authorization data, or URL secrets")
+    return value
+
+
+def _require_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("audit timestamps must be UTC")
+    return value
+
+
+class AuditPayload(ContractModel):
+    kind: Literal["transition", "validation", "usage", "selection", "summary"]
+    subject_ids: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
+    outcome_code: ShortText | None = None
+    reason_code: ShortText | None = None
+    item_count: NonNegativeInt | None = None
+
+    @field_validator("subject_ids", "outcome_code", "reason_code")
+    @classmethod
+    def reject_sensitive_payload_values(cls, value: tuple[str, ...] | str | None) -> tuple[str, ...] | str | None:
+        if isinstance(value, tuple):
+            return tuple(_require_safe_text(item) for item in value)
+        return _require_safe_text(value) if value is not None else value
 
 
 class AuditEvent(ContractModel):
@@ -42,26 +72,32 @@ class AuditEvent(ContractModel):
     schema_name: ShortText | None = None
     schema_hash: ShortText | None = None
     source_references: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
-    payload: dict[str, JsonValue] = Field(default_factory=dict)
+    payload: AuditPayload
 
     @field_validator("occurred_at")
     @classmethod
     def require_utc_timestamp(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() != timedelta(0):
-            raise ValueError("audit timestamps must be UTC")
-        return value
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def reject_sensitive_event_values(self) -> AuditEvent:
+        for value in (
+            self.event_id, self.trace_id, self.workflow_id, self.task_id, self.attempt_id, self.actor,
+            self.event_type, self.status, self.input_hash, self.output_hash, self.model, self.prompt_version,
+            self.schema_name, self.schema_hash, *self.source_references,
+        ):
+            if value is not None:
+                _require_safe_text(value)
+        encoded_payload = json.dumps(self.payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(encoded_payload) > _MAX_PAYLOAD_BYTES:
+            raise ValueError("audit payload exceeds encoded-byte limit")
+        return self
 
 
-def _redact(value: Any, field_name: str | None = None) -> Any:
-    if field_name is not None and any(fragment in field_name.lower() for fragment in _SENSITIVE_FIELD_FRAGMENTS):
-        return _REDACTED
-    if isinstance(value, Mapping):
-        return {str(key): _redact(item, str(key)) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact(item) for item in value]
-    if isinstance(value, tuple):
-        return [_redact(item) for item in value]
-    return value
+class AuditPage(list[AuditEvent]):
+    def __init__(self, items: Iterable[AuditEvent] = (), next_cursor: str | None = None) -> None:
+        super().__init__(items)
+        self.next_cursor = next_cursor
 
 
 class AuditStore:
@@ -72,6 +108,7 @@ class AuditStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path, timeout=5.0, isolation_level=None)
         connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA recursive_triggers = ON")
         return connection
 
     def _initialize(self) -> None:
@@ -79,147 +116,96 @@ class AuditStore:
         try:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_events (
-                    event_id TEXT PRIMARY KEY,
-                    trace_id TEXT NOT NULL,
-                    workflow_id TEXT NOT NULL,
-                    task_id TEXT,
-                    attempt_id TEXT,
-                    sequence INTEGER NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    input_hash TEXT,
-                    output_hash TEXT,
-                    latency_ms INTEGER NOT NULL,
-                    token_usage INTEGER NOT NULL,
-                    cached_token_usage INTEGER NOT NULL,
-                    estimated_cost REAL NOT NULL,
-                    cumulative_cost REAL NOT NULL,
-                    model TEXT,
-                    prompt_version TEXT,
-                    schema_name TEXT,
-                    schema_hash TEXT,
-                    source_references TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    UNIQUE(trace_id, sequence)
-                )
-                """
+                "CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, workflow_id TEXT NOT NULL, task_id TEXT, attempt_id TEXT, sequence INTEGER NOT NULL, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, event_type TEXT NOT NULL, status TEXT NOT NULL, input_hash TEXT, output_hash TEXT, latency_ms INTEGER NOT NULL, token_usage INTEGER NOT NULL, cached_token_usage INTEGER NOT NULL, estimated_cost REAL NOT NULL, cumulative_cost REAL NOT NULL, model TEXT, prompt_version TEXT, schema_name TEXT, schema_hash TEXT, source_references TEXT NOT NULL, payload TEXT NOT NULL, schema_version TEXT NOT NULL DEFAULT 'v1', UNIQUE(trace_id, sequence))"
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_events)")}
+            if "schema_version" not in columns:
+                connection.execute("ALTER TABLE audit_events ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'v1'")
             connection.execute("CREATE INDEX IF NOT EXISTS audit_events_trace_sequence_idx ON audit_events(trace_id, sequence)")
             connection.execute("CREATE INDEX IF NOT EXISTS audit_events_workflow_idx ON audit_events(workflow_id, sequence)")
-            connection.execute("CREATE INDEX IF NOT EXISTS audit_events_task_attempt_idx ON audit_events(task_id, attempt_id, sequence)")
+            connection.execute("CREATE INDEX IF NOT EXISTS audit_events_attempt_idx ON audit_events(attempt_id, sequence)")
+            connection.execute("CREATE INDEX IF NOT EXISTS audit_events_occurred_at_idx ON audit_events(occurred_at)")
             connection.execute("CREATE INDEX IF NOT EXISTS audit_events_type_time_idx ON audit_events(event_type, occurred_at)")
             connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
             connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
+            connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_replace BEFORE INSERT ON audit_events WHEN EXISTS (SELECT 1 FROM audit_events WHERE event_id = NEW.event_id) OR EXISTS (SELECT 1 FROM audit_events WHERE trace_id = NEW.trace_id AND sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
         finally:
             connection.close()
 
     def append(self, event: AuditEvent) -> AuditEvent:
         if event.sequence is not None:
             raise ValueError("audit sequence is assigned by the store")
-        redacted_event = event.model_copy(update={"payload": _redact(event.payload)})
-        connection = self._connect()
+        connection: sqlite3.Connection | None = None
         try:
+            connection = self._connect()
             connection.execute("BEGIN IMMEDIATE")
-            next_sequence = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit_events WHERE trace_id = ?",
-                (redacted_event.trace_id,),
-            ).fetchone()[0]
+            next_sequence = connection.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit_events WHERE trace_id = ?", (event.trace_id,)).fetchone()[0]
             connection.execute(
-                """
-                INSERT INTO audit_events (
-                    event_id, trace_id, workflow_id, task_id, attempt_id, sequence, occurred_at, actor,
-                    event_type, status, input_hash, output_hash, latency_ms, token_usage, cached_token_usage,
-                    estimated_cost, cumulative_cost, model, prompt_version, schema_name, schema_hash,
-                    source_references, payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    redacted_event.event_id,
-                    redacted_event.trace_id,
-                    redacted_event.workflow_id,
-                    redacted_event.task_id,
-                    redacted_event.attempt_id,
-                    next_sequence,
-                    redacted_event.occurred_at.astimezone(timezone.utc).isoformat(),
-                    redacted_event.actor,
-                    redacted_event.event_type,
-                    redacted_event.status,
-                    redacted_event.input_hash,
-                    redacted_event.output_hash,
-                    redacted_event.latency_ms,
-                    redacted_event.token_usage,
-                    redacted_event.cached_token_usage,
-                    redacted_event.estimated_cost,
-                    redacted_event.cumulative_cost,
-                    redacted_event.model,
-                    redacted_event.prompt_version,
-                    redacted_event.schema_name,
-                    redacted_event.schema_hash,
-                    json.dumps(redacted_event.source_references, separators=(",", ":")),
-                    json.dumps(redacted_event.payload, sort_keys=True, separators=(",", ":")),
-                ),
+                "INSERT INTO audit_events (event_id, trace_id, workflow_id, task_id, attempt_id, sequence, occurred_at, actor, event_type, status, input_hash, output_hash, latency_ms, token_usage, cached_token_usage, estimated_cost, cumulative_cost, model, prompt_version, schema_name, schema_hash, source_references, payload, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event.event_id, event.trace_id, event.workflow_id, event.task_id, event.attempt_id, next_sequence, event.occurred_at.isoformat(), event.actor, event.event_type, event.status, event.input_hash, event.output_hash, event.latency_ms, event.token_usage, event.cached_token_usage, event.estimated_cost, event.cumulative_cost, event.model, event.prompt_version, event.schema_name, event.schema_hash, json.dumps(event.source_references, separators=(",", ":")), json.dumps(event.payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":")), event.schema_version),
             )
             connection.execute("COMMIT")
         except Exception:
-            connection.execute("ROLLBACK")
+            if connection is not None and connection.in_transaction:
+                connection.execute("ROLLBACK")
             raise
         finally:
-            connection.close()
-        return redacted_event.model_copy(update={"sequence": next_sequence})
+            if connection is not None:
+                connection.close()
+        return event.model_copy(update={"sequence": next_sequence})
 
-    def list(
-        self,
-        *,
-        trace_id: str | None = None,
-        workflow_id: str | None = None,
-        task_id: str | None = None,
-        attempt_id: str | None = None,
-        event_type: str | None = None,
-        start_time: datetime | None = None,
-        end_time: datetime | None = None,
-    ) -> list[AuditEvent]:
+    def list(self, *, trace_id: str | None = None, workflow_id: str | None = None, task_id: str | None = None, attempt_id: str | None = None, event_type: str | None = None, start_time: datetime | None = None, end_time: datetime | None = None, page_size: int = _MAX_PAGE_SIZE, cursor: str | None = None) -> AuditPage:
+        if isinstance(page_size, bool) or not 1 <= page_size <= _MAX_PAGE_SIZE:
+            raise ValueError(f"page_size must be between 1 and {_MAX_PAGE_SIZE}")
         clauses: list[str] = []
         values: list[object] = []
         for field_name, field_value in (("trace_id", trace_id), ("workflow_id", workflow_id), ("task_id", task_id), ("attempt_id", attempt_id), ("event_type", event_type)):
             if field_value is not None:
                 clauses.append(f"{field_name} = ?")
                 values.append(field_value)
-        if start_time is not None:
-            clauses.append("occurred_at >= ?")
-            values.append(start_time.astimezone(timezone.utc).isoformat())
-        if end_time is not None:
-            clauses.append("occurred_at <= ?")
-            values.append(end_time.astimezone(timezone.utc).isoformat())
+        for operator, timestamp in ((">=", start_time), ("<=", end_time)):
+            if timestamp is not None:
+                clauses.append(f"occurred_at {operator} ?")
+                values.append(_require_utc(timestamp).isoformat())
+        if cursor is not None:
+            cursor_trace, cursor_sequence, cursor_event = self._decode_cursor(cursor)
+            clauses.append("(trace_id > ? OR (trace_id = ? AND (sequence > ? OR (sequence = ? AND event_id > ?))))")
+            values.extend((cursor_trace, cursor_trace, cursor_sequence, cursor_sequence, cursor_event))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         connection = self._connect()
         try:
-            rows = connection.execute(
-                "SELECT * FROM audit_events" + where + " ORDER BY trace_id ASC, sequence ASC, event_id ASC",
-                values,
-            ).fetchall()
+            rows = connection.execute("SELECT * FROM audit_events" + where + " ORDER BY trace_id ASC, sequence ASC, event_id ASC LIMIT ?", (*values, page_size + 1)).fetchall()
         finally:
             connection.close()
-        columns = (
-            "event_id", "trace_id", "workflow_id", "task_id", "attempt_id", "sequence", "occurred_at", "actor",
-            "event_type", "status", "input_hash", "output_hash", "latency_ms", "token_usage", "cached_token_usage",
-            "estimated_cost", "cumulative_cost", "model", "prompt_version", "schema_name", "schema_hash",
-            "source_references", "payload",
-        )
-        return [
-            AuditEvent(
-                **{
-                    **dict(zip(columns, row, strict=True)),
-                    "occurred_at": datetime.fromisoformat(row[6]),
-                    "source_references": tuple(json.loads(row[21])),
-                    "payload": json.loads(row[22]),
-                }
-            )
-            for row in rows
-        ]
+        events = [self._row_to_event(row) for row in rows[:page_size]]
+        next_cursor = self._encode_cursor(events[-1]) if len(rows) > page_size and events else None
+        return AuditPage(events, next_cursor)
+
+    @staticmethod
+    def _encode_cursor(event: AuditEvent) -> str:
+        rendered = json.dumps((event.trace_id, event.sequence, event.event_id), separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(rendered).decode("ascii")
+
+    @staticmethod
+    def _decode_cursor(cursor: str) -> tuple[str, int, str]:
+        try:
+            trace_id, sequence, event_id = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        except Exception as error:
+            raise ValueError("invalid audit cursor") from error
+        if not isinstance(trace_id, str) or not isinstance(sequence, int) or not isinstance(event_id, str) or sequence < 1:
+            raise ValueError("invalid audit cursor")
+        return trace_id, sequence, event_id
+
+    @staticmethod
+    def _row_to_event(row: tuple[object, ...]) -> AuditEvent:
+        columns = ("event_id", "trace_id", "workflow_id", "task_id", "attempt_id", "sequence", "occurred_at", "actor", "event_type", "status", "input_hash", "output_hash", "latency_ms", "token_usage", "cached_token_usage", "estimated_cost", "cumulative_cost", "model", "prompt_version", "schema_name", "schema_hash", "source_references", "payload", "schema_version")
+        values = dict(zip(columns, row, strict=True))
+        payload = json.loads(str(row[22]))
+        if not payload:
+            payload = {"kind": "transition", "subject_ids": ()}
+        elif "subject_ids" in payload:
+            payload["subject_ids"] = tuple(payload["subject_ids"])
+        return AuditEvent(**{**values, "occurred_at": datetime.fromisoformat(str(row[6])), "source_references": tuple(json.loads(str(row[21])),), "payload": payload})
 
 
 class AuditWriter:
