@@ -170,14 +170,14 @@ def test_technical_agent_cannot_use_web(policy):
 
 **Interfaces:** Each specialist exports `SYSTEM_PROMPT`, `PROMPT_VERSION`, `build_messages`, `run_node`; reflection exports `reflect_output`, deterministic `build_correction_context`, and `apply_correction_patch`; coordinator exports `plan_request`, `dispatch_tasks`, `reconcile_reports`, `reschedule`, `summarize_result`.
 
-- [ ] **Step 1:** Test stable abstention/stepwise prompts, versioned strict schemas, dynamic user data, web-tool isolation, task bounds, model selection, errors returning to coordinator, conflict reconciliation, and final summary; test Luna-only reflection of exactly decision draft, conditional Sol escalation, and coordinator final summary for format/schema identity, critical fields, conclusion/data consistency, contradictions, uncertainty, strict dispositions, target immutability, no tools, no recursive reflection, and no reflection calls for non-core outputs; test that `retry_original` creates bounded typed `CorrectionContext`, injects its error codes/field paths/evidence IDs only in dynamic user content, requests a strict allowlisted `CorrectionPatch`, deterministically revalidates the patched full output, and uses complete rewrite only as the single fallback.
+- [ ] **Step 1:** Test stable abstention/stepwise prompts, versioned strict schemas, dynamic user data, web-tool isolation, task bounds, model selection, errors returning to coordinator, conflict reconciliation, and final summary; test Luna-only reflection of exactly decision draft, conditional Sol escalation, and coordinator final summary using objective allowlisted `pass`/`fail`/`not_verifiable` checks, with deterministic disposition, no subjective strategy/market/prose scoring, target immutability, no tools, no recursive/non-core reflection; test bounded `CorrectionContext`, strict allowlisted `CorrectionPatch`, deterministic full-output revalidation, and one fallback full rewrite only.
 ```python
 def test_conflict_returns_to_coordinator():
     result = reconcile_reports(plan(), conflicting_reports(), budget())
     assert result.action == "schedule_reconciliation"
 ```
 - [ ] **Step 2:** Run both focused files; expect failure.
-- [ ] **Step 3:** Implement stable injection-resistant prefixes, JSON user content, bounded catalog, difficulty routing, report validation, Luna reflection gates, deterministic error-carrying correction contexts, targeted patch application, one fallback full rewrite, retry/reschedule, Sol reconciliation, and fail-closed summary.
+- [ ] **Step 3:** Implement stable injection-resistant prefixes, JSON user content, bounded catalog, difficulty routing, report validation, objective Luna checks plus deterministic disposition/correction guard, error-carrying correction contexts, targeted patch application, one fallback full rewrite, retry/reschedule, Sol reconciliation, and fail-closed summary.
 - [ ] **Step 4:** Rerun and verify each dispatched task contains three to five steps and a scoped capability, each configured core result is reflected exactly once, non-core results are not reflected, and no rejected core target reaches downstream state/cache/memory.
 - [ ] **Step 5:** Commit `feat: add coordinator and focused trading agents`.
 
@@ -187,7 +187,7 @@ def test_conflict_returns_to_coordinator():
 
 **Interfaces:** `evaluate_risk`, `assemble_playbook`, `unknown_playbook`, and `LLMWorkflow.invoke(request, services) -> WorkflowResult`.
 
-- [ ] **Step 1:** Test invalid values/stops/scenarios, insufficiency, conflict/Sol, unknown/no_trade, active/passive routes, fan-out/join, memory summary, reflection accept/targeted-patch/fallback-full-rewrite/coordinator/safe-reject routes, repeated-reflection cap, reflection outage, reschedule cycles, budgets, permissions, and audit-finalize.
+- [ ] **Step 1:** Test invalid values/stops/scenarios, insufficiency, conflict/Sol, unknown/no_trade, active/passive routes, fan-out/join, memory summary, objective reflection accept/targeted-patch/fallback-full-rewrite/coordinator/safe-reject routes, strict-improvement/no-regression checks, hash cycles, hard correction limits, reflection outage, trace mismatch, reschedule cycles, budgets, permissions, and audit-finalize.
 ```python
 def test_specialists_receive_summaries(graph, services):
     graph.invoke(request(), services)
@@ -200,18 +200,18 @@ def test_specialists_receive_summaries(graph, services):
 
 ### Task 11: Engine and Production Backend Integration
 
-**Files:** Modify `agent_runtime.py`, prompt/passive/RAG/routing modules, and `backend/{database,observability,container,api_contracts,api}.py`; test `test_workflow_engine_compatibility.py`, `test_workflow_backend_audit.py`.
+**Files:** Create `workflow_tracing.py`; modify contracts/state, `agent_runtime.py`, prompt/passive/RAG/routing modules, and `backend/{database,observability,container,api_contracts,api}.py`; test `test_workflow_engine_compatibility.py`, `test_workflow_trace_propagation.py`, `test_workflow_backend_audit.py`.
 
-**Interfaces:** Preserve `get_playbook`; extend debug; expose redacted read-only `GET /v1/audit/traces/{trace_id}` and bounded memory administration/status endpoints; publish low-cardinality metrics.
+**Interfaces:** `TraceContext.new_request/child/inject/extract/assert_same_trace`; preserve `get_playbook`; extend debug; expose redacted read-only `GET /v1/audit/traces/{trace_id}` and bounded memory administration/status endpoints; publish low-cardinality metrics.
 
-- [ ] **Step 1:** Test existing modes, prefetch, charts, symbols, caps, unknown, audit/memory queries, redaction, trace IDs, dependency injection, and metrics.
+- [ ] **Step 1:** Test existing modes, prefetch, charts, symbols, caps, unknown, audit/memory queries, redaction, fresh unique 128-bit trace IDs at every ingress, immutable propagation through every node/call/cache/retry/queue/memory/log/response, unique parented spans, cache-origin links, mismatch denial, dependency injection, and metrics.
 ```python
 def test_unknown_keeps_no_trade_contract(engine):
     playbook, _ = engine.get_playbook(**unknown_request())
     assert playbook.entry_plan.action_decision.action == "no_trade"
 ```
 - [ ] **Step 2:** Run new compatibility/backend files plus existing unit/backend files; expect targeted failures.
-- [ ] **Step 3:** Wire services, request/result adapters, debug, PostgreSQL/SQLite configuration, audit/memory repositories, strict endpoints, lifecycle queue job, and metrics.
+- [ ] **Step 3:** Wire trace/span generation and propagation, services, request/result adapters, debug, PostgreSQL/SQLite configuration, audit/memory repositories, strict endpoints, lifecycle queue job, structured logs, metric exemplars, and response trace headers.
 - [ ] **Step 4:** Rerun all affected files; expect pass without duplicate orchestration.
 - [ ] **Step 5:** Commit `refactor: integrate coordinated agent workflow`.
 
@@ -221,7 +221,7 @@ def test_unknown_keeps_no_trade_contract(engine):
 
 **Interfaces:** Only runner/runtime dispatches models; only service identities access durable stores; retrieved content remains user data.
 
-- [ ] **Step 1:** Add AST/runtime tests for direct model calls, exchange/repository imports, raw-context handoff, dynamic system fragments, secret audit fields, unsafe caches, unauthorized state keys/tools, unreflected core output, reflection on non-core output, reflection target mutation, and recursive reflection.
+- [ ] **Step 1:** Add AST/runtime tests for direct model calls, exchange/repository imports, raw-context handoff, dynamic system fragments, secret audit fields, unsafe caches, unauthorized state keys/tools, unreflected core output, reflection on non-core output, subjective reflection rules, correction-limit/regression bypass, reflection target mutation, recursive reflection, missing trace IDs, and cross-trace state/service writes.
 ```python
 def test_agent_modules_do_not_import_exchange():
     assert forbidden_imports(agent_paths()) == []
@@ -249,7 +249,7 @@ def test_agent_modules_do_not_import_exchange():
 
 **Interfaces:** Final evidence includes commit IDs, exact test totals, content comparison, routing/cost/retention defaults, and opt-in integration coverage.
 
-- [ ] **Step 1:** Trace active, passive-unrelated, reflection accept/retry/coordinator/safe-reject, conflict, timeout/downgrade, knowledge, unknown, memory promotion, and forgetting paths through audit finalize.
+- [ ] **Step 1:** Trace active, passive-unrelated, objective reflection accept/patch/rewrite/regression-stop/coordinator/safe-reject, conflict, timeout/downgrade, knowledge, unknown, memory promotion, and forgetting paths through audit finalize under one immutable request trace ID with parented spans.
 - [ ] **Step 2:** Verify summarized handoffs, audit/reservation/capability before calls, exactly one Luna reflection for each configured core output and none for non-core outputs, target immutability, and bounded exits on every cycle.
 - [ ] **Step 3:** Verify abstention prompts, dynamic-free system prefixes, actor permission matrix, and no direct durable writes by agents.
 - [ ] **Step 4:** Verify vector retrieval citations, anti-circular promotion, protected evidence, legal holds, tombstones, strict semantic-cache threshold/expiry/version metadata, and no live claims in fixed or semantic caches.

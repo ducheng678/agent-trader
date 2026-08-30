@@ -73,6 +73,7 @@ Every workflow transition writes an append-only audit event. Required event cate
 - structured output validation result;
 - reflection target/schema hashes, Luna attempt, format/field/conclusion-data checks, contradictions, disposition, and coordinator response;
 - correction-context/error codes, field paths, evidence references, targeted patch/application, fallback rewrite linkage, replacement output hash, and resolution;
+- correction guard before/after objective error tuples, output-hash cycle checks, regression stop reason, and safe terminal;
 - retry, timeout, cancellation, and cost reservation or settlement;
 - exponential-backoff ceiling, full-jitter/server delay, scheduled/actual wait, and circuit-breaker state/probe/rejection/recovery;
 - local knowledge lookup and evidence selected;
@@ -257,6 +258,12 @@ After deterministic parsing, only three configured core outputs are reviewed by 
 
 For `retry_original`, the coordinator receives a deterministic `CorrectionContext` rather than raw reflection text. It carries only target and reflection hashes, typed error/invariant codes, affected field paths, contradiction/missing-evidence references, retry ordinal, and bounded summaries of the prior output and original task. The first retry receives this context in dynamic user content and returns a strict targeted `CorrectionPatch`. A deterministic service applies only allowlisted field replacements to a copy and fully revalidates the result. Only patch-generation/application failure, full-schema failure, or another rejected reflection may trigger one fallback full rewrite with bounded correction history. The rewritten result must be complete and strict. One patch plus one rewrite is the hard maximum; all attempts share existing time/retry/cost limits, and exhaustion fails closed.
 
+Reflection is objective-only. Luna emits allowlisted checks with `pass`, `fail`, or `not_verifiable`, field paths, evidence IDs, observed values/hashes, and expected constraints. It cannot judge strategy quality, market opinion, profitability, prose, or confidence and cannot choose the workflow disposition. Deterministic policy maps required checks to a disposition. A deterministic correction guard permits at most one targeted patch and one fallback rewrite, requires strict improvement of the objective error tuple, detects repeated/cycling hashes, and stops immediately on new critical errors, weakened risk rules, unsupported direction changes, or lost evidence.
+
+### Trace and Span Propagation
+
+Each ingress creates one fresh internal 128-bit trace ID and an initial span before normalization. The ID is immutable and is passed explicitly in every request, task, report, summary, capability, audit event, cache lookup, model/tool call, retry, queue message, memory operation, log, metric exemplar, and final response. Every operation creates a child span; trace mismatches fail closed. Upstream trace context and cached-result origin traces are links, never replacements for the current request trace. Trace IDs are unique correlation identifiers and grant no permission.
+
 Schema name/version and canonical schema hash are included in prompt-cache keys, response-cache keys, audit events, usage records, task contracts, and memory records derived from an output. Cache and memory reads require compatible versions; migrations are explicit deterministic transformations that retain the original payload/hash and audit linkage.
 
 Tool arguments and tool results use separate strict schemas and capability validation. The coordinator cannot reinterpret an invalid specialist payload as a valid result. Reducers accept only the output model assigned to that actor and state key. API serialization uses the validated final contract rather than raw model text.
@@ -277,3 +284,5 @@ Tool arguments and tool results use separate strict schemas and capability valid
 - Retrieval returns versioned, freshness-aware records that are summarized before specialist handoff.
 - Every agent response is strict, versioned, fully parsed structured output; malformed or extra text is retried or degraded and never enters state or memory.
 - Decision drafts, conditional Sol escalation reviews, and coordinator final summaries pass exactly one Luna reflection gate; non-core outputs do not invoke reflection, reflection cannot mutate the target, and a reflection result is never recursively reflected.
+- Reflection emits only objective falsifiable checks; deterministic policy owns disposition and stops correction on regression, cycles, or the one-patch/one-rewrite limit.
+- Every ingress receives one fresh immutable internal trace ID that reaches every synchronous/asynchronous operation and final response; each operation has a unique parented span and cross-trace mutation is rejected.
