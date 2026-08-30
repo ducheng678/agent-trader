@@ -23,7 +23,9 @@ class BudgetExceededError(RuntimeError):
 
 
 class BudgetOverflowError(BudgetExceededError):
-    pass
+    def __init__(self, message: str, settlement: BudgetSettlement) -> None:
+        super().__init__(message)
+        self.settlement = settlement
 
 
 class ReservationOwnershipError(ValueError):
@@ -298,7 +300,7 @@ class WorkflowBudgetLedger:
             )
             settlement, overflowed = self._close(current, charged_cost, False, overflowed=usage_overflowed)
             if overflowed:
-                raise BudgetOverflowError('actual usage exceeds reservation')
+                raise BudgetOverflowError("actual usage exceeds reservation", settlement)
             return settlement
 
     def consume_timeout(self, reservation: BudgetReservation, usage: UsageTokens | None = None) -> BudgetSettlement:
@@ -312,6 +314,7 @@ class WorkflowBudgetLedger:
     def snapshot(self) -> BudgetSnapshot:
         with self._lock:
             now = self._now()
+            global_remaining = max(0, self._maximum_attempts - self._attempts)
             node_snapshots = tuple(
                 NodeBudgetSnapshot(
                     node_name=node_name,
@@ -319,6 +322,7 @@ class WorkflowBudgetLedger:
                     reserved_cost=node.reserved_cost,
                     settled_cost=node.settled_cost,
                     remaining_attempts=min(
+                        global_remaining,
                         max(0, node.policy.maximum_total_attempts - node.attempts),
                         sum(
                             max(0, node.policy.maximum_attempts_per_tier - node.tier_attempts.get(tier.model, 0))

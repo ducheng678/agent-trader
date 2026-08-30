@@ -10,6 +10,47 @@ from market_agent.openai_usage import UsageTokens
 from market_agent.workflow_contracts import WorkflowMode
 
 
+@pytest.fixture
+def ledger():
+    from market_agent.workflow_budget import WorkflowBudgetLedger
+
+    return WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+
+
+@pytest.fixture
+def reservation(ledger):
+    return ledger.reserve(
+        node_name="fundamental",
+        model="gpt-5.6-terra",
+        band="short",
+        usage=UsageTokens(input_tokens=1, output_tokens=1),
+    )
+
+
+@pytest.fixture
+def overflow_usage():
+    return UsageTokens(input_tokens=2, output_tokens=1)
+
+
+def consume_global_attempts_across_distinct_nodes(ledger):
+    from market_agent.workflow_model_routing import policies
+
+    node_names = tuple(policies())
+    for node_name in node_names:
+        ledger.reserve(
+            node_name=node_name,
+            model="gpt-5.6-luna",
+            band="short",
+            usage=UsageTokens(),
+        )
+    ledger.reserve(
+        node_name=node_names[0],
+        model="gpt-5.6-luna",
+        band="short",
+        usage=UsageTokens(),
+    )
+
+
 def test_policy_catalog_matches_the_core_reflection_graph_and_is_immutable():
     from market_agent.workflow_model_routing import UnknownWorkflowNodeError, policies, policy_for
 
@@ -183,6 +224,24 @@ def test_settlement_overflow_is_accounted_then_exhausts_the_ledger_and_node():
     assert node.exhausted and node.overdrawn
     with pytest.raises(BudgetExceededError):
         ledger.reserve(node_name="event_filter", model="gpt-5.6-luna", band="short", usage=UsageTokens(output_tokens=1))
+
+
+def test_overflow_error_exposes_committed_settlement(ledger, reservation, overflow_usage):
+    from market_agent.workflow_budget import BudgetOverflowError, ReservationStateError
+
+    with pytest.raises(BudgetOverflowError) as raised:
+        ledger.settle(reservation, overflow_usage)
+    assert raised.value.settlement.reservation_id == reservation.reservation_id
+    assert ledger.snapshot().settled_cost == raised.value.settlement.charged_cost
+    with pytest.raises(ReservationStateError):
+        ledger.settle(reservation, overflow_usage)
+
+
+def test_node_remaining_attempts_respects_workflow_global_cap(ledger):
+    consume_global_attempts_across_distinct_nodes(ledger)
+    snapshot = ledger.snapshot()
+    assert snapshot.remaining_attempts == 0
+    assert all(node.remaining_attempts == 0 for node in snapshot.nodes)
 
 
 def test_ledger_rejects_same_ledger_forgery_unknown_and_stale_reservations():
