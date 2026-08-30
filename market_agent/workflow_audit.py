@@ -2,25 +2,27 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timedelta, timezone
+from enum import Enum
+from hashlib import sha256
 import json
 from pathlib import Path
 import re
 import sqlite3
 from typing import Iterable, Literal
 
-from pydantic import Field, StringConstraints, field_validator, model_validator
+from pydantic import AfterValidator, Field, StringConstraints, field_validator, model_validator
 from typing import Annotated
 
-from market_agent.workflow_contracts import ContractModel, NonNegativeFinite, NonNegativeInt, PositiveInt, ShortText
+from market_agent.workflow_contracts import ContractModel, Digest, NonNegativeFinite, NonNegativeInt, PositiveInt, ShortText
 
 
 _MAX_PAGE_SIZE = 100
 _MAX_PAYLOAD_BYTES = 4096
-_UNSAFE_VALUE = re.compile(r"(?:authorization\s*[:=]|bearer\s+\S+|cookie\s*[:=]|(?:api[ _-]?key|credential|secret|token|private[ _-]?key)\s*[:=]|https?://\S+[?&](?:token|key|secret|signature)=)", re.IGNORECASE)
+_UNSAFE_VALUE = re.compile(r"(?:authorization|bearer|cookie|api[ _-]?key|credential|secret|token|password|private[ _-]?key|raw[ _-]?prompt|system[ _-]?prompt|reasoning|chain[ _-]?of[ _-]?thought|-----BEGIN|eyJ[a-zA-Z0-9_-]*\.|https?://\S+[?&](?:token|key|secret|signature)=)", re.IGNORECASE)
 _OPAQUE_ID = re.compile(r"^(?!sk-)(?!eyJ)[a-z][a-z0-9_-]{0,63}$")
 _CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+_LEGACY_HASH_POLICY = "null_noncanonical_v1"
 
 
 class AuditUnavailableError(RuntimeError):
@@ -34,12 +36,14 @@ def _require_safe_text(value: str) -> str:
 
 
 def _require_id(value: str) -> str:
+    _require_safe_text(value)
     if not _OPAQUE_ID.fullmatch(value):
         raise ValueError("audit opaque identifiers must be bounded non-secret identifiers")
     return value
 
 
 def _require_code(value: str) -> str:
+    _require_safe_text(value)
     if not _CODE.fullmatch(value):
         raise ValueError("audit codes must be compact identifiers, never prose or URLs")
     return value
@@ -51,34 +55,139 @@ def _require_utc(value: datetime) -> datetime:
     return value
 
 
+AuditEventId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
+AuditTraceId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
+AuditWorkflowId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
+AuditTaskId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
+AuditAttemptId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
+AuditSourceReference = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
+AuditSubjectId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
+AuditCode = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_code)]
+
+
+class AuditActor(str, Enum):
+    COORDINATOR = "coordinator"
+    AUDIT_STORE = "audit_store"
+    CONTEXT_SELECTOR = "context_selector"
+    CONTEXT_SUMMARIZER = "context_summarizer"
+    SPECIALIST = "specialist"
+    MODEL = "model"
+    TOOL = "tool"
+    QUEUE = "queue"
+    MEMORY = "memory"
+    EXCHANGE = "exchange"
+
+
+class AuditEventType(str, Enum):
+    CREATED = "created"
+    TASK_DISPATCHED = "task_dispatched"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    VALIDATION_COMPLETED = "validation_completed"
+    CONTEXT_SELECTED = "context_selected"
+    CONTEXT_SUMMARIZED = "context_summarized"
+    LEGACY_MIGRATED = "legacy_migrated"
+    DISPATCH_BLOCKED = "dispatch_blocked"
+    EXTERNAL_DISPATCH = "external_dispatch"
+
+
+class AuditStatus(str, Enum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+    OMITTED = "omitted"
+
+
+class AuditModel(str, Enum):
+    LUNA = "gpt-5.6-luna"
+    TERRA = "gpt-5.6-terra"
+    SOL = "gpt-5.6-sol"
+
+
+class AuditOutcome(str, Enum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    COMPLETED = "completed"
+    OMITTED = "omitted"
+    LEGACY_PAYLOAD = "legacy_payload"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+
+
+class AuditReason(str, Enum):
+    VALIDATION_ERROR = "validation_error"
+    BUDGET_LIMIT = "budget_limit"
+    SOURCE_LIMIT = "source_limit"
+    UNRESOLVED_CONFLICT = "unresolved_conflict"
+    MISSING_EVIDENCE = "missing_evidence"
+    LEGACY_SCHEMA = "legacy_schema"
+    AUDIT_FAILURE = "audit_failure"
+
+
+_ACTORS = frozenset(item.value for item in AuditActor)
+_EVENT_TYPES = frozenset(item.value for item in AuditEventType)
+_STATUSES = frozenset(item.value for item in AuditStatus)
+_MODELS = frozenset(item.value for item in AuditModel)
+_OUTCOMES = frozenset(item.value for item in AuditOutcome)
+_REASONS = frozenset(item.value for item in AuditReason)
+
+
 class AuditPayload(ContractModel):
     kind: Literal["transition", "validation", "usage", "selection", "summary", "legacy_migration"]
-    subject_ids: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
-    outcome_code: ShortText | None = None
-    reason_code: ShortText | None = None
+    subject_ids: tuple[AuditSubjectId, ...] = Field(default_factory=tuple, max_length=50)
+    outcome_code: AuditCode | None = None
+    reason_code: AuditCode | None = None
     item_count: NonNegativeInt | None = None
     legacy_payload_digest: Digest | None = None
     legacy_schema_lineage: Literal["v0", "v1"] | None = None
+    legacy_hash_policy: Literal["null_noncanonical_v1"] | None = None
 
-    @field_validator("subject_ids", "outcome_code", "reason_code")
+    @field_validator("outcome_code")
     @classmethod
-    def reject_sensitive_payload_values(cls, value: tuple[str, ...] | str | None) -> tuple[str, ...] | str | None:
-        if isinstance(value, tuple):
-            return tuple(_require_safe_text(item) for item in value)
-        return _require_safe_text(value) if value is not None else value
+    def validate_outcome(cls, value: str | None) -> str | None:
+        if value is not None and value not in _OUTCOMES:
+            raise ValueError("audit outcomes must use the semantic registry")
+        return value
+
+    @field_validator("reason_code")
+    @classmethod
+    def validate_reason(cls, value: str | None) -> str | None:
+        if value is not None and value not in _REASONS:
+            raise ValueError("audit reasons must use the semantic registry")
+        return value
+
+    @model_validator(mode="after")
+    def validate_kind_contract(self) -> AuditPayload:
+        legacy_fields = (self.legacy_payload_digest, self.legacy_schema_lineage, self.legacy_hash_policy)
+        if self.kind == "transition":
+            if not self.subject_ids or any(value is not None for value in (self.outcome_code, self.reason_code, self.item_count, *legacy_fields)):
+                raise ValueError("transition payloads require subjects and forbid result fields")
+        elif self.kind == "validation":
+            if not self.subject_ids or self.outcome_code is None or self.item_count is not None or any(value is not None for value in legacy_fields):
+                raise ValueError("validation payload fields are inconsistent")
+        elif self.kind in {"usage", "selection", "summary"}:
+            if self.item_count is None or any(value is not None for value in legacy_fields):
+                raise ValueError("aggregate payloads require item_count and forbid legacy fields")
+        elif self.kind == "legacy_migration":
+            if self.subject_ids or self.outcome_code != AuditOutcome.LEGACY_PAYLOAD.value or self.reason_code is not None or self.item_count is None or any(value is None for value in legacy_fields):
+                raise ValueError("legacy migration payloads require complete lineage and hash policy")
+        return self
 
 
 class AuditEvent(ContractModel):
-    event_id: ShortText
-    trace_id: ShortText
-    workflow_id: ShortText
-    task_id: ShortText | None = None
-    attempt_id: ShortText | None = None
+    event_id: AuditEventId
+    trace_id: AuditTraceId
+    workflow_id: AuditWorkflowId
+    task_id: AuditTaskId | None = None
+    attempt_id: AuditAttemptId | None = None
     sequence: PositiveInt | None = None
     occurred_at: datetime
-    actor: ShortText
-    event_type: ShortText
-    status: ShortText
+    actor: AuditCode
+    event_type: AuditCode
+    status: AuditCode
     input_hash: Digest | None = None
     output_hash: Digest | None = None
     latency_ms: NonNegativeInt = 0
@@ -86,11 +195,11 @@ class AuditEvent(ContractModel):
     cached_token_usage: NonNegativeInt = 0
     estimated_cost: NonNegativeFinite = 0.0
     cumulative_cost: NonNegativeFinite = 0.0
-    model: ShortText | None = None
-    prompt_version: ShortText | None = None
-    schema_name: ShortText | None = None
+    model: AuditCode | None = None
+    prompt_version: AuditCode | None = None
+    schema_name: AuditCode | None = None
     schema_hash: Digest | None = None
-    source_references: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
+    source_references: tuple[AuditSourceReference, ...] = Field(default_factory=tuple, max_length=50)
     payload: AuditPayload
 
     @field_validator("occurred_at")
@@ -98,17 +207,33 @@ class AuditEvent(ContractModel):
     def require_utc_timestamp(cls, value: datetime) -> datetime:
         return _require_utc(value)
 
-    @field_validator("event_id", "trace_id", "workflow_id", "task_id", "attempt_id", "source_references")
+    @field_validator("actor")
     @classmethod
-    def validate_identifiers(cls, value: tuple[str, ...] | str | None) -> tuple[str, ...] | str | None:
-        if isinstance(value, tuple):
-            return tuple(_require_id(item) for item in value)
-        return _require_id(value) if value is not None else value
+    def validate_actor(cls, value: str) -> str:
+        if value not in _ACTORS:
+            raise ValueError("audit actors must use the semantic registry")
+        return value
 
-    @field_validator("actor", "event_type", "status", "model", "prompt_version", "schema_name")
+    @field_validator("event_type")
     @classmethod
-    def validate_codes(cls, value: str | None) -> str | None:
-        return _require_code(value) if value is not None else value
+    def validate_event_type(cls, value: str) -> str:
+        if value not in _EVENT_TYPES:
+            raise ValueError("audit event types must use the semantic registry")
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        if value not in _STATUSES:
+            raise ValueError("audit statuses must use the semantic registry")
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, value: str | None) -> str | None:
+        if value is not None and value not in _MODELS:
+            raise ValueError("audit models must use the semantic registry")
+        return value
 
     @model_validator(mode="after")
     def reject_sensitive_event_values(self) -> AuditEvent:
@@ -146,47 +271,76 @@ class AuditStore:
         connection = self._connect()
         try:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, workflow_id TEXT NOT NULL, task_id TEXT, attempt_id TEXT, sequence INTEGER NOT NULL, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, event_type TEXT NOT NULL, status TEXT NOT NULL, input_hash TEXT, output_hash TEXT, latency_ms INTEGER NOT NULL, token_usage INTEGER NOT NULL, cached_token_usage INTEGER NOT NULL, estimated_cost REAL NOT NULL, cumulative_cost REAL NOT NULL, model TEXT, prompt_version TEXT, schema_name TEXT, schema_hash TEXT, source_references TEXT NOT NULL, payload TEXT NOT NULL, schema_version TEXT NOT NULL DEFAULT 'v1', UNIQUE(trace_id, sequence))"
-            )
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_events)")}
-            if "schema_version" not in columns:
-                connection.execute("ALTER TABLE audit_events ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'v1'")
-            self._migrate_legacy_payloads(connection)
-            connection.execute("CREATE INDEX IF NOT EXISTS audit_events_trace_sequence_idx ON audit_events(trace_id, sequence)")
-            connection.execute("CREATE INDEX IF NOT EXISTS audit_events_workflow_idx ON audit_events(workflow_id, sequence)")
-            connection.execute("CREATE INDEX IF NOT EXISTS audit_events_attempt_idx ON audit_events(attempt_id, sequence)")
-            connection.execute("CREATE INDEX IF NOT EXISTS audit_events_occurred_at_idx ON audit_events(occurred_at)")
-            connection.execute("CREATE INDEX IF NOT EXISTS audit_events_type_time_idx ON audit_events(event_type, occurred_at)")
-            connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
-            connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
-            connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_replace BEFORE INSERT ON audit_events WHEN EXISTS (SELECT 1 FROM audit_events WHERE event_id = NEW.event_id) OR EXISTS (SELECT 1 FROM audit_events WHERE trace_id = NEW.trace_id AND sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, workflow_id TEXT NOT NULL, task_id TEXT, attempt_id TEXT, sequence INTEGER NOT NULL, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, event_type TEXT NOT NULL, status TEXT NOT NULL, input_hash TEXT, output_hash TEXT, latency_ms INTEGER NOT NULL, token_usage INTEGER NOT NULL, cached_token_usage INTEGER NOT NULL, estimated_cost REAL NOT NULL, cumulative_cost REAL NOT NULL, model TEXT, prompt_version TEXT, schema_name TEXT, schema_hash TEXT, source_references TEXT NOT NULL, payload TEXT NOT NULL, schema_version TEXT NOT NULL DEFAULT 'v1', UNIQUE(trace_id, sequence))")
+                self._migrate_legacy_payloads(connection)
+                self._rebuild_indexes(connection)
+                self._create_triggers(connection)
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
         finally:
             connection.close()
 
     @staticmethod
     def _migrate_legacy_payloads(connection: sqlite3.Connection) -> None:
-        connection.execute("DROP TRIGGER IF EXISTS audit_events_no_update")
-        connection.execute("DROP TRIGGER IF EXISTS audit_events_no_delete")
-        connection.execute("DROP TRIGGER IF EXISTS audit_events_no_replace")
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            rows = connection.execute("SELECT event_id, payload, schema_version FROM audit_events").fetchall()
-            for event_id, payload_text, schema_version in rows:
-                try:
-                    parsed = json.loads(payload_text)
-                    AuditPayload.model_validate(parsed)
-                    continue
-                except Exception:
-                    pass
-                canonical = json.dumps(parsed if 'parsed' in locals() else str(payload_text), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-                migrated = {"kind": "legacy_migration", "subject_ids": (), "outcome_code": "legacy_payload", "item_count": len(parsed) if isinstance(parsed, (dict, list)) else 1, "legacy_payload_digest": __import__("hashlib").sha256(canonical.encode("utf-8")).hexdigest(), "legacy_schema_lineage": "v0" if schema_version != "v1" else "v1"}
-                connection.execute("UPDATE audit_events SET payload = ? WHERE event_id = ?", (json.dumps(migrated, sort_keys=True, separators=(",", ":")), event_id))
-            connection.execute("COMMIT")
-        except BaseException:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(audit_events)")}
+        had_schema_version = "schema_version" in columns
+        schema_expression = "schema_version" if had_schema_version else "'v0'"
+        rows = connection.execute(f"SELECT event_id, payload, input_hash, output_hash, schema_hash, {schema_expression} FROM audit_events ORDER BY event_id").fetchall()
+        migrations: list[tuple[str | None, str | None, str | None, str | None, str]] = []
+        for event_id, payload_text, input_hash, output_hash, schema_hash, schema_version in rows:
+            legacy_value: object
+            try:
+                legacy_value = json.loads(str(payload_text))
+            except (TypeError, ValueError):
+                legacy_value = str(payload_text)
+            payload_value = dict(legacy_value) if isinstance(legacy_value, dict) else legacy_value
+            if isinstance(payload_value, dict) and isinstance(payload_value.get("subject_ids"), list):
+                payload_value["subject_ids"] = tuple(payload_value["subject_ids"])
+            try:
+                validated_payload = AuditPayload.model_validate(payload_value)
+                migrated_payload = None
+            except Exception:
+                canonical = json.dumps(legacy_value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                item_count = len(legacy_value) if isinstance(legacy_value, (dict, list)) else 1
+                migrated_payload = json.dumps(AuditPayload(kind="legacy_migration", outcome_code="legacy_payload", item_count=item_count, legacy_payload_digest=sha256(canonical.encode("utf-8")).hexdigest(), legacy_schema_lineage="v1" if schema_version == "v1" else "v0", legacy_hash_policy=_LEGACY_HASH_POLICY).model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+                validated_payload = None
+            cleaned_hashes = tuple(value if value is None or _DIGEST.fullmatch(str(value)) else None for value in (input_hash, output_hash, schema_hash))
+            if migrated_payload is not None or cleaned_hashes != (input_hash, output_hash, schema_hash) or schema_version != "v1" or not had_schema_version:
+                payload_update = migrated_payload if migrated_payload is not None else json.dumps(validated_payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+                migrations.append((payload_update, *cleaned_hashes, str(event_id)))
+        if not had_schema_version or migrations:
+            connection.execute("DROP TRIGGER IF EXISTS audit_events_no_update")
+            connection.execute("DROP TRIGGER IF EXISTS audit_events_no_delete")
+            connection.execute("DROP TRIGGER IF EXISTS audit_events_no_replace")
+            if not had_schema_version:
+                connection.execute("ALTER TABLE audit_events ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'v1'")
+            for payload_update, input_hash, output_hash, schema_hash, event_id in migrations:
+                connection.execute("UPDATE audit_events SET payload = ?, input_hash = ?, output_hash = ?, schema_hash = ?, schema_version = 'v1' WHERE event_id = ?", (payload_update, input_hash, output_hash, schema_hash, event_id))
+
+    @staticmethod
+    def _rebuild_indexes(connection: sqlite3.Connection) -> None:
+        definitions = {
+            "audit_events_trace_sequence_idx": "trace_id, sequence, event_id",
+            "audit_events_workflow_idx": "workflow_id, trace_id, sequence, event_id",
+            "audit_events_task_idx": "task_id, trace_id, sequence, event_id",
+            "audit_events_attempt_idx": "attempt_id, trace_id, sequence, event_id",
+            "audit_events_occurred_at_idx": "occurred_at, trace_id, sequence, event_id",
+            "audit_events_type_time_idx": "event_type, occurred_at, trace_id, sequence, event_id",
+        }
+        for name, fields in definitions.items():
+            connection.execute(f"DROP INDEX IF EXISTS {name}")
+            connection.execute(f"CREATE INDEX {name} ON audit_events({fields})")
+
+    @staticmethod
+    def _create_triggers(connection: sqlite3.Connection) -> None:
+        connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_replace BEFORE INSERT ON audit_events WHEN EXISTS (SELECT 1 FROM audit_events WHERE event_id = NEW.event_id) OR EXISTS (SELECT 1 FROM audit_events WHERE trace_id = NEW.trace_id AND sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
 
     def append(self, event: AuditEvent) -> AuditEvent:
         if event.sequence is not None:
@@ -274,13 +428,8 @@ class AuditStore:
         columns = ("event_id", "trace_id", "workflow_id", "task_id", "attempt_id", "sequence", "occurred_at", "actor", "event_type", "status", "input_hash", "output_hash", "latency_ms", "token_usage", "cached_token_usage", "estimated_cost", "cumulative_cost", "model", "prompt_version", "schema_name", "schema_hash", "source_references", "payload", "schema_version")
         values = dict(zip(columns, row, strict=True))
         payload = json.loads(str(row[22]))
-        if not payload:
-            payload = {"kind": "transition", "subject_ids": ()}
-        elif "subject_ids" in payload:
+        if isinstance(payload, dict) and "subject_ids" in payload:
             payload["subject_ids"] = tuple(payload["subject_ids"])
-        for field_name in ("input_hash", "output_hash", "schema_hash"):
-            if values[field_name] is not None and not _DIGEST.fullmatch(str(values[field_name])):
-                values[field_name] = None
         return AuditEvent(**{**values, "occurred_at": datetime.fromisoformat(str(row[6])), "source_references": tuple(json.loads(str(row[21])),), "payload": payload})
 
 

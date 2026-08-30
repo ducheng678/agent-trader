@@ -7,16 +7,17 @@ from typing import Annotated, Iterable, Literal, Mapping
 
 from pydantic import Field, StrictBool, StrictFloat, StringConstraints, field_validator, model_validator
 
-from market_agent.workflow_contracts import ContextSummary, ContractModel, NonNegativeInt, OmittedSection, ShortText, SourceFact, SummaryCompleteness, Text
+from market_agent.workflow_contracts import ContextSummary, ContractModel, Digest, NonNegativeInt, OmittedSection, PositiveInt, ShortText, SourceFact, SummaryCompleteness, Text
 
 
 _MAX_CANDIDATES = 200
-_MAX_INPUT_BYTES = 65536
+_MAX_INPUT_BYTES = 524288
 _MAX_OMITTED_IDS = 30
 _MAX_UNCERTAINTIES = 20
+_MAX_EVIDENCE = 50
+_MAX_CONFLICT_QUESTIONS = 10
 _POLICY_VERSION = "context-selector-v2"
 ClaimText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
-Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 def _require_utc(value: datetime) -> datetime:
@@ -93,17 +94,79 @@ class ContextRecord(ContractModel):
         return self
 
 
-def _selected_hash(records: tuple[ContextRecord, ...], policy_version: str, max_records: int, max_bytes: int) -> str:
-    return _canonical_hash({"policy_version": policy_version, "max_records": max_records, "max_bytes": max_bytes, "records": [record.model_dump(mode="json") for record in records]})
-
-
 class CandidateManifestEntry(ContractModel):
     record_id: ShortText
     record_hash: Digest
+    relevance: StrictFloat = Field(ge=0.0, le=1.0)
+    conflict_group_id: ShortText | None = None
+    canonical_byte_length: PositiveInt
+
+
+def _limits_identity(max_records: int, max_bytes: int) -> dict[str, str]:
+    return {"max_bytes": f"{max_bytes:012d}", "max_records": f"{max_records:02d}"}
+
+
+def _manifest_envelope(entries: tuple[CandidateManifestEntry, ...], policy_version: str, max_records: int, max_bytes: int) -> dict[str, object]:
+    return {"candidate_count": len(entries), "entries": [entry.model_dump(mode="json") for entry in entries], "limits": _limits_identity(max_records, max_bytes), "policy_version": policy_version}
 
 
 def _manifest_hash(entries: tuple[CandidateManifestEntry, ...], policy_version: str, max_records: int, max_bytes: int) -> str:
-    return _canonical_hash({"policy_version": policy_version, "max_records": max_records, "max_bytes": max_bytes, "entries": [entry.model_dump(mode="json") for entry in entries]})
+    return _canonical_hash(_manifest_envelope(entries, policy_version, max_records, max_bytes))
+
+
+def _full_input_envelope(entries: tuple[CandidateManifestEntry, ...], manifest_hash: str, policy_version: str, max_records: int, max_bytes: int) -> dict[str, object]:
+    return {"candidate_count": len(entries), "candidate_manifest": [entry.model_dump(mode="json") for entry in entries], "limits": _limits_identity(max_records, max_bytes), "manifest_hash": manifest_hash, "policy_version": policy_version}
+
+
+def _selected_envelope(entries: tuple[CandidateManifestEntry, ...], manifest_hash: str, policy_version: str, max_records: int, max_bytes: int) -> dict[str, object]:
+    return {"limits": _limits_identity(max_records, max_bytes), "manifest_hash": manifest_hash, "policy_version": policy_version, "selected_count": len(entries), "selected_entries": [entry.model_dump(mode="json") for entry in entries]}
+
+
+def _content_envelope_byte_length(identity_envelope: dict[str, object], entries: tuple[CandidateManifestEntry, ...]) -> int:
+    empty_length = len(_canonical_bytes({"identity": identity_envelope, "records": []}))
+    if not entries:
+        return empty_length
+    return empty_length + sum(entry.canonical_byte_length for entry in entries) + len(entries) - 1
+
+
+def _selected_byte_length(entries: tuple[CandidateManifestEntry, ...], manifest_hash: str, policy_version: str, max_records: int, max_bytes: int) -> int:
+    return _content_envelope_byte_length(_selected_envelope(entries, manifest_hash, policy_version, max_records, max_bytes), entries)
+
+
+def _full_input_byte_length(entries: tuple[CandidateManifestEntry, ...], manifest_hash: str, policy_version: str, max_records: int, max_bytes: int) -> int:
+    return _content_envelope_byte_length(_full_input_envelope(entries, manifest_hash, policy_version, max_records, max_bytes), entries)
+
+
+def _derive_inventory(entries: tuple[CandidateManifestEntry, ...], manifest_hash: str, policy_version: str, max_records: int, max_bytes: int) -> tuple[tuple[str, ...], tuple[str, ...], int]:
+    grouped: dict[tuple[str, str], list[CandidateManifestEntry]] = {}
+    for entry in entries:
+        key = ("conflict", entry.conflict_group_id) if entry.conflict_group_id is not None else ("record", entry.record_id)
+        grouped.setdefault(key, []).append(entry)
+    if any(key[0] == "conflict" and len(group) < 2 for key, group in grouped.items()):
+        raise ValueError("manifest conflict groups require at least two members")
+    ordered_groups = []
+    for group in grouped.values():
+        ordered = tuple(sorted(group, key=lambda item: (-item.relevance, item.record_id)))
+        ordered_groups.append(ordered)
+    ordered_groups.sort(key=lambda group: (-group[0].relevance, group[0].record_id))
+    selected: list[CandidateManifestEntry] = []
+    omitted: list[str] = []
+    for group in ordered_groups:
+        proposed = tuple(selected) + group
+        proposed_length = _selected_byte_length(proposed, manifest_hash, policy_version, max_records, max_bytes)
+        if len(proposed) <= max_records and proposed_length <= max_bytes:
+            selected.extend(group)
+        else:
+            omitted.extend(entry.record_id for entry in group)
+    selected_entries = tuple(selected)
+    selected_length = _selected_byte_length(selected_entries, manifest_hash, policy_version, max_records, max_bytes)
+    if selected_length > max_bytes:
+        raise ValueError("max_bytes cannot hold the canonical empty selection envelope")
+    return tuple(entry.record_id for entry in selected_entries), tuple(omitted), selected_length
+
+
+def _selected_hash(entries: tuple[CandidateManifestEntry, ...], manifest_hash: str, policy_version: str, max_records: int, max_bytes: int) -> str:
+    return _canonical_hash(_selected_envelope(entries, manifest_hash, policy_version, max_records, max_bytes))
 
 
 class ContextSelection(ContractModel):
@@ -113,7 +176,7 @@ class ContextSelection(ContractModel):
     selected_count: NonNegativeInt
     omitted_count: NonNegativeInt
     omitted_ids_truncated: StrictBool = False
-    selection_policy_version: ShortText = _POLICY_VERSION
+    selection_policy_version: Literal["context-selector-v2"] = _POLICY_VERSION
     max_records: NonNegativeInt
     max_bytes: NonNegativeInt
     selected_record_hash: Digest
@@ -121,6 +184,8 @@ class ContextSelection(ContractModel):
     candidate_count: NonNegativeInt = 0
     candidate_manifest: tuple[CandidateManifestEntry, ...] = Field(default_factory=tuple, max_length=_MAX_CANDIDATES)
     manifest_hash: Digest
+    selected_byte_length: PositiveInt
+    full_input_byte_length: PositiveInt
 
     @property
     def input_hash(self) -> str:
@@ -128,25 +193,51 @@ class ContextSelection(ContractModel):
 
     @model_validator(mode="after")
     def validate_selection(self) -> ContextSelection:
-        record_ids = tuple(record.record_id for record in self.records)
-        if len(set(record_ids)) != len(record_ids) or self.selected_ids != record_ids or self.selected_count != len(record_ids):
-            raise ValueError("selection identifiers and counts must match selected records")
-        if len(set(self.omitted_ids)) != len(self.omitted_ids) or set(self.selected_ids).intersection(self.omitted_ids):
-            raise ValueError("selected and omitted identifiers must be unique and disjoint")
-        if self.omitted_count < len(self.omitted_ids) or self.omitted_ids_truncated != (self.omitted_count > len(self.omitted_ids)):
-            raise ValueError("omitted identifier truncation metadata is inconsistent")
-        if not 1 <= self.max_records <= 30 or self.max_bytes < 1:
+        if not 1 <= self.max_records <= 30 or not 1 <= self.max_bytes <= 999999999999:
             raise ValueError("selection bounds are invalid")
-        if self.selected_record_hash != _selected_hash(self.records, self.selection_policy_version, self.max_records, self.max_bytes):
-            raise ValueError("selection hash does not match selected records")
         if self.candidate_count != len(self.candidate_manifest) or len({entry.record_id for entry in self.candidate_manifest}) != self.candidate_count:
             raise ValueError("candidate manifest count or identifiers are inconsistent")
-        if self.manifest_hash != _manifest_hash(self.candidate_manifest, self.selection_policy_version, self.max_records, self.max_bytes) or self.all_input_hash != self.manifest_hash:
-            raise ValueError("candidate manifest hashes are inconsistent")
-        entries = {entry.record_id: entry.record_hash for entry in self.candidate_manifest}
-        if any(entries.get(record.record_id) != _canonical_hash(record.model_dump(mode="json")) for record in self.records):
+        if self.candidate_manifest != tuple(sorted(self.candidate_manifest, key=lambda entry: entry.record_id)):
+            raise ValueError("candidate manifest order is noncanonical")
+        expected_manifest_hash = _manifest_hash(self.candidate_manifest, self.selection_policy_version, self.max_records, self.max_bytes)
+        if self.manifest_hash != expected_manifest_hash:
+            raise ValueError("candidate manifest hash is inconsistent")
+        full_envelope = _canonical_bytes(_full_input_envelope(self.candidate_manifest, self.manifest_hash, self.selection_policy_version, self.max_records, self.max_bytes))
+        if self.full_input_byte_length != _full_input_byte_length(self.candidate_manifest, self.manifest_hash, self.selection_policy_version, self.max_records, self.max_bytes) or self.all_input_hash != sha256(full_envelope).hexdigest():
+            raise ValueError("full-input envelope identity is inconsistent")
+        derived_selected, derived_omitted, selected_length = _derive_inventory(self.candidate_manifest, self.manifest_hash, self.selection_policy_version, self.max_records, self.max_bytes)
+        canonical_omitted = derived_omitted[:_MAX_OMITTED_IDS]
+        if self.selected_ids != derived_selected or self.selected_count != len(derived_selected):
+            raise ValueError("selection identifiers and counts do not match policy")
+        if self.omitted_ids != canonical_omitted or self.omitted_count != len(derived_omitted):
+            raise ValueError("omitted identifiers and counts do not match policy")
+        if self.omitted_ids_truncated != (len(derived_omitted) > len(canonical_omitted)):
+            raise ValueError("omitted identifier truncation metadata is inconsistent")
+        record_ids = tuple(record.record_id for record in self.records)
+        if len(set(record_ids)) != len(record_ids) or record_ids != self.selected_ids:
+            raise ValueError("selection identifiers and counts must match selected records")
+        entries = {entry.record_id: entry for entry in self.candidate_manifest}
+        if any(entries.get(record.record_id) is None or entries[record.record_id].record_hash != _canonical_hash(record.model_dump(mode="json")) or entries[record.record_id].canonical_byte_length != len(_canonical_bytes(record.model_dump(mode="json"))) or entries[record.record_id].relevance != record.relevance or entries[record.record_id].conflict_group_id != record.conflict_group_id for record in self.records):
             raise ValueError("selected records do not match candidate manifest")
+        selected_entries = tuple(entries[record_id] for record_id in self.selected_ids)
+        if self.selected_byte_length != selected_length or self.selected_record_hash != _selected_hash(selected_entries, self.manifest_hash, self.selection_policy_version, self.max_records, self.max_bytes):
+            raise ValueError("selection hash does not match canonical selected envelope")
         return self
+
+
+_SUMMARY_IDENTITY_FIELDS = (
+    "input_hash", "all_input_hash", "selected_ids", "omitted_ids", "selected_count", "omitted_count",
+    "omitted_ids_truncated", "unreported_omitted_count", "selection_policy_version", "max_records", "max_bytes",
+    "candidate_count", "candidate_manifest", "manifest_hash", "selected_byte_length", "full_input_byte_length",
+    "uncertainty_markers", "omitted_uncertainty_count", "conflict_questions", "omitted_conflict_question_count", "conflicts",
+    "supporting_evidence", "omitted_supporting_evidence_count", "contradicting_evidence", "omitted_contradicting_evidence_count",
+)
+
+
+def _summary_identity(summary: ContextSummary, values: Mapping[str, object]) -> str:
+    normalized_summary = {key: value for key, value in summary.model_dump(mode="json").items() if key != "summary_id"}
+    inventory = {key: values[key] for key in _SUMMARY_IDENTITY_FIELDS}
+    return "summary-" + _canonical_hash({"normalized_summary": normalized_summary, "selection_inventory": inventory})[:32]
 
 
 class ContextHandoff(ContractModel):
@@ -162,24 +253,62 @@ class ContextHandoff(ContractModel):
     unreported_omitted_count: NonNegativeInt
     uncertainty_markers: tuple[Text, ...] = Field(default_factory=tuple, max_length=_MAX_UNCERTAINTIES)
     omitted_uncertainty_count: NonNegativeInt
+    conflict_questions: tuple[Text, ...] = Field(default_factory=tuple, max_length=_MAX_CONFLICT_QUESTIONS)
+    omitted_conflict_question_count: NonNegativeInt
     conflicts: tuple[ConflictGroup, ...] = Field(default_factory=tuple, max_length=20)
-    supporting_evidence: tuple[EvidenceReference, ...] = Field(default_factory=tuple, max_length=50)
-    contradicting_evidence: tuple[EvidenceReference, ...] = Field(default_factory=tuple, max_length=50)
-    selection_policy_version: ShortText
+    supporting_evidence: tuple[EvidenceReference, ...] = Field(default_factory=tuple, max_length=_MAX_EVIDENCE)
+    omitted_supporting_evidence_count: NonNegativeInt
+    contradicting_evidence: tuple[EvidenceReference, ...] = Field(default_factory=tuple, max_length=_MAX_EVIDENCE)
+    omitted_contradicting_evidence_count: NonNegativeInt
+    selection_policy_version: Literal["context-selector-v2"]
+    max_records: NonNegativeInt
+    max_bytes: NonNegativeInt
     candidate_count: NonNegativeInt
+    candidate_manifest: tuple[CandidateManifestEntry, ...] = Field(default_factory=tuple, max_length=_MAX_CANDIDATES)
     manifest_hash: Digest
+    selected_byte_length: PositiveInt
+    full_input_byte_length: PositiveInt
     untrusted_data: Literal[True]
 
     @model_validator(mode="after")
     def validate_handoff(self) -> ContextHandoff:
-        if self.summary.source_record_hash != self.input_hash or self.selected_count != len(self.selected_ids):
+        if not 1 <= self.max_records <= 30 or not 1 <= self.max_bytes <= 999999999999:
+            raise ValueError("handoff selection bounds are invalid")
+        if self.candidate_count != len(self.candidate_manifest) or self.candidate_manifest != tuple(sorted(self.candidate_manifest, key=lambda entry: entry.record_id)) or len({entry.record_id for entry in self.candidate_manifest}) != self.candidate_count:
+            raise ValueError("handoff candidate manifest is inconsistent")
+        expected_manifest_hash = _manifest_hash(self.candidate_manifest, self.selection_policy_version, self.max_records, self.max_bytes)
+        if self.manifest_hash != expected_manifest_hash:
+            raise ValueError("handoff manifest hash is inconsistent")
+        full_envelope = _canonical_bytes(_full_input_envelope(self.candidate_manifest, self.manifest_hash, self.selection_policy_version, self.max_records, self.max_bytes))
+        if self.full_input_byte_length != _full_input_byte_length(self.candidate_manifest, self.manifest_hash, self.selection_policy_version, self.max_records, self.max_bytes) or self.all_input_hash != sha256(full_envelope).hexdigest():
+            raise ValueError("handoff full-input envelope is inconsistent")
+        derived_selected, derived_omitted, selected_length = _derive_inventory(self.candidate_manifest, self.manifest_hash, self.selection_policy_version, self.max_records, self.max_bytes)
+        if self.selected_ids != derived_selected or self.selected_count != len(derived_selected):
+            raise ValueError("handoff selected inventory is inconsistent")
+        if self.omitted_ids != derived_omitted[:_MAX_OMITTED_IDS] or self.omitted_count != len(derived_omitted):
+            raise ValueError("handoff omitted inventory is inconsistent")
+        selected_entries = {entry.record_id: entry for entry in self.candidate_manifest}
+        expected_selected_hash = _selected_hash(tuple(selected_entries[record_id] for record_id in self.selected_ids), self.manifest_hash, self.selection_policy_version, self.max_records, self.max_bytes)
+        if self.selected_byte_length != selected_length or self.input_hash != expected_selected_hash:
+            raise ValueError("handoff selected envelope is inconsistent")
+        if self.summary.source_record_hash != self.input_hash:
             raise ValueError("handoff identity contradicts summary selection")
-        if self.candidate_count < self.selected_count:
-            raise ValueError("handoff candidate inventory contradicts selected records")
         if self.omitted_count < len(self.omitted_ids) or self.unreported_omitted_count != self.omitted_count - len(self.omitted_ids):
             raise ValueError("handoff omitted metadata is inconsistent")
         if self.omitted_ids_truncated != (self.unreported_omitted_count > 0):
             raise ValueError("handoff omitted truncation metadata is inconsistent")
+        expected_questions = tuple(sorted(f"unresolved conflict: {group.group_id}" for group in self.conflicts if group.unresolved))
+        if self.conflict_questions != expected_questions[:_MAX_CONFLICT_QUESTIONS] or self.omitted_conflict_question_count != len(expected_questions) - len(self.conflict_questions):
+            raise ValueError("handoff conflict-question aggregation is inconsistent")
+        for items, omitted, relation in ((self.supporting_evidence, self.omitted_supporting_evidence_count, "supporting"), (self.contradicting_evidence, self.omitted_contradicting_evidence_count, "contradicting")):
+            if any(item.relation != relation for item in items) or items != tuple(sorted(items, key=lambda item: item.evidence_id)):
+                raise ValueError("handoff evidence aggregation is noncanonical")
+            if (omitted > 0 and len(items) != _MAX_EVIDENCE) or (len(items) < _MAX_EVIDENCE and omitted != 0):
+                raise ValueError("handoff evidence omission metadata is inconsistent")
+        if self.uncertainty_markers != tuple(sorted(set(self.uncertainty_markers))) or (self.omitted_uncertainty_count > 0 and len(self.uncertainty_markers) != _MAX_UNCERTAINTIES) or (len(self.uncertainty_markers) < _MAX_UNCERTAINTIES and self.omitted_uncertainty_count != 0):
+            raise ValueError("handoff uncertainty aggregation is inconsistent")
+        if self.summary.summary_id != _summary_identity(self.summary, self.model_dump(mode="json")):
+            raise ValueError("handoff summary identity is inconsistent")
         expected_output = _canonical_hash({key: value for key, value in self.model_dump(mode="json").items() if key != "output_hash"})
         if self.output_hash != expected_output:
             raise ValueError("handoff output hash does not match handoff content")
@@ -208,17 +337,13 @@ def select_context(source_records: Iterable[ContextRecord | Mapping[str, object]
     if isinstance(max_records, bool) or not 1 <= max_records <= 30:
         raise ValueError("max_records must be between 1 and 30")
     selected_max_bytes = max_characters if max_bytes is None else max_bytes
-    if isinstance(selected_max_bytes, bool) or selected_max_bytes < 1:
+    if isinstance(selected_max_bytes, bool) or not 1 <= selected_max_bytes <= 999999999999:
         raise ValueError("max_bytes must be positive")
     normalized: list[ContextRecord] = []
-    consumed_input_bytes = 0
     for record in source_records:
         if len(normalized) >= _MAX_CANDIDATES:
             raise ValueError("context candidate count exceeds limit")
         normalized_record = _normalize_record(record)
-        consumed_input_bytes += len(_canonical_bytes(normalized_record.model_dump(mode="json")))
-        if consumed_input_bytes > _MAX_INPUT_BYTES:
-            raise ValueError("context input exceeds byte limit")
         normalized.append(normalized_record)
     if len({record.record_id for record in normalized}) != len(normalized):
         raise ValueError("context record identifiers must be unique")
@@ -232,25 +357,20 @@ def select_context(source_records: Iterable[ContextRecord | Mapping[str, object]
             raise ValueError("conflict groups require at least two members")
         if len({item.conflict_description for item in group}) != 1 or len({item.conflict_unresolved for item in group}) != 1:
             raise ValueError("conflict group metadata must be consistent")
-    selected: list[ContextRecord] = []
-    omitted: list[str] = []
-    used_bytes = 0
-    group_values = sorted(grouped.values(), key=lambda group: _record_sort_key(sorted(group, key=_record_sort_key)[0]))
-    for group in group_values:
-        ordered_group = sorted(group, key=_record_sort_key)
-        group_bytes = sum(len(_canonical_bytes(record.model_dump(mode="json"))) for record in ordered_group)
-        if len(selected) + len(ordered_group) <= max_records and used_bytes + group_bytes <= selected_max_bytes:
-            selected.extend(ordered_group)
-            used_bytes += group_bytes
-        else:
-            omitted.extend(record.record_id for record in ordered_group)
-    selected_tuple = tuple(selected)
-    manifest = tuple(CandidateManifestEntry(record_id=record.record_id, record_hash=_canonical_hash(record.model_dump(mode="json"))) for record in sorted(normalized, key=lambda item: item.record_id))
+    manifest = tuple(CandidateManifestEntry(record_id=record.record_id, record_hash=_canonical_hash(record.model_dump(mode="json")), relevance=record.relevance, conflict_group_id=record.conflict_group_id, canonical_byte_length=len(_canonical_bytes(record.model_dump(mode="json")))) for record in sorted(normalized, key=lambda item: item.record_id))
     manifest_hash = _manifest_hash(manifest, _POLICY_VERSION, max_records, selected_max_bytes)
+    full_input_envelope = _canonical_bytes(_full_input_envelope(manifest, manifest_hash, _POLICY_VERSION, max_records, selected_max_bytes))
+    full_input_byte_length = _full_input_byte_length(manifest, manifest_hash, _POLICY_VERSION, max_records, selected_max_bytes)
+    if full_input_byte_length > _MAX_INPUT_BYTES:
+        raise ValueError("context full-input envelope exceeds byte limit")
+    selected_ids, omitted, selected_byte_length = _derive_inventory(manifest, manifest_hash, _POLICY_VERSION, max_records, selected_max_bytes)
+    records_by_id = {record.record_id: record for record in normalized}
+    selected_tuple = tuple(records_by_id[record_id] for record_id in selected_ids)
+    selected_entries = {entry.record_id: entry for entry in manifest}
     reported_omitted = tuple(omitted[:_MAX_OMITTED_IDS])
     return ContextSelection(
         records=selected_tuple,
-        selected_ids=tuple(record.record_id for record in selected_tuple),
+        selected_ids=selected_ids,
         omitted_ids=reported_omitted,
         selected_count=len(selected_tuple),
         omitted_count=len(omitted),
@@ -258,11 +378,13 @@ def select_context(source_records: Iterable[ContextRecord | Mapping[str, object]
         selection_policy_version=_POLICY_VERSION,
         max_records=max_records,
         max_bytes=selected_max_bytes,
-        selected_record_hash=_selected_hash(selected_tuple, _POLICY_VERSION, max_records, selected_max_bytes),
-        all_input_hash=manifest_hash,
+        selected_record_hash=_selected_hash(tuple(selected_entries[record_id] for record_id in selected_ids), manifest_hash, _POLICY_VERSION, max_records, selected_max_bytes),
+        all_input_hash=sha256(full_input_envelope).hexdigest(),
         candidate_count=len(normalized),
         candidate_manifest=manifest,
         manifest_hash=manifest_hash,
+        selected_byte_length=selected_byte_length,
+        full_input_byte_length=full_input_byte_length,
     )
 
 
@@ -274,42 +396,49 @@ def _conflicts(records: tuple[ContextRecord, ...]) -> tuple[ConflictGroup, ...]:
     return tuple(ConflictGroup(group_id=group_id, description=items[0].conflict_description or "conflict", unresolved=any(item.conflict_unresolved for item in items), record_ids=tuple(item.record_id for item in sorted(items, key=_record_sort_key))) for group_id, items in sorted(groups.items()))
 
 
-def _summary_id(selection: ContextSelection, workflow_id: str, trace_id: str, task_id: str, user_objective: str, immutable_constraints: tuple[str, ...], summary_version: str, uncertainty: tuple[str, ...], conflicts: tuple[ConflictGroup, ...]) -> str:
-    return "summary-" + _canonical_hash({"workflow_id": workflow_id, "trace_id": trace_id, "task_id": task_id, "user_objective": user_objective, "immutable_constraints": immutable_constraints, "summary_version": summary_version, "selected_record_hash": selection.selected_record_hash, "all_input_hash": selection.all_input_hash, "selected_ids": selection.selected_ids, "omitted_ids": selection.omitted_ids, "selected_count": selection.selected_count, "omitted_count": selection.omitted_count, "uncertainty": uncertainty, "conflicts": [group.model_dump(mode="json") for group in conflicts], "policy": selection.selection_policy_version})[:16]
+def _dedupe_evidence(supporting_items: tuple[EvidenceReference, ...], contradicting_items: tuple[EvidenceReference, ...]) -> tuple[tuple[EvidenceReference, ...], tuple[EvidenceReference, ...]]:
+    registry: dict[str, EvidenceReference] = {}
+    for item in supporting_items + contradicting_items:
+        prior = registry.get(item.evidence_id)
+        if prior is not None and prior != item:
+            raise ValueError("duplicate evidence identifiers must have identical contracts")
+        registry[item.evidence_id] = item
+    supporting = tuple(sorted({item.evidence_id: item for item in supporting_items}.values(), key=lambda item: item.evidence_id))
+    contradicting = tuple(sorted({item.evidence_id: item for item in contradicting_items}.values(), key=lambda item: item.evidence_id))
+    return supporting, contradicting
 
 
 def summarize_context(selection: ContextSelection, *, workflow_id: str, trace_id: str, task_id: str, user_objective: str, immutable_constraints: tuple[str, ...] = (), summary_version: str = "v1") -> ContextHandoff:
     selection = ContextSelection.model_validate(selection.model_dump())
-    expected_hash = _selected_hash(selection.records, selection.selection_policy_version, selection.max_records, selection.max_bytes)
-    if selection.selected_record_hash != expected_hash:
-        raise ValueError("selection hash does not match selected records")
     facts = tuple(SourceFact(source_id=record.claim.source_id, observed_at=_utc_text(record.claim.observed_at), fact=("not " if record.claim.negated else "") + record.claim.value + (f" {record.claim.unit}" if record.claim.unit else "")) for record in sorted(selection.records, key=lambda record: (record.claim.source_id, record.record_id)))
     all_uncertainty = tuple(sorted({record.uncertainty for record in selection.records if record.uncertainty is not None}))
     uncertainty = all_uncertainty[:_MAX_UNCERTAINTIES]
     conflicts = _conflicts(selection.records)
-    unresolved = tuple(f"unresolved conflict: {group.group_id}" for group in conflicts if group.unresolved)
-    incomplete = selection.omitted_count > 0 or not selection.records or bool(unresolved)
+    all_conflict_questions = tuple(sorted(f"unresolved conflict: {group.group_id}" for group in conflicts if group.unresolved))
+    conflict_questions = all_conflict_questions[:_MAX_CONFLICT_QUESTIONS]
+    incomplete = selection.omitted_count > 0 or not selection.records or bool(all_conflict_questions)
+    omitted_sections_values: list[OmittedSection] = []
     if selection.omitted_count:
-        omitted_sections = (OmittedSection(section="source_records", count=selection.omitted_count),)
-    elif unresolved:
-        omitted_sections = (OmittedSection(section="unresolved_conflicts", count=len(unresolved)),)
-    elif not selection.records:
-        omitted_sections = (OmittedSection(section="source_records", count=0),)
-    else:
-        omitted_sections = ()
-    combined_questions = uncertainty + unresolved
+        omitted_sections_values.append(OmittedSection(section="source_records", count=selection.omitted_count))
+    if all_conflict_questions:
+        omitted_sections_values.append(OmittedSection(section="unresolved_conflicts", count=len(all_conflict_questions)))
+    if not selection.records and not selection.omitted_count:
+        omitted_sections_values.append(OmittedSection(section="source_records", count=0))
+    omitted_sections = tuple(omitted_sections_values)
+    combined_questions = uncertainty + conflict_questions
     unresolved_questions = combined_questions[:_MAX_UNCERTAINTIES] or (("insufficient source evidence",) if not selection.records else ())
-    summary = ContextSummary(summary_id=_summary_id(selection, workflow_id, trace_id, task_id, user_objective, immutable_constraints, summary_version, uncertainty, conflicts), task_id=task_id, workflow_id=workflow_id, trace_id=trace_id, user_objective=user_objective, immutable_constraints=immutable_constraints, market_facts=facts, unresolved_questions=unresolved_questions, conflicts=tuple(f"{group.group_id}: {group.description}" for group in conflicts), omitted_sections=omitted_sections, token_estimate=sum(len(fact.fact.split()) for fact in facts), completeness=SummaryCompleteness.INCOMPLETE if incomplete else SummaryCompleteness.COMPLETE, summary_version=summary_version, source_record_hash=selection.selected_record_hash, source_references=tuple(fact.source_id for fact in facts))
-    def dedupe(items: tuple[EvidenceReference, ...]) -> tuple[EvidenceReference, ...]:
-        values: dict[str, EvidenceReference] = {}
-        for item in items:
-            values.setdefault(item.evidence_id, item)
-        return tuple(values[key] for key in sorted(values)[:50])
-    supporting = dedupe(tuple(item for record in selection.records for item in record.supporting_evidence))
+    provisional_summary = ContextSummary(summary_id="pending", task_id=task_id, workflow_id=workflow_id, trace_id=trace_id, user_objective=user_objective, immutable_constraints=immutable_constraints, market_facts=facts, unresolved_questions=unresolved_questions, conflicts=tuple(f"{group.group_id}: {group.description}" for group in conflicts), omitted_sections=omitted_sections, token_estimate=sum(len(fact.fact.split()) for fact in facts), completeness=SummaryCompleteness.INCOMPLETE if incomplete else SummaryCompleteness.COMPLETE, summary_version=summary_version, source_record_hash=selection.selected_record_hash, source_references=tuple(fact.source_id for fact in facts))
+    explicit_supporting = tuple(item for record in selection.records for item in record.supporting_evidence)
     explicit_contradictions = tuple(item for record in selection.records for item in record.contradicting_evidence)
-    inferred_contradictions = tuple(EvidenceReference(evidence_id=record.record_id, source_id=record.claim.source_id, observed_at=record.claim.observed_at, relation="contradicting") for group in conflicts for record in selection.records if record.conflict_group_id == group.group_id and record.record_id != group.record_ids[0])
-    contradicting = dedupe(explicit_contradictions + inferred_contradictions)
-    base = {"summary": summary, "input_hash": selection.selected_record_hash, "all_input_hash": selection.all_input_hash, "selected_ids": selection.selected_ids, "omitted_ids": selection.omitted_ids, "selected_count": selection.selected_count, "omitted_count": selection.omitted_count, "omitted_ids_truncated": selection.omitted_ids_truncated, "unreported_omitted_count": selection.omitted_count - len(selection.omitted_ids), "uncertainty_markers": uncertainty, "omitted_uncertainty_count": len(all_uncertainty) - len(uncertainty), "conflicts": conflicts, "supporting_evidence": supporting, "contradicting_evidence": contradicting, "selection_policy_version": selection.selection_policy_version, "candidate_count": selection.candidate_count, "manifest_hash": selection.manifest_hash, "untrusted_data": True}
+    inferred_contradictions = tuple(EvidenceReference(evidence_id=record.record_id, source_id=record.claim.source_id, observed_at=record.claim.observed_at, relation="contradicting") for group in conflicts for record in selection.records if record.conflict_group_id == group.group_id)
+    all_supporting, all_contradicting = _dedupe_evidence(explicit_supporting, explicit_contradictions + inferred_contradictions)
+    supporting = all_supporting[:_MAX_EVIDENCE]
+    contradicting = all_contradicting[:_MAX_EVIDENCE]
+    base = {"summary": provisional_summary, "input_hash": selection.selected_record_hash, "all_input_hash": selection.all_input_hash, "selected_ids": selection.selected_ids, "omitted_ids": selection.omitted_ids, "selected_count": selection.selected_count, "omitted_count": selection.omitted_count, "omitted_ids_truncated": selection.omitted_ids_truncated, "unreported_omitted_count": selection.omitted_count - len(selection.omitted_ids), "uncertainty_markers": uncertainty, "omitted_uncertainty_count": len(all_uncertainty) - len(uncertainty), "conflict_questions": conflict_questions, "omitted_conflict_question_count": len(all_conflict_questions) - len(conflict_questions), "conflicts": conflicts, "supporting_evidence": supporting, "omitted_supporting_evidence_count": len(all_supporting) - len(supporting), "contradicting_evidence": contradicting, "omitted_contradicting_evidence_count": len(all_contradicting) - len(contradicting), "selection_policy_version": selection.selection_policy_version, "max_records": selection.max_records, "max_bytes": selection.max_bytes, "candidate_count": selection.candidate_count, "candidate_manifest": selection.candidate_manifest, "manifest_hash": selection.manifest_hash, "selected_byte_length": selection.selected_byte_length, "full_input_byte_length": selection.full_input_byte_length, "untrusted_data": True}
+    provisional = ContextHandoff.model_construct(**base, output_hash="pending")
+    summary_values = provisional.model_dump(mode="json")
+    summary = provisional_summary.model_copy(update={"summary_id": _summary_identity(provisional_summary, summary_values)})
+    base["summary"] = summary
     provisional = ContextHandoff.model_construct(**base, output_hash="pending")
     output_hash = _canonical_hash({key: value for key, value in provisional.model_dump(mode="json").items() if key != "output_hash"})
     return ContextHandoff(**base, output_hash=output_hash)

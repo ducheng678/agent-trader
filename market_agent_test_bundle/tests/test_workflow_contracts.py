@@ -10,7 +10,9 @@ from market_agent.workflow_contracts import (
     Action,
     AgentReport,
     AgentTask,
+    ContextSummary,
     DataQuality,
+    Digest,
     EventAlignment,
     EventAssessment,
     EventRelevance,
@@ -20,6 +22,7 @@ from market_agent.workflow_contracts import (
     MarketRegime,
     ModelTier,
     ReportStatus,
+    SummaryCompleteness,
     TaskDifficulty,
     TaskType,
     TechnicalAnalysis,
@@ -338,4 +341,20 @@ def test_workflow_result_rejects_unstructured_playbook_payload():
             terminal_mode=TerminalMode.PLAYBOOK,
             final_action=Action.LONG,
             playbook_payload={"free_form": "payload"},
+        )
+
+
+@pytest.mark.parametrize("digest", ["A" * 64, "g" * 64, "short"])
+def test_shared_digest_alias_rejects_noncanonical_nested_summary_hashes(digest):
+    with pytest.raises(ValidationError):
+        ContextSummary(
+            summary_id="summary-1",
+            task_id="task-1",
+            workflow_id="workflow-1",
+            trace_id="trace-1",
+            user_objective="Assess BTC",
+            token_estimate=0,
+            completeness=SummaryCompleteness.COMPLETE,
+            summary_version="v1",
+            source_record_hash=digest,
         )

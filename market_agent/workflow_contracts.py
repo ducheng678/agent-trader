@@ -13,6 +13,7 @@ PositiveFinite = Annotated[StrictFloat, Field(gt=0.0)]
 NonNegativeFinite = Annotated[StrictFloat, Field(ge=0.0)]
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 class FrozenDict(dict[str, JsonValue]):
@@ -208,7 +209,7 @@ class ContextSummary(ContractModel):
     completeness: SummaryCompleteness
     summary_version: ShortText
     summarizer_model: ModelTier | None = None
-    source_record_hash: ShortText
+    source_record_hash: Digest
     source_references: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
 
     @model_validator(mode="after")
