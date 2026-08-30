@@ -97,6 +97,32 @@ A cache hit always receives the new caller's trace and records the cached entry'
 
 Reflection uses a Luna-only policy with no higher-model fallback, no tools, no durable writes, a small output/token/cost cap, bounded timeout/retries, the same audit/budget/backoff/circuit-breaker controls, and optional exact caching keyed by the immutable target-output hash plus reflection prompt/schema/model versions. If Luna reflection is unavailable or malformed after its bounded retry, deterministic validation remains authoritative but the configured core output fails closed and returns to the coordinator or a safe terminal. Non-core outputs never incur reflection cost. A reflection result is validated deterministically but is never recursively reflected.
 
+## Production Observability
+
+Observability has three separate code modules and one correlation contract. `workflow_structured_logging.py` emits one-line JSON records with UTC timestamp, trace/span/parent IDs, request/workflow/task/attempt/tool-call IDs, actor/node/event/status, latency, model/tier, prompt/schema/release versions, token classes, reserved/actual/cumulative cost, retry/fallback/circuit/cache outcomes, and bounded redacted attributes. Logs are searchable by trace, time, actor, event, and status. Credentials, raw authorization, wallet data, private reasoning, unrestricted prompts, and unrestricted tool/web content are prohibited by typed log-event schemas.
+
+`workflow_metrics.py` exposes low-cardinality counters, gauges, and histograms for request/task success, `no_trade`/`不知道`, abstention correctness, cache hits/false hits, retry/fallback/circuit outcomes, queue lag, lifecycle backlog, API/LLM/tool/database/cache latency and errors, input/cached-input/cache-write/output tokens, and reserved/actual cost by approved node/model/tier labels. Trace IDs are metric exemplars, never labels. Release/version labels come from bounded registries to prevent cardinality attacks. SLO alerts cover broad error spikes, latency, cost, trace incompleteness, schema failures, unsafe-cache rejection, and correction regressions.
+
+`workflow_tool_observability.py` creates a child span and append-only audit pair for every requested/completed/denied tool call. Records include tool-call ID, capability ID hash, tool/schema versions, redacted typed argument/result summaries, argument/result hashes and sizes, status, latency, retry count, and bounded artifact references. Sensitive fields are removed before serialization. Large or unrestricted results are stored only through the governed object store and logs retain checksum-addressed references.
+
+OpenTelemetry-compatible spans cover ingress, coordinator, each Agent, core reflection/correction, model call, tool call, cache/database/queue/memory operation, and response. Every request records complete local span metadata and audit linkage; exporter sampling may reduce remote telemetry volume but never removes the canonical per-request audit chain. Structured logging, metrics export, and tracing failures are isolated from trading truth, while failure of the mandatory append-only audit boundary remains fail-closed.
+
+## Versioned Prompt and Model Configuration
+
+System prompts are not embedded as ad hoc Python strings. Immutable prompt text files live under `market_agent/config/prompts/releases/<release_id>/system/`; versioned JSON profiles in the same release map each node to its prompt file/hash, model tier policy, optional temperature, reasoning effort, maximum output, tool/schema versions, and stable prompt-cache version. A manifest contains release ID, parent release, file hashes, creation metadata, compatibility constraints, and evaluation artifact hash. All files are committed to Git and loaded through strict `workflow_prompt_config.py` contracts.
+
+Temperature is configuration, not an unconditional API argument. Profiles use a finite bounded value only for model/API combinations whose capability registry supports it; otherwise it must be `null` and is omitted from the request. Dynamic task, timestamp, symbol, memory, correction, and trace values never enter prompt files or stable system prefixes.
+
+`workflow_prompt_release.py` pins one immutable `prompt_release_id` at request ingress. An atomic compare-and-swap release registry activates a validated version for new requests; in-flight requests keep their pinned version. `activate(version)` and `rollback_previous()` verify Git-tracked manifest hashes, schemas, model capabilities, evaluation gates, and known-good status, then audit actor/reason/from/to versions. The admin API/CLI exposes one guarded action to roll back to the immediately previous known-good release. Rollback changes no historical audit/memory/cache row, and versioned cache keys prevent cross-release reuse. A safe-stop switch can force `no_trade`/`不知道` during broad failures.
+
+## Evaluation Corpus and Release Gates
+
+The repository maintains versioned JSONL evaluation datasets plus strict schemas under `evals/`. Cases contain sanitized immutable inputs and market snapshots, expected structured outcome or acceptable set, required/forbidden facts and evidence, abstention expectation, numeric tolerances, allowed tools, maximum latency/cost, tags, provenance, and dataset version/hash. Regression, security, routing/resilience, memory/RAG, cache, reflection/correction, permission, tracing, and held-out partitions are isolated; held-out answers are not available to prompts, retrieval, or runtime memory.
+
+`workflow_evaluation.py` runs deterministic offline/provider-recorded cases and opt-in live shadow cases without placing orders. `workflow_eval_metrics.py` reports strict-schema rate, end-to-end case success rate, abstention precision/recall, hallucination and unsupported-claim rates, evidence/citation consistency, risk violations, cache false-hit rate, retrieval recall, objective-reflection accuracy, correction improvement/regression, permission and trace completeness, latency, tokens, and cost. Every result pins code commit, dataset hash, prompt release, model snapshot, schema versions, and runtime configuration.
+
+Release comparison is paired against the current known-good baseline. `ReleaseGate` requires hard safety cases to pass, no new risk/permission/trace violation, minimum sample coverage, a configured lower confidence bound for overall success, and bounded latency/cost regression; an average success percentage alone cannot override a safety failure. Results are stored as immutable JSON artifacts and database summaries. Dataset schema/duplicate/leakage/provenance tests run in CI, and cases are versioned, reviewed, periodically refreshed, and retired only with an audited replacement rationale.
+
 ## Compatibility Boundary
 
 `get_playbook` converts its existing parameters into a `WorkflowRequest`, invokes the graph, applies existing local symbol/price normalization and caps, updates `last_call_debug`, and returns the existing tuple.
@@ -353,6 +379,12 @@ New files:
 - `workflow_circuit_breaker.py`: isolated closed/open/half-open dependency protection and bounded probes.
 - `workflow_reflection_agent.py`: Luna-only structured format/field/conclusion-data consistency review.
 - `workflow_tracing.py`: immutable request trace, parented spans, propagation, and mismatch guards.
+- `workflow_structured_logging.py`: typed redacted JSON log events and correlation fields.
+- `workflow_metrics.py`: bounded-label business, reliability, latency, token, and cost metrics.
+- `workflow_tool_observability.py`: schema-aware tool spans and redacted call/result records.
+- `workflow_prompt_config.py`: Git-tracked prompt/profile manifest loading and capability validation.
+- `workflow_prompt_release.py`: pinned activation, known-good history, and atomic rollback.
+- `workflow_evaluation.py` and `workflow_eval_metrics.py`: versioned corpus execution, scoring, comparison, and release gates.
 - `local_knowledge_base.py`: deterministic curated retrieval.
 - `market_context_agent.py`, `event_filter_agent.py`, `fundamental_direction_agent.py`, `technical_structure_agent.py`, `decision_planner_agent.py`, and `escalation_reviewer_agent.py`: one prompt and node each.
 - `workflow_risk_gate.py`: deterministic rejection/escalation.

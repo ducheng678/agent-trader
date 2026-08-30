@@ -264,6 +264,14 @@ Reflection is objective-only. Luna emits allowlisted checks with `pass`, `fail`,
 
 Each ingress creates one fresh internal 128-bit trace ID and an initial span before normalization. The ID is immutable and is passed explicitly in every request, task, report, summary, capability, audit event, cache lookup, model/tool call, retry, queue message, memory operation, log, metric exemplar, and final response. Every operation creates a child span; trace mismatches fail closed. Upstream trace context and cached-result origin traces are links, never replacements for the current request trace. Trace IDs are unique correlation identifiers and grant no permission.
 
+### Logs, Metrics, Tool Traces, and Releases
+
+Structured logs are typed one-line JSON and always include UTC time, trace/span hierarchy, workflow/task/attempt, actor/event/status, latency, model/prompt/schema/release identity, token classes, cost, and retry/cache/fallback/circuit outcomes. Metrics cover business success, abstention, interfaces, queues, Agent/LLM/tools, caches, memory, tokens, and cost with bounded labels and trace exemplars. Tool spans record capability-checked typed arguments/results as redacted summaries plus hashes, sizes, schemas, status, duration, and artifact references. Canonical audit remains complete even when remote telemetry export is sampled.
+
+System prompts and generation parameters are immutable Git-tracked release files. Requests pin one release. Activation and rollback are atomic, authorized, hash/schema/model-capability/evaluation-gated, and fully audited. Rollback affects only new requests and returns to the immediately previous known-good release; dynamic values stay outside stable prefixes and unsupported temperature values are never sent.
+
+The versioned evaluation corpus measures end-to-end success and safety across normal, unknown, adversarial, cache, routing, retry/circuit, reflection/correction, memory/RAG, permission, and trace paths. Release results bind code, corpus, prompts, schemas, model versions, latency, tokens, and cost. Hard safety failures block release regardless of average success; candidate/baseline comparison uses paired cases and confidence bounds.
+
 Schema name/version and canonical schema hash are included in prompt-cache keys, response-cache keys, audit events, usage records, task contracts, and memory records derived from an output. Cache and memory reads require compatible versions; migrations are explicit deterministic transformations that retain the original payload/hash and audit linkage.
 
 Tool arguments and tool results use separate strict schemas and capability validation. The coordinator cannot reinterpret an invalid specialist payload as a valid result. Reducers accept only the output model assigned to that actor and state key. API serialization uses the validated final contract rather than raw model text.
@@ -286,3 +294,6 @@ Tool arguments and tool results use separate strict schemas and capability valid
 - Decision drafts, conditional Sol escalation reviews, and coordinator final summaries pass exactly one Luna reflection gate; non-core outputs do not invoke reflection, reflection cannot mutate the target, and a reflection result is never recursively reflected.
 - Reflection emits only objective falsifiable checks; deterministic policy owns disposition and stops correction on regression, cycles, or the one-patch/one-rewrite limit.
 - Every ingress receives one fresh immutable internal trace ID that reaches every synchronous/asynchronous operation and final response; each operation has a unique parented span and cross-trace mutation is rejected.
+- JSON logs, bounded-cardinality metrics, and Agent/LLM/tool spans expose success, latency, token, cost, arguments/results metadata, and failure paths without secrets, raw prompts, private reasoning, or unrestricted content.
+- System prompts and supported generation parameters are immutable Git-tracked releases pinned per request; guarded atomic rollback restores the previous evaluated known-good release for new requests in one action.
+- A versioned leak-checked evaluation corpus reports reproducible end-to-end success and safety metrics; hard safety failures or configured confidence-bound regressions block release regardless of average score.
