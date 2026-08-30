@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool, StrictFloat, StrictInt, StringConstraints, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, JsonValue, StrictBool, StrictFloat, StrictInt, StringConstraints, field_validator, model_validator
 
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
@@ -15,8 +15,37 @@ PositiveInt = Annotated[StrictInt, Field(gt=0)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 
 
+class FrozenDict(dict[str, JsonValue]):
+    def __readonly(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("workflow request values are immutable")
+
+    __setitem__ = __readonly
+    __delitem__ = __readonly
+    __ior__ = __readonly
+    clear = __readonly
+    pop = __readonly
+    popitem = __readonly
+    setdefault = __readonly
+    update = __readonly
+
+    def copy(self) -> FrozenDict:
+        return FrozenDict(self)
+
+
+def freeze_json(value: JsonValue) -> JsonValue:
+    if isinstance(value, dict):
+        return FrozenDict({key: freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_json(item) for item in value)
+    return value
+
+
+FrozenJsonMapping = Annotated[dict[str, JsonValue], AfterValidator(freeze_json)]
+
+
 class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, allow_inf_nan=False, str_strip_whitespace=True)
+    schema_version: Literal["v1"] = "v1"
 
 
 class KnowledgeStatus(str, Enum):
@@ -135,14 +164,14 @@ class WorkflowRequest(ContractModel):
     workflow_id: ShortText
     trace_id: ShortText
     user_query: Text
-    event_tape: tuple[dict[str, JsonValue], ...] = Field(default_factory=tuple, max_length=200)
+    event_tape: tuple[FrozenJsonMapping, ...] = Field(default_factory=tuple, max_length=200)
     trigger_reason: Text
-    trigger_event: dict[str, JsonValue] | None = None
-    recent_events: tuple[dict[str, JsonValue], ...] = Field(default_factory=tuple, max_length=50)
-    trade_symbol_context: dict[str, JsonValue] | None = None
+    trigger_event: FrozenJsonMapping | None = None
+    recent_events: tuple[FrozenJsonMapping, ...] = Field(default_factory=tuple, max_length=50)
+    trade_symbol_context: FrozenJsonMapping | None = None
     active_symbol: ShortText | None = None
     has_live_position: StrictBool = False
-    prefetched_passive_event_judge: dict[str, JsonValue] | None = None
+    prefetched_passive_event_judge: FrozenJsonMapping | None = None
 
     @field_validator("event_tape", "recent_events", mode="before")
     @classmethod
@@ -246,6 +275,8 @@ class AgentReport(KnowledgeBoundContract):
             raise ValueError("conflict reports require disputed claims")
         if self.status is ReportStatus.FAILED and self.error_category is None:
             raise ValueError("failed reports require an error category")
+        if (self.status is not ReportStatus.COMPLETED or self.knowledge_status is KnowledgeStatus.INSUFFICIENT) and self.safe_fallback not in {None, Action.NO_TRADE}:
+            raise ValueError("uncertain reports can only use no_trade as a safe fallback")
         return self
 
 
@@ -259,6 +290,8 @@ class EventAssessment(KnowledgeBoundContract):
     def validate_event_assessment(self) -> EventAssessment:
         if self.knowledge_status is KnowledgeStatus.INSUFFICIENT and self.relevance is not EventRelevance.UNKNOWN:
             raise ValueError("insufficient event knowledge requires unknown relevance")
+        if self.relevance is EventRelevance.UNKNOWN and self.knowledge_status is not KnowledgeStatus.INSUFFICIENT:
+            raise ValueError("unknown relevance requires insufficient knowledge")
         return self
 
 
@@ -310,6 +343,14 @@ class TechnicalAnalysis(KnowledgeBoundContract):
     def validate_technical_analysis(self) -> TechnicalAnalysis:
         if self.knowledge_status is KnowledgeStatus.INSUFFICIENT and self.data_quality is not DataQuality.INSUFFICIENT:
             raise ValueError("insufficient technical knowledge requires insufficient data quality")
+        if self.data_quality is DataQuality.INSUFFICIENT and self.knowledge_status is not KnowledgeStatus.INSUFFICIENT:
+            raise ValueError("insufficient technical data requires insufficient knowledge")
+        if self.market_regime is MarketRegime.INSUFFICIENT_DATA and self.knowledge_status is not KnowledgeStatus.INSUFFICIENT:
+            raise ValueError("insufficient market regime requires insufficient knowledge")
+        if self.extension_state is ExtensionState.INSUFFICIENT_DATA and self.knowledge_status is not KnowledgeStatus.INSUFFICIENT:
+            raise ValueError("insufficient extension state requires insufficient knowledge")
+        if self.knowledge_status is KnowledgeStatus.INSUFFICIENT and (self.long_setup.viable or self.short_setup.viable):
+            raise ValueError("insufficient technical data requires nonviable setups")
         return self
 
 
@@ -418,10 +459,57 @@ class CachedAnswer(ContractModel):
 
 
 class WorkflowBudgetState(ContractModel):
+    mode: WorkflowMode
+    elapsed_seconds: NonNegativeFinite
+    time_cap_seconds: PositiveFinite | None = None
+    maximum_attempts: PositiveInt | None = None
+    cost_cap: NonNegativeFinite | None = None
     remaining_cost: NonNegativeFinite
     reserved_cost: NonNegativeFinite
     settled_cost: NonNegativeFinite
     remaining_attempts: NonNegativeInt
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_mode_caps(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        values = dict(value)
+        caps = {
+            WorkflowMode.ACTIVE: (300.0, 10, 0.75),
+            WorkflowMode.PASSIVE: (130.0, 10, 0.30),
+        }
+        mode = values.get("mode")
+        if isinstance(mode, str):
+            try:
+                mode = WorkflowMode(mode)
+            except ValueError:
+                return values
+        if mode in caps:
+            time_cap, maximum_attempts, cost_cap = caps[mode]
+            values.setdefault("time_cap_seconds", time_cap)
+            values.setdefault("maximum_attempts", maximum_attempts)
+            values.setdefault("cost_cap", cost_cap)
+        return values
+
+    @model_validator(mode="after")
+    def validate_workflow_caps(self) -> WorkflowBudgetState:
+        caps = {
+            WorkflowMode.ACTIVE: (300.0, 10, 0.75),
+            WorkflowMode.PASSIVE: (130.0, 10, 0.30),
+        }
+        expected_time, expected_attempts, expected_cost = caps[self.mode]
+        if (self.time_cap_seconds, self.maximum_attempts, self.cost_cap) != (expected_time, expected_attempts, expected_cost):
+            raise ValueError("workflow budget caps must match the selected mode")
+        if self.elapsed_seconds > expected_time:
+            raise ValueError("workflow elapsed time exceeds its cap")
+        if self.remaining_attempts > expected_attempts:
+            raise ValueError("remaining attempts exceed the workflow cap")
+        if self.remaining_cost > expected_cost or self.reserved_cost + self.settled_cost > expected_cost:
+            raise ValueError("workflow cost exceeds its cap")
+        if self.remaining_cost + self.reserved_cost + self.settled_cost > expected_cost:
+            raise ValueError("workflow cost transition exceeds its cap")
+        return self
 
 
 class WorkflowError(ContractModel):
@@ -437,7 +525,7 @@ class WorkflowResult(KnowledgeBoundContract):
     final_action: Action
     evidence_references: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
     route_history: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
-    playbook_payload: dict[str, JsonValue] | None = None
+    playbook_payload: DecisionDraft | None = None
     informational_answer: InformationalAnswer | None = None
 
     @model_validator(mode="after")
@@ -450,4 +538,8 @@ class WorkflowResult(KnowledgeBoundContract):
             raise ValueError("informational results require an informational answer")
         if self.terminal_mode in {TerminalMode.NO_TRADE, TerminalMode.UNKNOWN} and self.final_action is not Action.NO_TRADE:
             raise ValueError("safe terminal results require no_trade")
+        if self.terminal_mode is TerminalMode.UNKNOWN and self.knowledge_status is not KnowledgeStatus.INSUFFICIENT:
+            raise ValueError("unknown results require insufficient knowledge")
+        if self.knowledge_status is KnowledgeStatus.INSUFFICIENT and self.terminal_mode not in {TerminalMode.NO_TRADE, TerminalMode.UNKNOWN}:
+            raise ValueError("insufficient workflow knowledge requires a safe terminal mode")
         return self
