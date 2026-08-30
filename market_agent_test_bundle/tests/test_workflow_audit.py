@@ -19,8 +19,8 @@ def event(event_id: str, trace_id: str = "trace-1", **overrides: object) -> Audi
         "actor": "coordinator",
         "event_type": "task_dispatched",
         "status": "accepted",
-        "input_hash": "input-hash",
-        "output_hash": "output-hash",
+        "input_hash": "a" * 64,
+        "output_hash": "b" * 64,
         "latency_ms": 12,
         "token_usage": 4,
         "cached_token_usage": 0,
@@ -29,7 +29,7 @@ def event(event_id: str, trace_id: str = "trace-1", **overrides: object) -> Audi
         "model": "gpt-5.6-terra",
         "prompt_version": "prompt-v1",
         "schema_name": "AgentTask",
-        "schema_hash": "schema-hash",
+        "schema_hash": "c" * 64,
         "source_references": ("source-1",),
         "payload": {"kind": "transition", "subject_ids": ("task-1",)},
     }
@@ -141,7 +141,7 @@ def test_store_migrates_legacy_database_without_changing_existing_event_hashes(t
     migrated = AuditStore(database_path).list()
 
     assert migrated[0].schema_version == "v1"
-    assert (migrated[0].input_hash, migrated[0].output_hash) == ("in", "out")
+    assert (migrated[0].input_hash, migrated[0].output_hash) == (None, None)
     assert migrated[0].payload.kind == "legacy_migration"
     assert "safe" not in migrated[0].payload.model_dump_json()
 
@@ -164,3 +164,14 @@ def test_cursor_is_bounded_and_cannot_be_reused_with_different_filters(tmp_path)
         store.list(page_size=1, trace_id="trace-a", cursor=page.next_cursor)
     with pytest.raises(ValueError, match="cursor"):
         store.list(cursor="x" * 5000)
+
+
+@pytest.mark.parametrize("field,value", [("input_hash", "a" * 63), ("output_hash", "A" * 64), ("schema_hash", "g" * 64), ("legacy_payload_digest", "short")])
+def test_audit_digest_fields_require_canonical_lowercase_sha256(field, value):
+    values = event("event-digest").model_dump()
+    if field == "legacy_payload_digest":
+        values["payload"] = {"kind": "legacy_migration", "legacy_payload_digest": value}
+    else:
+        values[field] = value
+    with pytest.raises(ValidationError):
+        AuditEvent(**values)

@@ -16,6 +16,7 @@ _MAX_OMITTED_IDS = 30
 _MAX_UNCERTAINTIES = 20
 _POLICY_VERSION = "context-selector-v2"
 ClaimText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
+Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 def _require_utc(value: datetime) -> datetime:
@@ -98,7 +99,7 @@ def _selected_hash(records: tuple[ContextRecord, ...], policy_version: str, max_
 
 class CandidateManifestEntry(ContractModel):
     record_id: ShortText
-    record_hash: ShortText
+    record_hash: Digest
 
 
 def _manifest_hash(entries: tuple[CandidateManifestEntry, ...], policy_version: str, max_records: int, max_bytes: int) -> str:
@@ -115,11 +116,11 @@ class ContextSelection(ContractModel):
     selection_policy_version: ShortText = _POLICY_VERSION
     max_records: NonNegativeInt
     max_bytes: NonNegativeInt
-    selected_record_hash: ShortText
-    all_input_hash: ShortText
+    selected_record_hash: Digest
+    all_input_hash: Digest
     candidate_count: NonNegativeInt = 0
     candidate_manifest: tuple[CandidateManifestEntry, ...] = Field(default_factory=tuple, max_length=_MAX_CANDIDATES)
-    manifest_hash: ShortText = "0"
+    manifest_hash: Digest
 
     @property
     def input_hash(self) -> str:
@@ -150,9 +151,9 @@ class ContextSelection(ContractModel):
 
 class ContextHandoff(ContractModel):
     summary: ContextSummary
-    input_hash: ShortText
-    all_input_hash: ShortText
-    output_hash: ShortText
+    input_hash: Digest
+    all_input_hash: Digest
+    output_hash: Digest
     selected_ids: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=30)
     omitted_ids: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=_MAX_OMITTED_IDS)
     selected_count: NonNegativeInt
@@ -166,7 +167,7 @@ class ContextHandoff(ContractModel):
     contradicting_evidence: tuple[EvidenceReference, ...] = Field(default_factory=tuple, max_length=50)
     selection_policy_version: ShortText
     candidate_count: NonNegativeInt
-    manifest_hash: ShortText
+    manifest_hash: Digest
     untrusted_data: Literal[True]
 
     @model_validator(mode="after")

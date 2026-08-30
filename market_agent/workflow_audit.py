@@ -8,7 +8,8 @@ import re
 import sqlite3
 from typing import Iterable, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StringConstraints, field_validator, model_validator
+from typing import Annotated
 
 from market_agent.workflow_contracts import ContractModel, NonNegativeFinite, NonNegativeInt, PositiveInt, ShortText
 
@@ -19,6 +20,7 @@ _UNSAFE_VALUE = re.compile(r"(?:authorization\s*[:=]|bearer\s+\S+|cookie\s*[:=]|
 _OPAQUE_ID = re.compile(r"^(?!sk-)(?!eyJ)[a-z][a-z0-9_-]{0,63}$")
 _CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 class AuditUnavailableError(RuntimeError):
@@ -55,7 +57,7 @@ class AuditPayload(ContractModel):
     outcome_code: ShortText | None = None
     reason_code: ShortText | None = None
     item_count: NonNegativeInt | None = None
-    legacy_payload_digest: str | None = None
+    legacy_payload_digest: Digest | None = None
     legacy_schema_lineage: Literal["v0", "v1"] | None = None
 
     @field_validator("subject_ids", "outcome_code", "reason_code")
@@ -77,8 +79,8 @@ class AuditEvent(ContractModel):
     actor: ShortText
     event_type: ShortText
     status: ShortText
-    input_hash: ShortText | None = None
-    output_hash: ShortText | None = None
+    input_hash: Digest | None = None
+    output_hash: Digest | None = None
     latency_ms: NonNegativeInt = 0
     token_usage: NonNegativeInt = 0
     cached_token_usage: NonNegativeInt = 0
@@ -87,7 +89,7 @@ class AuditEvent(ContractModel):
     model: ShortText | None = None
     prompt_version: ShortText | None = None
     schema_name: ShortText | None = None
-    schema_hash: ShortText | None = None
+    schema_hash: Digest | None = None
     source_references: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
     payload: AuditPayload
 
@@ -259,6 +261,8 @@ class AuditStore:
             raise ValueError("invalid audit cursor") from error
         if not isinstance(trace_id, str) or isinstance(sequence, bool) or not isinstance(sequence, int) or not isinstance(event_id, str) or not isinstance(filter_hash, str) or sequence < 1:
             raise ValueError("invalid audit cursor")
+        if not _DIGEST.fullmatch(filter_hash):
+            raise ValueError("invalid audit cursor")
         return _require_id(trace_id), sequence, _require_id(event_id), filter_hash
 
     @staticmethod
@@ -274,6 +278,9 @@ class AuditStore:
             payload = {"kind": "transition", "subject_ids": ()}
         elif "subject_ids" in payload:
             payload["subject_ids"] = tuple(payload["subject_ids"])
+        for field_name in ("input_hash", "output_hash", "schema_hash"):
+            if values[field_name] is not None and not _DIGEST.fullmatch(str(values[field_name])):
+                values[field_name] = None
         return AuditEvent(**{**values, "occurred_at": datetime.fromisoformat(str(row[6])), "source_references": tuple(json.loads(str(row[21])),), "payload": payload})
 
 
