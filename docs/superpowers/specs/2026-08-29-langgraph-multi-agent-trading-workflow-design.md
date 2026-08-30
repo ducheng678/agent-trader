@@ -53,17 +53,29 @@ START
             -> fundamental_direction_agent (Terra)
             -> technical_structure_agent (Terra)
   -> decision_planner_agent (Terra; waits for both branches)
+       -> deterministic_contract_gate -> luna_reflection_gate
   -> deterministic_risk_gate
        -> no_trade_terminal on hard failure or unresolved uncertainty
        -> escalation_reviewer_agent (Sol) for reviewable conflict/high risk
+            -> deterministic_contract_gate -> luna_reflection_gate
        -> playbook_assembler for a clean draft
   -> deterministic_risk_gate_after_escalation
        -> no_trade_terminal on any remaining failure
        -> playbook_assembler
+  -> coordinator_final_summary
+       -> deterministic_contract_gate -> luna_reflection_gate
   -> END
 ```
 
 Every model node is executed through the same `AgentRunner`. Model fallback happens inside the runner and does not alter graph topology.
+
+Reflection is limited to the three highest-impact model outputs: `DecisionDraft` from the decision planner, `EscalationReview` when Sol escalation is invoked, and the coordinator's final summary. Market-context, event-filter, fundamental, technical, retrieval, cache, and deterministic risk outputs do not invoke reflection; they retain local strict-schema and deterministic invariant validation. A fixed `CORE_REFLECTION_TARGETS` policy is deny-by-default so a new node cannot silently add reflection cost. `market_agent/workflow_reflection_agent.py` uses only `gpt-5.6-luna` to check the already parsed, redacted core output for required-field presence, format/schema identity, conclusion-to-evidence consistency, numeric and directional contradictions, uncertainty adequacy, and conflict with the supplied data summary.
+
+The reflection prompt has a stable cached system prefix and a fixed three-step internal checklist: verify the declared contract and required fields; compare conclusions and key values with cited data; return a disposition and explicit contradictions or missing evidence. The model is told to reason step by step internally but emits only a strict versioned `ReflectionResult`; no hidden reasoning is requested or stored. Dynamic target output, hashes, evidence summaries, and policy values appear only in the user message.
+
+`ReflectionResult` includes the target output hash, target schema name/version/hash, `format_valid`, missing critical fields, conclusion/data consistency, contradiction references, uncertainty adequacy, knowledge status, and one disposition from `accept`, `retry_original`, `return_to_coordinator`, or `safe_reject`. The reflection agent cannot repair, rewrite, reinterpret, or persist the target result. Any non-accept disposition keeps the target out of reducers, response caches, and memory. The coordinator may reschedule within existing retry/time/cost limits; unresolved trading inconsistency becomes `no_trade`, and unresolved informational inconsistency becomes `不知道`.
+
+Reflection uses a Luna-only policy with no higher-model fallback, no tools, no durable writes, a small output/token/cost cap, bounded timeout/retries, the same audit/budget/backoff/circuit-breaker controls, and optional exact caching keyed by the immutable target-output hash plus reflection prompt/schema/model versions. If Luna reflection is unavailable or malformed after its bounded retry, deterministic validation remains authoritative but the configured core output fails closed and returns to the coordinator or a safe terminal. Non-core outputs never incur reflection cost. A reflection result is validated deterministically but is never recursively reflected.
 
 ## Compatibility Boundary
 
@@ -319,6 +331,7 @@ New files:
 - `workflow_response_cache.py`: in-memory LRU and SQLite exact cache.
 - `workflow_semantic_request_cache.py`: historical request embeddings, strict similarity/compatibility lookup, metadata, and expiry.
 - `workflow_circuit_breaker.py`: isolated closed/open/half-open dependency protection and bounded probes.
+- `workflow_reflection_agent.py`: Luna-only structured format/field/conclusion-data consistency review.
 - `local_knowledge_base.py`: deterministic curated retrieval.
 - `market_context_agent.py`, `event_filter_agent.py`, `fundamental_direction_agent.py`, `technical_structure_agent.py`, `decision_planner_agent.py`, and `escalation_reviewer_agent.py`: one prompt and node each.
 - `workflow_risk_gate.py`: deterministic rejection/escalation.

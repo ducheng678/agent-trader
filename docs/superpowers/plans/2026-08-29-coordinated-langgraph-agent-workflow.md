@@ -67,7 +67,7 @@ def test_audit_failure_blocks_dispatch():
 
 **Interfaces:** `policy_for(node_name)` and thread-safe `WorkflowBudgetLedger.reserve/settle/consume_timeout/snapshot`.
 
-- [ ] **Step 1:** Test exact tier chains, node caps, parallel reservations, timeout charges, attempts, deadlines, and pre-overspend rejection.
+- [ ] **Step 1:** Test exact tier chains including Luna-only reflection, node caps, parallel reservations, timeout charges, attempts, deadlines, and pre-overspend rejection.
 ```python
 def test_terra_downgrades_to_luna():
     assert [x.model for x in policy_for("fundamental").tiers] == ["gpt-5.6-terra", "gpt-5.6-luna"]
@@ -107,7 +107,7 @@ def test_core_experience_has_citations(memory):
     summary = build_core_experience_summary(result, token_budget=800)
     assert summary.memory_ids and summary.evidence_ids
 ```
-- [ ] **Step 2:** Run both focused files; expect failure.
+- [ ] **Step 2:** Run all three focused files; expect failure.
 - [ ] **Step 3:** Implement task normalization, vector candidates, exact/full-text fallback, reranking, bounded summaries, and verified-outcome promotion.
 - [ ] **Step 4:** Rerun and verify retrieval failure returns no memory.
 - [ ] **Step 5:** Commit `feat: add governed memory retrieval loop`.
@@ -152,7 +152,7 @@ def test_trade_result_is_not_cacheable(cache):
 
 **Interfaces:** `CapabilityContext`, `CapabilityPolicy.issue`, `authorize_read`, `authorize_tool`, `authorize_state_write`, and `authorize_service_request`.
 
-- [ ] **Step 1:** Parameterize the design matrix and test every actor's allowed reads/state keys/tools plus denied database, tenant, memory, audit, queue, web, and exchange actions.
+- [ ] **Step 1:** Parameterize the design matrix and test every actor's allowed reads/state keys/tools plus denied database, tenant, memory, audit, queue, web, and exchange actions; reflection receives one target hash/evidence summary, writes only `ReflectionResult`, and cannot mutate the target or reflect itself.
 ```python
 def test_technical_agent_cannot_use_web(policy):
     grant = policy.issue(actor="technical", task_id="t")
@@ -166,19 +166,19 @@ def test_technical_agent_cannot_use_web(policy):
 
 ### Task 9: Coordinator and Specialist Agents
 
-**Files:** Create `workflow_coordinator_agent.py` and six focused `*_agent.py` modules; test `test_workflow_agent_prompts.py`, `test_workflow_coordinator.py`.
+**Files:** Create `workflow_coordinator_agent.py`, `workflow_reflection_agent.py`, and six focused `*_agent.py` modules; modify `workflow_contracts.py`; test `test_workflow_agent_prompts.py`, `test_workflow_reflection.py`, `test_workflow_coordinator.py`.
 
-**Interfaces:** Each specialist exports `SYSTEM_PROMPT`, `PROMPT_VERSION`, `build_messages`, `run_node`; coordinator exports `plan_request`, `dispatch_tasks`, `reconcile_reports`, `reschedule`, `summarize_result`.
+**Interfaces:** Each specialist exports `SYSTEM_PROMPT`, `PROMPT_VERSION`, `build_messages`, `run_node`; reflection exports `reflect_output`; coordinator exports `plan_request`, `dispatch_tasks`, `reconcile_reports`, `reschedule`, `summarize_result`.
 
-- [ ] **Step 1:** Test stable abstention/stepwise prompts, versioned strict schemas, dynamic user data, web-tool isolation, task bounds, model selection, errors returning to coordinator, conflict reconciliation, and final summary.
+- [ ] **Step 1:** Test stable abstention/stepwise prompts, versioned strict schemas, dynamic user data, web-tool isolation, task bounds, model selection, errors returning to coordinator, conflict reconciliation, and final summary; test Luna-only reflection of exactly decision draft, conditional Sol escalation, and coordinator final summary for format/schema identity, critical fields, conclusion/data consistency, contradictions, uncertainty, strict dispositions, target immutability, no tools, no recursive reflection, and no reflection calls for non-core outputs.
 ```python
 def test_conflict_returns_to_coordinator():
     result = reconcile_reports(plan(), conflicting_reports(), budget())
     assert result.action == "schedule_reconciliation"
 ```
 - [ ] **Step 2:** Run both focused files; expect failure.
-- [ ] **Step 3:** Implement stable injection-resistant prefixes, JSON user content, bounded catalog, difficulty routing, report validation, retry/reschedule, Sol reconciliation, and fail-closed summary.
-- [ ] **Step 4:** Rerun and verify each dispatched task contains three to five steps and a scoped capability.
+- [ ] **Step 3:** Implement stable injection-resistant prefixes, JSON user content, bounded catalog, difficulty routing, report validation, Luna reflection gates, retry/reschedule, Sol reconciliation, and fail-closed summary.
+- [ ] **Step 4:** Rerun and verify each dispatched task contains three to five steps and a scoped capability, each configured core result is reflected exactly once, non-core results are not reflected, and no rejected core target reaches downstream state/cache/memory.
 - [ ] **Step 5:** Commit `feat: add coordinator and focused trading agents`.
 
 ### Task 10: Deterministic Risk, Assembly, and LangGraph
@@ -187,14 +187,14 @@ def test_conflict_returns_to_coordinator():
 
 **Interfaces:** `evaluate_risk`, `assemble_playbook`, `unknown_playbook`, and `LLMWorkflow.invoke(request, services) -> WorkflowResult`.
 
-- [ ] **Step 1:** Test invalid values/stops/scenarios, insufficiency, conflict/Sol, unknown/no_trade, active/passive routes, fan-out/join, memory summary, reschedule cycles, budgets, permissions, and audit-finalize.
+- [ ] **Step 1:** Test invalid values/stops/scenarios, insufficiency, conflict/Sol, unknown/no_trade, active/passive routes, fan-out/join, memory summary, reflection accept/retry/coordinator/safe-reject routes, reflection outage, reschedule cycles, budgets, permissions, and audit-finalize.
 ```python
 def test_specialists_receive_summaries(graph, services):
     graph.invoke(request(), services)
     assert all(isinstance(call.context, ContextSummary) for call in services.runner.calls)
 ```
 - [ ] **Step 2:** Run both focused files; expect failure.
-- [ ] **Step 3:** Implement deterministic gate/assembly and typed LangGraph with reducers, bounded cycles, guarded edges, coordinator feedback, and terminal nodes.
+- [ ] **Step 3:** Implement deterministic gate/assembly and typed LangGraph with reducers, Luna reflection gates only after decision planning, conditional Sol escalation, and coordinator final summary, bounded cycles, guarded edges, coordinator feedback, and terminal nodes.
 - [ ] **Step 4:** Rerun and verify unhealthy audit, denied capability, or exhausted budget cannot dispatch.
 - [ ] **Step 5:** Commit `feat: build coordinated langgraph workflow`.
 
@@ -221,7 +221,7 @@ def test_unknown_keeps_no_trade_contract(engine):
 
 **Interfaces:** Only runner/runtime dispatches models; only service identities access durable stores; retrieved content remains user data.
 
-- [ ] **Step 1:** Add AST/runtime tests for direct model calls, exchange/repository imports, raw-context handoff, dynamic system fragments, secret audit fields, unsafe caches, and unauthorized state keys/tools.
+- [ ] **Step 1:** Add AST/runtime tests for direct model calls, exchange/repository imports, raw-context handoff, dynamic system fragments, secret audit fields, unsafe caches, unauthorized state keys/tools, unreflected core output, reflection on non-core output, reflection target mutation, and recursive reflection.
 ```python
 def test_agent_modules_do_not_import_exchange():
     assert forbidden_imports(agent_paths()) == []
@@ -249,8 +249,8 @@ def test_agent_modules_do_not_import_exchange():
 
 **Interfaces:** Final evidence includes commit IDs, exact test totals, content comparison, routing/cost/retention defaults, and opt-in integration coverage.
 
-- [ ] **Step 1:** Trace active, passive-unrelated, conflict, timeout/downgrade, knowledge, unknown, memory promotion, and forgetting paths through audit finalize.
-- [ ] **Step 2:** Verify summarized handoffs, audit/reservation/capability before calls, and bounded exits on every cycle.
+- [ ] **Step 1:** Trace active, passive-unrelated, reflection accept/retry/coordinator/safe-reject, conflict, timeout/downgrade, knowledge, unknown, memory promotion, and forgetting paths through audit finalize.
+- [ ] **Step 2:** Verify summarized handoffs, audit/reservation/capability before calls, exactly one Luna reflection for each configured core output and none for non-core outputs, target immutability, and bounded exits on every cycle.
 - [ ] **Step 3:** Verify abstention prompts, dynamic-free system prefixes, actor permission matrix, and no direct durable writes by agents.
 - [ ] **Step 4:** Verify vector retrieval citations, anti-circular promotion, protected evidence, legal holds, tombstones, strict semantic-cache threshold/expiry/version metadata, and no live claims in fixed or semantic caches.
 - [ ] **Step 5:** For each confirmed finding, add a failing test, patch it, rerun affected/full suites, and record final evidence.

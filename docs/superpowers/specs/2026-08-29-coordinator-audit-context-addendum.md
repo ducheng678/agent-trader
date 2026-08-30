@@ -71,6 +71,7 @@ Every workflow transition writes an append-only audit event. Required event cate
 - semantic request-cache embedding, filtered candidates, similarity, compatibility, expiry, model/schema metadata, and result;
 - tool call requested, allowed, completed, or denied;
 - structured output validation result;
+- reflection target/schema hashes, Luna attempt, format/field/conclusion-data checks, contradictions, disposition, and coordinator response;
 - retry, timeout, cancellation, and cost reservation or settlement;
 - exponential-backoff ceiling, full-jitter/server delay, scheduled/actual wait, and circuit-breaker state/probe/rejection/recovery;
 - local knowledge lookup and evidence selected;
@@ -106,7 +107,7 @@ Authentication, authorization, invalid configuration, audit persistence failure,
 
 The revised graph is:
 
-`request_normalizer -> seed_cache_lookup -> coordinator_plan -> context_select -> context_summarize -> dispatch_specialists -> collect_reports -> coordinator_reconcile`
+`request_normalizer -> seed_cache_lookup -> coordinator_plan -> context_select -> context_summarize -> dispatch_specialists -> collect_reports -> coordinator_reconcile -> decision_planner -> reflect_decision -> risk_or_escalation -> reflect_escalation_if_used -> coordinator_summary -> reflect_coordinator_summary`
 
 From `coordinator_reconcile`:
 
@@ -231,6 +232,7 @@ An agent `write` means returning its strict result for one allowed invocation-st
 | fundamental agent | event/market/core-experience summaries and evidence references | write `FundamentalAnalysis` | no chart pixels, execution values, tools, durable writes |
 | technical agent | bounded chart text/images, market snapshot, core-experience summary | write direction-neutral `TechnicalAnalysis` | no web tools, event reinterpretation, final direction, durable writes |
 | decision-planner agent | validated fundamental/technical reports and bounded summaries | write `DecisionDraft` | no tools, size/leverage, execution, durable writes |
+| reflection agent | one validated redacted target output, its schema identity/hash, bounded evidence summary, and deterministic validation result | Luna-only no-tool consistency review; write one `ReflectionResult` for the assigned target hash | no target mutation/repair, no coordinator planning, no web/exchange/filesystem/database/cache/queue/memory access, no durable writes, no reflection of reflection output |
 | escalation-reviewer agent | conflict bundle, cited summaries, deterministic rule result | write `EscalationReview` | no new facts/tools, symbol changes, risk bypass, execution, durable writes |
 | deterministic risk gate | validated graph state and budget/audit health | write `RiskAssessment` only | no model/tool calls, no durable writes, no policy override |
 | playbook assembler | accepted state and exact normalization/cap policy | write final invocation result | no model/tools, no execution or durable memory writes |
@@ -249,6 +251,8 @@ Every coordinator and specialist invocation uses a versioned Pydantic contract r
 Every output includes `schema_version`, knowledge status, uncertainty reason, bounded evidence references, and only the concise conclusion/reason fields defined by its contract. It never includes hidden chain-of-thought. Prompt instructions to reason step by step affect internal analysis only; the response contains the validated result, key evidence, and uncertainty.
 
 `AgentRunner` parses the complete response once, validates it locally against the same Pydantic model, and rejects partial recovery or best-effort field dropping. A schema failure is an audited retryable attempt within the node's existing attempt/time/cost budget. Exhaustion follows the configured lower-model, local-knowledge, and explicit-unknown path. A malformed output can never reach a reducer, memory proposal, risk gate, cache, API response, or final playbook.
+
+After deterministic parsing, only three configured core outputs are reviewed by the Luna-only reflection agent: the decision planner's draft, the conditional Sol escalation review, and the coordinator's final summary. It checks the declared schema/required-field result and semantic consistency between conclusion, numbers, direction, cited evidence, uncertainty, and the bounded source summary. Its strict disposition is `accept`, `retry_original`, `return_to_coordinator`, or `safe_reject`. It cannot change the target payload. Non-accepted core targets remain outside their downstream state, cache, memory, risk, and API boundaries. Non-core Agent outputs receive deterministic validation without an LLM reflection call. Reflection unavailability for a core trading output fails closed; the reflection output itself receives deterministic validation only, preventing recursive reflection.
 
 Schema name/version and canonical schema hash are included in prompt-cache keys, response-cache keys, audit events, usage records, task contracts, and memory records derived from an output. Cache and memory reads require compatible versions; migrations are explicit deterministic transformations that retain the original payload/hash and audit linkage.
 
@@ -269,3 +273,4 @@ Tool arguments and tool results use separate strict schemas and capability valid
 - No agent writes durable memory directly; every promotion is coordinator-reviewed, policy-validated, source-linked, and audited.
 - Retrieval returns versioned, freshness-aware records that are summarized before specialist handoff.
 - Every agent response is strict, versioned, fully parsed structured output; malformed or extra text is retried or degraded and never enters state or memory.
+- Decision drafts, conditional Sol escalation reviews, and coordinator final summaries pass exactly one Luna reflection gate; non-core outputs do not invoke reflection, reflection cannot mutate the target, and a reflection result is never recursively reflected.
