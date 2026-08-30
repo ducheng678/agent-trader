@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 
+from market_agent.openai_usage import UsageTokens
 from market_agent.workflow_contracts import WorkflowMode
 
 
@@ -238,4 +239,114 @@ def test_reservation_deadlines_use_monotonic_time_and_snapshot_is_immutable():
     with pytest.raises(BudgetExceededError):
         ledger.reserve(node_name="fundamental", model="gpt-5.6-terra", band="short", usage=UsageTokens(input_tokens=1_000, output_tokens=900))
     with pytest.raises(FrozenInstanceError):
-        ledger.snapshot().remaining_cost = Decimal("1")
+        ledger.snapshot().remaining_cost = Decimal('1')
+
+
+@pytest.mark.parametrize(
+    ('reserved', 'actual'),
+    [
+        (UsageTokens(input_tokens=1), UsageTokens(input_tokens=2)),
+        (UsageTokens(input_tokens=2, cached_input_tokens=1), UsageTokens(input_tokens=2, cached_input_tokens=2)),
+        (UsageTokens(cache_write_tokens=1), UsageTokens(cache_write_tokens=2)),
+        (UsageTokens(output_tokens=1), UsageTokens(output_tokens=2)),
+    ],
+)
+def test_each_reserved_token_dimension_overflow_is_accounted_before_raising(reserved, actual):
+    from market_agent.workflow_budget import BudgetOverflowError, WorkflowBudgetLedger
+
+    ledger = WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+    reservation = ledger.reserve(node_name='fundamental', model='gpt-5.6-terra', band='short', usage=reserved)
+    with pytest.raises(BudgetOverflowError):
+        ledger.settle(reservation, actual)
+    snapshot = ledger.snapshot()
+    assert snapshot.reserved_cost == Decimal('0')
+    assert snapshot.settled_cost > Decimal('0')
+    assert snapshot.exhausted and snapshot.overdrawn
+
+
+def test_tool_overflow_is_accounted_before_raising_even_when_total_cost_is_lower():
+    from market_agent.openai_usage import UsageTokens
+    from market_agent.workflow_budget import BudgetOverflowError, WorkflowBudgetLedger
+
+    ledger = WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+    reservation = ledger.reserve(
+        node_name='market_context', model='gpt-5.6-terra', band='short',
+        usage=UsageTokens(input_tokens=20_000, output_tokens=1_200), maximum_tool_calls=1,
+    )
+    with pytest.raises(BudgetOverflowError):
+        ledger.settle(reservation, UsageTokens(input_tokens=1, output_tokens=1, web_search_tool_calls=2))
+    snapshot = ledger.snapshot()
+    assert snapshot.reserved_cost == Decimal('0')
+    assert snapshot.settled_cost < reservation.reserved_cost
+    assert snapshot.exhausted and snapshot.overdrawn
+
+
+@pytest.mark.parametrize('changed_price', ['100', '0', 'not-a-decimal'])
+def test_settlement_uses_tool_price_pinned_at_reservation(monkeypatch, changed_price):
+    from market_agent.openai_usage import UsageTokens
+    from market_agent.workflow_budget import WorkflowBudgetLedger
+
+    monkeypatch.setenv('OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD', '2.5')
+    ledger = WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+    reservation = ledger.reserve(
+        node_name='market_context', model='gpt-5.6-terra', band='short',
+        usage=UsageTokens(web_search_tool_calls=0), maximum_tool_calls=1,
+    )
+    monkeypatch.setenv('OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD', changed_price)
+    settlement = ledger.settle(reservation, UsageTokens(web_search_tool_calls=1))
+    assert reservation.reserved_cost == Decimal('0.0025')
+    assert settlement.charged_cost == Decimal('0.0025')
+
+
+def test_policy_attempt_caps_are_reachable_and_snapshot_counts_reachable_attempts():
+    from market_agent.openai_usage import UsageTokens
+    from market_agent.workflow_budget import WorkflowBudgetLedger
+    from market_agent.workflow_model_routing import AgentExecutionPolicy, ModelRouteTier, policies
+
+    for policy in policies().values():
+        assert policy.maximum_total_attempts <= policy.maximum_attempts_per_tier * len(policy.tiers)
+    with pytest.raises(ValueError):
+        AgentExecutionPolicy('bad', (ModelRouteTier('gpt-5.6-luna', 'low'),), 1, 1, 1, 2, 1, Decimal('0'), 0)
+
+    ledger = WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+    ledger.reserve(node_name='fundamental', model='gpt-5.6-terra', band='short', usage=UsageTokens())
+    ledger.reserve(node_name='fundamental', model='gpt-5.6-terra', band='short', usage=UsageTokens())
+    assert ledger.snapshot().nodes[0].remaining_attempts == 1
+
+
+def test_concurrent_settlements_use_each_reservation_pinned_tool_price_after_environment_becomes_invalid(monkeypatch):
+    from market_agent.workflow_budget import WorkflowBudgetLedger
+
+    ledger = WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+    monkeypatch.setenv('OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD', '1')
+    first = ledger.reserve(node_name='market_context', model='gpt-5.6-terra', band='short', usage=UsageTokens(), maximum_tool_calls=1)
+    monkeypatch.setenv('OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD', '2')
+    second = ledger.reserve(node_name='market_context', model='gpt-5.6-terra', band='short', usage=UsageTokens(), maximum_tool_calls=1)
+    monkeypatch.setenv('OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD', 'not-a-decimal')
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        settlements = list(executor.map(lambda reservation: ledger.settle(reservation, UsageTokens(web_search_tool_calls=1)), (first, second)))
+    assert sorted(settlement.charged_cost for settlement in settlements) == [Decimal('0.001'), Decimal('0.002')]
+
+
+@pytest.mark.parametrize('invalid_price', ['-1', 'NaN', 'Infinity'])
+def test_invalid_tool_price_is_rejected_at_reservation_without_creating_budget_state(monkeypatch, invalid_price):
+    from market_agent.workflow_budget import WorkflowBudgetLedger
+
+    monkeypatch.setenv('OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD', invalid_price)
+    ledger = WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+    with pytest.raises(ValueError, match='web search tool price'):
+        ledger.reserve(node_name='market_context', model='gpt-5.6-terra', band='short', usage=UsageTokens(), maximum_tool_calls=1)
+    assert ledger.snapshot().nodes == ()
+
+
+def test_foreign_reservation_cannot_change_the_other_ledger():
+    from market_agent.workflow_budget import ReservationOwnershipError, WorkflowBudgetLedger
+
+    owner = WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+    foreign = WorkflowBudgetLedger(WorkflowMode.ACTIVE)
+    reservation = owner.reserve(node_name='fundamental', model='gpt-5.6-terra', band='short', usage=UsageTokens(input_tokens=1))
+    with pytest.raises(ReservationOwnershipError):
+        foreign.settle(reservation, UsageTokens(input_tokens=1))
+    assert foreign.snapshot().reserved_cost == Decimal('0')
+    assert owner.snapshot().reserved_cost == reservation.reserved_cost

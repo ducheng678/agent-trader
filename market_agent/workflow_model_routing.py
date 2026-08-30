@@ -40,7 +40,9 @@ class AgentExecutionPolicy:
         if self.attempt_timeout_seconds <= 0 or self.node_timeout_seconds < self.attempt_timeout_seconds:
             raise ValueError("workflow policy timeout is invalid")
         if self.maximum_attempts_per_tier <= 0 or self.maximum_total_attempts <= 0:
-            raise ValueError("workflow policy attempt cap is invalid")
+            raise ValueError('workflow policy attempt cap is invalid')
+        if self.maximum_total_attempts > self.maximum_attempts_per_tier * len(self.tiers):
+            raise ValueError('workflow policy attempt cap is unreachable')
         if self.maximum_output_tokens <= 0 or self.maximum_tool_calls < 0:
             raise ValueError("workflow policy output or tool cap is invalid")
         if not self.node_cost_cap.is_finite() or self.node_cost_cap < 0:
@@ -90,7 +92,7 @@ SOL = ModelRouteTier("gpt-5.6-sol", "high")
 
 _POLICIES: Mapping[str, AgentExecutionPolicy] = MappingProxyType(
     {
-        "event_filter": _policy("event_filter", (LUNA,), 20, 55, 2, 3, 600, "0.02", 0),
+        'event_filter': _policy('event_filter', (LUNA,), 20, 55, 2, 2, 600, '0.02', 0),
         "market_context": _policy("market_context", (TERRA, LUNA), 60, 150, 2, 3, 1200, "0.20", 3),
         "fundamental": _policy("fundamental", (TERRA, LUNA), 35, 95, 2, 3, 900, "0.08", 0),
         "technical": _policy("technical", (TERRA, LUNA), 40, 105, 2, 3, 1400, "0.12", 0),

@@ -69,17 +69,34 @@ def workflow_model_pricing(model: str, band: PricingBand) -> ModelPricing:
     return WORKFLOW_MODEL_PRICING_USD_PER_1M[model][band]
 
 
-def estimate_workflow_usage_cost(model: str, band: PricingBand, usage: UsageTokens) -> Decimal:
+def estimate_workflow_usage_cost(
+    model: str,
+    band: PricingBand,
+    usage: UsageTokens,
+    *,
+    web_search_tool_price_usd_per_1k: Decimal | None = None,
+) -> Decimal:
     if not isinstance(usage, UsageTokens):
-        raise ValueError("workflow usage must use UsageTokens")
+        raise ValueError('workflow usage must use UsageTokens')
+    if web_search_tool_price_usd_per_1k is not None and (
+        not isinstance(web_search_tool_price_usd_per_1k, Decimal)
+        or not web_search_tool_price_usd_per_1k.is_finite()
+        or web_search_tool_price_usd_per_1k < 0
+    ):
+        raise ValueError('web search tool price must be a non-negative finite decimal')
     pricing = workflow_model_pricing(model, band)
     uncached_input_tokens = usage.input_tokens - usage.cached_input_tokens
+    tool_price = (
+        get_openai_web_search_tool_price_usd_per_1k_decimal()
+        if web_search_tool_price_usd_per_1k is None
+        else web_search_tool_price_usd_per_1k
+    )
     return (
         Decimal(uncached_input_tokens) * pricing.input
         + Decimal(usage.cached_input_tokens) * pricing.cached_input
         + Decimal(usage.cache_write_tokens) * pricing.cache_write
         + Decimal(usage.output_tokens) * pricing.output
-    ) / Decimal(1_000_000) + Decimal(usage.web_search_tool_calls) * get_openai_web_search_tool_price_usd_per_1k_decimal() / Decimal(1_000)
+    ) / Decimal(1_000_000) + Decimal(usage.web_search_tool_calls) * tool_price / Decimal(1_000)
 
 
 def get_openai_model_pricing(model: str) -> Optional[Dict[str, float]]:

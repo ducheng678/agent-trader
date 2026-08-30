@@ -8,7 +8,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Callable
 
-from market_agent.openai_usage import PricingBand, UsageTokens, estimate_workflow_usage_cost
+from market_agent.openai_usage import (
+    PricingBand,
+    UsageTokens,
+    estimate_workflow_usage_cost,
+    get_openai_web_search_tool_price_usd_per_1k_decimal,
+)
 from market_agent.workflow_contracts import WorkflowMode
 from market_agent.workflow_model_routing import AgentExecutionPolicy, policy_for
 
@@ -38,8 +43,8 @@ class BudgetReservation:
     reserved_cost: Decimal
     deadline_monotonic: float
     _ledger_nonce: object = field(repr=False, compare=False)
-    _maximum_output_tokens: int = field(repr=False, compare=False)
-    _maximum_tool_calls: int = field(repr=False, compare=False)
+    _reserved_usage: UsageTokens = field(repr=False, compare=False)
+    _web_search_tool_price_usd_per_1k: Decimal = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,18 +176,21 @@ class WorkflowBudgetLedger:
         timeout = policy.attempt_timeout_seconds if attempt_timeout_seconds is None else self._positive_int(attempt_timeout_seconds, "attempt_timeout_seconds")
         if timeout > policy.attempt_timeout_seconds:
             raise BudgetExceededError("attempt timeout exceeds node cap")
-        reserved_cost = estimate_workflow_usage_cost(
-            model,
-            band,
-            UsageTokens(
+        with self._lock:
+            reserved_usage = UsageTokens(
                 input_tokens=usage.input_tokens,
                 cached_input_tokens=usage.cached_input_tokens,
                 cache_write_tokens=usage.cache_write_tokens,
                 output_tokens=usage.output_tokens,
                 web_search_tool_calls=maximum_tool_calls,
-            ),
-        )
-        with self._lock:
+            )
+            web_search_tool_price = get_openai_web_search_tool_price_usd_per_1k_decimal()
+            reserved_cost = estimate_workflow_usage_cost(
+                model,
+                band,
+                reserved_usage,
+                web_search_tool_price_usd_per_1k=web_search_tool_price,
+            )
             now = self._now()
             if self._exhausted:
                 raise BudgetExceededError("workflow budget exhausted")
@@ -214,8 +222,8 @@ class WorkflowBudgetLedger:
                 reserved_cost=reserved_cost,
                 deadline_monotonic=min(now + timeout, node_deadline, self._deadline_monotonic),
                 _ledger_nonce=self._nonce,
-                _maximum_output_tokens=usage.output_tokens,
-                _maximum_tool_calls=maximum_tool_calls,
+                _reserved_usage=reserved_usage,
+                _web_search_tool_price_usd_per_1k=web_search_tool_price,
             )
             if node is None:
                 node = _NodeBudget(policy, now, node_deadline)
@@ -240,7 +248,14 @@ class WorkflowBudgetLedger:
             raise ReservationOwnershipError("reservation identity is invalid")
         return current
 
-    def _close(self, reservation: BudgetReservation, charged_cost: Decimal, timeout: bool) -> tuple[BudgetSettlement, bool]:
+    def _close(
+        self,
+        reservation: BudgetReservation,
+        charged_cost: Decimal,
+        timeout: bool,
+        *,
+        overflowed: bool = False,
+    ) -> tuple[BudgetSettlement, bool]:
         if not isinstance(charged_cost, Decimal) or charged_cost < 0 or not charged_cost.is_finite():
             raise ValueError("settlement cost is invalid")
         current = self._active_reservation(reservation)
@@ -251,7 +266,7 @@ class WorkflowBudgetLedger:
         node.reserved_cost -= current.reserved_cost
         self._settled_cost += charged_cost
         node.settled_cost += charged_cost
-        overflowed = charged_cost > current.reserved_cost
+        overflowed = overflowed or charged_cost > current.reserved_cost
         if overflowed:
             self._exhausted = True
             self._overdrawn = True
@@ -264,14 +279,26 @@ class WorkflowBudgetLedger:
             raise ValueError("workflow settlements require UsageTokens")
         with self._lock:
             current = self._active_reservation(reservation)
-            if usage.output_tokens > current._maximum_output_tokens:
-                raise ValueError("actual output tokens exceed reservation")
-            if usage.web_search_tool_calls > current._maximum_tool_calls:
-                raise ValueError("actual tool calls exceed reservation")
-            charged_cost = estimate_workflow_usage_cost(current.model, current.band, usage)
-            settlement, overflowed = self._close(current, charged_cost, False)
+            reserved_usage = current._reserved_usage
+            usage_overflowed = any(
+                actual > reserved
+                for actual, reserved in (
+                    (usage.input_tokens, reserved_usage.input_tokens),
+                    (usage.cached_input_tokens, reserved_usage.cached_input_tokens),
+                    (usage.cache_write_tokens, reserved_usage.cache_write_tokens),
+                    (usage.output_tokens, reserved_usage.output_tokens),
+                    (usage.web_search_tool_calls, reserved_usage.web_search_tool_calls),
+                )
+            )
+            charged_cost = estimate_workflow_usage_cost(
+                current.model,
+                current.band,
+                usage,
+                web_search_tool_price_usd_per_1k=current._web_search_tool_price_usd_per_1k,
+            )
+            settlement, overflowed = self._close(current, charged_cost, False, overflowed=usage_overflowed)
             if overflowed:
-                raise BudgetOverflowError("actual cost exceeds reservation")
+                raise BudgetOverflowError('actual usage exceeds reservation')
             return settlement
 
     def consume_timeout(self, reservation: BudgetReservation, usage: UsageTokens | None = None) -> BudgetSettlement:
@@ -291,7 +318,13 @@ class WorkflowBudgetLedger:
                     remaining_cost=max(Decimal("0"), node.policy.node_cost_cap - node.reserved_cost - node.settled_cost),
                     reserved_cost=node.reserved_cost,
                     settled_cost=node.settled_cost,
-                    remaining_attempts=max(0, node.policy.maximum_total_attempts - node.attempts),
+                    remaining_attempts=min(
+                        max(0, node.policy.maximum_total_attempts - node.attempts),
+                        sum(
+                            max(0, node.policy.maximum_attempts_per_tier - node.tier_attempts.get(tier.model, 0))
+                            for tier in node.policy.tiers
+                        ),
+                    ),
                     remaining_seconds=max(0.0, node.deadline_monotonic - now),
                     exhausted=node.exhausted,
                     overdrawn=node.overdrawn,
