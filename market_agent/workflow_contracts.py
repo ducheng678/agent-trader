@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# Shared workflow primitives and legacy agent contracts live in this module.
+# Deterministic harness contracts depend on them one-way from
+# ``workflow_harness_contracts`` and are intentionally not re-exported here.
+
 from enum import Enum
 from typing import Annotated, Literal
 
