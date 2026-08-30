@@ -270,3 +270,135 @@ def test_exact_canonical_envelopes_enforce_minus_at_and_plus_one_boundaries(monk
     assert select_context(candidate, max_records=1, max_bytes=500000).candidate_count == 1
     monkeypatch.setattr(workflow_context_summary, "_MAX_INPUT_BYTES", full_limit + 1)
     assert select_context(candidate, max_records=1, max_bytes=500000).candidate_count == 1
+
+
+def _resign_handoff(handoff):
+    identity_fields = (
+        "input_hash", "all_input_hash", "selected_ids", "omitted_ids", "selected_count", "omitted_count",
+        "omitted_ids_truncated", "unreported_omitted_count", "selection_policy_version", "max_records", "max_bytes",
+        "candidate_count", "candidate_manifest", "manifest_hash", "manifest_byte_length", "selected_byte_length", "full_input_byte_length",
+        "uncertainty_markers", "omitted_uncertainty_count", "conflict_questions", "omitted_conflict_question_count", "conflicts",
+        "supporting_evidence", "omitted_supporting_evidence_count", "contradicting_evidence", "omitted_contradicting_evidence_count",
+    )
+    rendered = handoff.model_dump(mode="json")
+    normalized_summary = {key: value for key, value in rendered["summary"].items() if key != "summary_id"}
+    inventory = {key: rendered[key] for key in identity_fields}
+    summary_id = "summary-" + sha256(_canonical({"normalized_summary": normalized_summary, "selection_inventory": inventory})).hexdigest()[:32]
+    updated = handoff.model_copy(update={"summary": handoff.summary.model_copy(update={"summary_id": summary_id}), "output_hash": "0" * 64})
+    output_values = {key: value for key, value in updated.model_dump(mode="json").items() if key != "output_hash"}
+    return updated.model_copy(update={"output_hash": sha256(_canonical(output_values)).hexdigest()})
+
+
+def test_source_grouping_tags_standalone_records_separately_from_conflict_ids():
+    observed_at = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    standalone = ContextRecord(record_id="shared", claim=NormalizedClaim(claim_id="claim-standalone", source_id="source-standalone", observed_at=observed_at, value="standalone", negated=False, untrusted_data=True), relevance=0.7)
+    conflicts = [
+        ContextRecord(record_id=f"conflict-member-{index}", claim=NormalizedClaim(claim_id=f"claim-{index}", source_id=f"source-{index}", observed_at=observed_at, value=f"conflict {index}", negated=False, untrusted_data=True), relevance=0.9 - index / 10.0, conflict_group_id="shared", conflict_description="sources disagree", conflict_unresolved=True)
+        for index in range(2)
+    ]
+
+    for candidates in (conflicts + [standalone], [standalone] + conflicts):
+        selection = select_context(candidates, max_records=3, max_bytes=500000)
+        assert set(selection.selected_ids) == {"shared", "conflict-member-0", "conflict-member-1"}
+
+
+def test_selection_revalidates_constructed_records_and_nested_evidence():
+    observed_at = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    claim = NormalizedClaim(claim_id="claim-1", source_id="source-1", observed_at=observed_at, value="value", negated=False, untrusted_data=True)
+    bad_relation = EvidenceReference.model_construct(evidence_id="evidence-1", source_id="source-1", observed_at=observed_at, relation="wrong")
+    constructed = ContextRecord.model_construct(record_id="record-1", claim=claim, relevance=0.9, uncertainty=None, supporting_evidence=[bad_relation], contradicting_evidence=(), conflict_group_id=None, conflict_description=None, conflict_unresolved=False)
+
+    with pytest.raises(ValidationError):
+        select_context([constructed], max_records=1, max_bytes=500000)
+
+
+def test_summarize_revalidates_copied_selection_with_mutable_lists():
+    copied = select_context(records(), max_records=2).model_copy(update={"selected_ids": ["source-a", "source-b"]})
+
+    with pytest.raises(ValidationError):
+        summarize_context(copied, workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+
+
+def test_standalone_handoff_rejects_inconsistent_duplicate_evidence_after_resigning():
+    handoff = summarize_context(select_context(records(), max_records=2), workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+    observed_at = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    support = EvidenceReference(evidence_id="duplicate", source_id="source-a", observed_at=observed_at, relation="supporting")
+    contradiction = EvidenceReference(evidence_id="duplicate", source_id="source-b", observed_at=observed_at, relation="contradicting")
+    forged = _resign_handoff(handoff.model_copy(update={"supporting_evidence": (support,), "contradicting_evidence": (contradiction,)}))
+
+    with pytest.raises(ValidationError, match="duplicate evidence"):
+        ContextHandoff.model_validate(forged)
+
+
+def test_standalone_handoff_revalidates_nested_relation_and_mutable_tuple_fields():
+    handoff = summarize_context(select_context(records(), max_records=2), workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+    observed_at = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    bad_relation = EvidenceReference.model_construct(evidence_id="evidence-1", source_id="source-1", observed_at=observed_at, relation="supporting")
+    bad_evidence = _resign_handoff(handoff.model_copy(update={"contradicting_evidence": (bad_relation,)}))
+    bad_list = ContextHandoff.model_construct(**{**handoff.model_dump(), "selected_ids": list(handoff.selected_ids)})
+
+    with pytest.raises(ValidationError):
+        ContextHandoff.model_validate(bad_evidence)
+    with pytest.raises(ValidationError):
+        ContextHandoff.model_validate(bad_list)
+
+
+def test_unresolved_conflict_evidence_is_reserved_before_global_truncation():
+    observed_at = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    candidates = []
+    for index in range(30):
+        explicit = EvidenceReference(evidence_id=f"a-explicit-{index:02d}", source_id=f"explicit-{index}", observed_at=observed_at, relation="contradicting")
+        candidates.append(ContextRecord(record_id=f"z-member-{index:02d}", claim=NormalizedClaim(claim_id=f"claim-{index}", source_id=f"source-{index}", observed_at=observed_at, value=f"value {index}", negated=False, untrusted_data=True), relevance=1.0 - index / 100.0, contradicting_evidence=(explicit,), conflict_group_id="conflict-all", conflict_description="all sources disagree", conflict_unresolved=True))
+    handoff = summarize_context(select_context(candidates, max_records=30, max_bytes=500000), workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+    reserved = {f"z-member-{index:02d}" for index in range(30)}
+
+    assert reserved.issubset({item.evidence_id for item in handoff.contradicting_evidence})
+    assert (len(handoff.contradicting_evidence), handoff.omitted_contradicting_evidence_count) == (50, 10)
+
+    replacement = EvidenceReference(evidence_id="a-explicit-29", source_id="explicit-29", observed_at=observed_at, relation="contradicting")
+    forged_items = tuple(sorted(tuple(item for item in handoff.contradicting_evidence if item.evidence_id != "z-member-00") + (replacement,), key=lambda item: item.evidence_id))
+    forged = _resign_handoff(handoff.model_copy(update={"contradicting_evidence": forged_items}))
+    with pytest.raises(ValidationError, match="reserved"):
+        ContextHandoff.model_validate(forged)
+
+
+def _raw_content_envelope(record_values, selection, scope):
+    return {
+        "limits": {"max_bytes": f"{selection.max_bytes:012d}", "max_records": f"{selection.max_records:02d}"},
+        "manifest_hash": selection.manifest_hash,
+        "policy_version": selection.selection_policy_version,
+        "record_count": len(record_values),
+        "records": [record.model_dump(mode="json") for record in record_values],
+        "scope": scope,
+    }
+
+
+def test_raw_content_hashes_and_lengths_use_the_same_exact_canonical_envelopes():
+    normalized = tuple(ContextRecord.model_validate(item) for item in records())
+    selection = select_context(normalized, max_records=3, max_bytes=500000)
+    full_records = tuple(sorted(normalized, key=lambda item: item.record_id))
+    full_bytes = _canonical(_raw_content_envelope(full_records, selection, "full"))
+    selected_bytes = _canonical(_raw_content_envelope(selection.records, selection, "selected"))
+    manifest_bytes = _canonical({"candidate_count": len(selection.candidate_manifest), "entries": [entry.model_dump(mode="json") for entry in selection.candidate_manifest], "limits": {"max_bytes": f"{selection.max_bytes:012d}", "max_records": f"{selection.max_records:02d}"}, "policy_version": selection.selection_policy_version})
+
+    assert (selection.all_input_hash, selection.full_input_byte_length) == (sha256(full_bytes).hexdigest(), len(full_bytes))
+    assert (selection.selected_record_hash, selection.selected_byte_length) == (sha256(selected_bytes).hexdigest(), len(selected_bytes))
+    assert (selection.manifest_hash, selection.manifest_byte_length) == (sha256(manifest_bytes).hexdigest(), len(manifest_bytes))
+
+    changed_values = records()
+    changed_values[0]["claim"] = {**changed_values[0]["claim"], "value": changed_values[0]["claim"]["value"] + "X"}
+    changed = select_context(changed_values, max_records=3, max_bytes=500000)
+    assert changed.all_input_hash != selection.all_input_hash
+    assert changed.full_input_byte_length == selection.full_input_byte_length + 1
+    assert changed.selected_record_hash != selection.selected_record_hash
+    assert changed.selected_byte_length == selection.selected_byte_length + 1
+    assert changed.manifest_hash != selection.manifest_hash
+
+
+def test_handoff_carries_manifest_identity_separately_from_raw_attestations():
+    selection = select_context(records(), max_records=2, max_bytes=500000)
+    handoff = summarize_context(selection, workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+
+    assert (handoff.input_hash, handoff.selected_byte_length) == (selection.selected_record_hash, selection.selected_byte_length)
+    assert (handoff.all_input_hash, handoff.full_input_byte_length) == (selection.all_input_hash, selection.full_input_byte_length)
+    assert (handoff.manifest_hash, handoff.manifest_byte_length) == (selection.manifest_hash, selection.manifest_byte_length)

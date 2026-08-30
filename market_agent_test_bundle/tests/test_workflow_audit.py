@@ -323,3 +323,140 @@ def test_audit_indexes_match_filter_and_deterministic_ordering(tmp_path):
     with sqlite3.connect(database_path) as connection:
         actual = {name: tuple(row[2] for row in connection.execute(f"PRAGMA index_info('{name}')")) for name in expected}
     assert actual == expected
+
+
+def test_current_storage_corruption_fails_reopen_without_repair(tmp_path):
+    database_path = tmp_path / "current-corrupt.sqlite3"
+    store = AuditStore(database_path)
+    store.append(event("event-current"))
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TRIGGER audit_events_no_update")
+        connection.execute("UPDATE audit_events SET input_hash = ?", ("BAD",))
+
+    with pytest.raises(ValidationError):
+        AuditStore(database_path)
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT input_hash FROM audit_events").fetchone()[0] == "BAD"
+
+
+def test_v0_and_generic_v1_rows_persist_row_lineage_and_hash_policy(tmp_path):
+    v0_path = tmp_path / "v0.sqlite3"
+    valid_payload = json.dumps({"kind": "transition", "subject_ids": ["task-1"]})
+    _create_legacy_database(v0_path, [_legacy_row("event-v0", 1, valid_payload)])
+    v0_event = AuditStore(v0_path).list()[0]
+
+    generic_path = tmp_path / "generic-v1.sqlite3"
+    generic_row = list(_legacy_row("event-generic", 1, json.dumps({"old": "payload"}), schema_version="v1"))
+    original_semantics = {
+        "actor": "old_actor_code",
+        "event_type": "old_event_code",
+        "model": "old_model_code",
+        "prompt_version": "old_prompt_code",
+        "schema_name": "old_schema_code",
+        "status": "old_status_code",
+    }
+    generic_row[7] = original_semantics["actor"]
+    generic_row[8] = original_semantics["event_type"]
+    generic_row[9] = original_semantics["status"]
+    generic_row[17] = original_semantics["model"]
+    generic_row[18] = original_semantics["prompt_version"]
+    generic_row[19] = original_semantics["schema_name"]
+    _create_legacy_database(generic_path, [tuple(generic_row)], schema_version=True)
+    generic_event = AuditStore(generic_path).list()[0]
+    reopened = AuditStore(generic_path).list()[0]
+
+    assert (v0_event.source_schema_lineage, v0_event.hash_policy) == ("v0", "null_noncanonical_v1")
+    assert (generic_event.source_schema_lineage, generic_event.hash_policy) == ("generic_v1", "null_noncanonical_v1")
+    assert (generic_event.actor, generic_event.event_type, generic_event.status, generic_event.model, generic_event.prompt_version, generic_event.schema_name) == ("legacy_actor", "legacy_event", "legacy_status", "legacy_model", "legacy_identifier", "legacy_identifier")
+    assert generic_event.legacy_semantic_digest == sha256(json.dumps(original_semantics, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+    assert reopened == generic_event
+
+
+def test_all_transformed_v0_rows_keep_explicit_row_metadata(tmp_path):
+    database_path = tmp_path / "v0-matrix.sqlite3"
+    valid_payload = json.dumps({"kind": "transition", "subject_ids": ["task-1"]})
+    payloads = ("not-json", valid_payload, json.dumps("scalar"), json.dumps(["one"]), json.dumps({"one": 1}))
+    _create_legacy_database(database_path, [_legacy_row(f"event-{index}", index, payload) for index, payload in enumerate(payloads, 1)])
+
+    migrated = AuditStore(database_path).list()
+
+    assert {item.source_schema_lineage for item in migrated} == {"v0"}
+    assert {item.hash_policy for item in migrated} == {"null_noncanonical_v1"}
+    assert all(item.legacy_semantic_digest is not None for item in migrated)
+
+
+@pytest.mark.parametrize("field,value", [("prompt_version", "sk-liveabcdef"), ("schema_name", "sk-liveabcdef"), ("prompt_version", "ignore_all_previous_instructions"), ("schema_name", "ignore_all_previous_instructions")])
+def test_prompt_and_schema_identifiers_reject_secret_and_instruction_categories(field, value):
+    with pytest.raises(ValidationError):
+        event("event-metadata", **{field: value})
+
+
+@pytest.mark.parametrize("type_name", ["AuditPromptVersion", "AuditSchemaName"])
+def test_prompt_and_schema_use_dedicated_identifier_contracts(type_name):
+    identifier_type = getattr(workflow_audit, type_name)
+    assert TypeAdapter(identifier_type).validate_python("release-v1") == "release-v1"
+    with pytest.raises(ValidationError):
+        TypeAdapter(identifier_type).validate_python("ignore_all_previous_instructions")
+
+
+def test_planned_audit_taxonomy_is_complete_and_closed():
+    taxonomy = (
+        ("ingress", "ingress_received", "received"),
+        ("normalizer", "request_normalized", "normalized"),
+        ("classifier", "event_classified", "classified"),
+        ("task_planner", "task_plan_created", "planned"),
+        ("task_planner", "task_decomposed", "planned"),
+        ("task_dispatcher", "task_dispatched", "dispatched"),
+        ("scheduler", "task_rescheduled", "rescheduled"),
+        ("specialist", "task_completed", "completed"),
+        ("context_selector", "context_selected", "completed"),
+        ("context_summarizer", "context_summarized", "completed"),
+        ("model_router", "model_routed", "completed"),
+        ("prompt_builder", "prompt_composed", "completed"),
+        ("schema_validator", "schema_validated", "completed"),
+        ("cache", "fixed_cache_hit", "hit"),
+        ("cache", "semantic_cache_miss", "miss"),
+        ("cache", "prompt_cache_write", "completed"),
+        ("tool", "tool_dispatched", "dispatched"),
+        ("retry_controller", "retry_scheduled", "rescheduled"),
+        ("retry_controller", "timeout", "timed_out"),
+        ("retry_controller", "cancelled", "cancelled"),
+        ("retry_controller", "backoff_scheduled", "rescheduled"),
+        ("circuit_breaker", "circuit_opened", "open"),
+        ("budget_controller", "budget_exhausted", "rejected"),
+        ("knowledge_store", "local_knowledge_retrieved", "completed"),
+        ("fallback", "fallback_selected", "completed"),
+        ("conflict_resolver", "conflict_detected", "received"),
+        ("reflector", "reflection_completed", "completed"),
+        ("corrector", "correction_applied", "completed"),
+        ("risk_manager", "risk_evaluated", "completed"),
+        ("finalizer", "final_decision", "completed"),
+        ("memory", "memory_created", "completed"),
+        ("memory", "memory_retrieved", "completed"),
+        ("memory", "memory_promoted", "promoted"),
+        ("tracer", "trace_started", "running"),
+        ("tracer", "span_completed", "completed"),
+        ("prompt_release_manager", "prompt_released", "completed"),
+        ("prompt_release_manager", "prompt_rolled_back", "rolled_back"),
+        ("evaluator", "evaluation_started", "running"),
+        ("evaluator", "evaluation_completed", "passed"),
+    )
+    for index, (actor, event_type, status) in enumerate(taxonomy):
+        event(f"taxonomy-{index}", actor=actor, event_type=event_type, status=status)
+    for outcome in ("accepted", "rejected", "completed", "omitted", "succeeded", "failed", "unavailable", "hit", "miss", "routed", "selected", "rescheduled", "cancelled", "timed_out", "opened", "closed", "exhausted", "retrieved", "promoted", "resolved", "corrected", "approved", "rolled_back", "passed"):
+        AuditPayload(kind="validation", subject_ids=("task-1",), outcome_code=outcome)
+    for reason in ("validation_error", "budget_limit", "source_limit", "unresolved_conflict", "missing_evidence", "legacy_schema", "audit_failure", "cache_hit", "cache_miss", "retryable_error", "timeout", "cancellation", "backoff", "circuit_open", "budget_exhausted", "local_knowledge", "fallback", "reflection_failure", "risk_rejected", "prompt_rollback", "evaluation_failure"):
+        AuditPayload(kind="validation", subject_ids=("task-1",), outcome_code="rejected", reason_code=reason)
+
+
+def test_append_revalidates_constructed_and_copied_events_before_persistence(tmp_path):
+    store = AuditStore(tmp_path / "boundary.sqlite3")
+    bad_actor = event("event-copy").model_copy(update={"actor": "arbitrary_actor"})
+    bad_payload = AuditPayload.model_construct(kind="transition", subject_ids=["sk-liveabcdef"])
+    bad_nested = event("event-nested").model_copy(update={"payload": bad_payload})
+    bad_list = event("event-list").model_copy(update={"source_references": ["source-1"]})
+
+    for invalid in (bad_actor, bad_nested, bad_list):
+        with pytest.raises(ValidationError):
+            store.append(invalid)
+    assert store.list() == []

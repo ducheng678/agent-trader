@@ -358,3 +358,30 @@ def test_shared_digest_alias_rejects_noncanonical_nested_summary_hashes(digest):
             summary_version="v1",
             source_record_hash=digest,
         )
+
+
+def test_contract_model_revalidates_constructed_and_copied_instances():
+    valid = ContextSummary(
+        summary_id="summary-1",
+        task_id="task-1",
+        workflow_id="workflow-1",
+        trace_id="trace-1",
+        user_objective="Assess BTC",
+        token_estimate=0,
+        completeness=SummaryCompleteness.COMPLETE,
+        summary_version="v1",
+        source_record_hash="a" * 64,
+    )
+    constructed = ContextSummary.model_construct(
+        **{
+            **valid.model_dump(mode="python"),
+            "source_record_hash": "BAD",
+            "immutable_constraints": [],
+        },
+    )
+    copied = valid.model_copy(update={"source_record_hash": "BAD"})
+
+    with pytest.raises(ValidationError):
+        ContextSummary.model_validate(constructed)
+    with pytest.raises(ValidationError):
+        ContextSummary.model_validate(copied)

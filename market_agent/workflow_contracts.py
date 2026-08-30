@@ -45,7 +45,7 @@ FrozenJsonMapping = Annotated[dict[str, JsonValue], AfterValidator(freeze_json)]
 
 
 class ContractModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, allow_inf_nan=False, str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, allow_inf_nan=False, str_strip_whitespace=True, revalidate_instances="always")
     schema_version: Literal["v1"] = "v1"
 
 

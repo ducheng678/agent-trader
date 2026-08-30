@@ -18,7 +18,7 @@ from market_agent.workflow_contracts import ContractModel, Digest, NonNegativeFi
 
 _MAX_PAGE_SIZE = 100
 _MAX_PAYLOAD_BYTES = 4096
-_UNSAFE_VALUE = re.compile(r"(?:authorization|bearer|cookie|api[ _-]?key|credential|secret|token|password|private[ _-]?key|raw[ _-]?prompt|system[ _-]?prompt|reasoning|chain[ _-]?of[ _-]?thought|-----BEGIN|eyJ[a-zA-Z0-9_-]*\.|https?://\S+[?&](?:token|key|secret|signature)=)", re.IGNORECASE)
+_UNSAFE_VALUE = re.compile(r"(?:authorization|bearer|cookie|api[ _-]?key|credential|secret|token|password|private[ _-]?key|raw[ _-]?prompt|system[ _-]?prompt|reasoning|instruction|ignore.*previous|chain[ _-]?of[ _-]?thought|(?:^|[^a-z0-9])sk-[a-z0-9]|-----BEGIN|eyJ[a-zA-Z0-9_-]*\.|https?://\S+[?&](?:token|key|secret|signature)=)", re.IGNORECASE)
 _OPAQUE_ID = re.compile(r"^(?!sk-)(?!eyJ)[a-z][a-z0-9_-]{0,63}$")
 _CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -63,6 +63,8 @@ AuditAttemptId = Annotated[str, StringConstraints(strip_whitespace=True), AfterV
 AuditSourceReference = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
 AuditSubjectId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
 AuditCode = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_code)]
+AuditPromptVersion = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_code)]
+AuditSchemaName = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_code)]
 
 
 class AuditActor(str, Enum):
@@ -76,6 +78,30 @@ class AuditActor(str, Enum):
     QUEUE = "queue"
     MEMORY = "memory"
     EXCHANGE = "exchange"
+    INGRESS = "ingress"
+    NORMALIZER = "normalizer"
+    CLASSIFIER = "classifier"
+    TASK_PLANNER = "task_planner"
+    TASK_DISPATCHER = "task_dispatcher"
+    SCHEDULER = "scheduler"
+    MODEL_ROUTER = "model_router"
+    PROMPT_BUILDER = "prompt_builder"
+    SCHEMA_VALIDATOR = "schema_validator"
+    CACHE = "cache"
+    RETRY_CONTROLLER = "retry_controller"
+    CIRCUIT_BREAKER = "circuit_breaker"
+    BUDGET_CONTROLLER = "budget_controller"
+    KNOWLEDGE_STORE = "knowledge_store"
+    FALLBACK = "fallback"
+    CONFLICT_RESOLVER = "conflict_resolver"
+    REFLECTOR = "reflector"
+    CORRECTOR = "corrector"
+    RISK_MANAGER = "risk_manager"
+    FINALIZER = "finalizer"
+    TRACER = "tracer"
+    PROMPT_RELEASE_MANAGER = "prompt_release_manager"
+    EVALUATOR = "evaluator"
+    LEGACY = "legacy_actor"
 
 
 class AuditEventType(str, Enum):
@@ -89,6 +115,57 @@ class AuditEventType(str, Enum):
     LEGACY_MIGRATED = "legacy_migrated"
     DISPATCH_BLOCKED = "dispatch_blocked"
     EXTERNAL_DISPATCH = "external_dispatch"
+    INGRESS_RECEIVED = "ingress_received"
+    REQUEST_NORMALIZED = "request_normalized"
+    EVENT_CLASSIFIED = "event_classified"
+    TASK_PLAN_CREATED = "task_plan_created"
+    TASK_DECOMPOSED = "task_decomposed"
+    TASK_RESCHEDULED = "task_rescheduled"
+    MODEL_ROUTED = "model_routed"
+    PROMPT_COMPOSED = "prompt_composed"
+    SCHEMA_VALIDATED = "schema_validated"
+    FIXED_CACHE_HIT = "fixed_cache_hit"
+    FIXED_CACHE_MISS = "fixed_cache_miss"
+    FIXED_CACHE_WRITE = "fixed_cache_write"
+    SEMANTIC_CACHE_HIT = "semantic_cache_hit"
+    SEMANTIC_CACHE_MISS = "semantic_cache_miss"
+    SEMANTIC_CACHE_WRITE = "semantic_cache_write"
+    PROMPT_CACHE_HIT = "prompt_cache_hit"
+    PROMPT_CACHE_MISS = "prompt_cache_miss"
+    PROMPT_CACHE_WRITE = "prompt_cache_write"
+    TOOL_DISPATCHED = "tool_dispatched"
+    TOOL_COMPLETED = "tool_completed"
+    TOOL_FAILED = "tool_failed"
+    RETRY_SCHEDULED = "retry_scheduled"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    BACKOFF_SCHEDULED = "backoff_scheduled"
+    CIRCUIT_OPENED = "circuit_opened"
+    CIRCUIT_CLOSED = "circuit_closed"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    LOCAL_KNOWLEDGE_RETRIEVED = "local_knowledge_retrieved"
+    FALLBACK_SELECTED = "fallback_selected"
+    CONFLICT_DETECTED = "conflict_detected"
+    REFLECTION_COMPLETED = "reflection_completed"
+    CORRECTION_APPLIED = "correction_applied"
+    RISK_EVALUATED = "risk_evaluated"
+    FINAL_DECISION = "final_decision"
+    MEMORY_CREATED = "memory_created"
+    MEMORY_UPDATED = "memory_updated"
+    MEMORY_EXPIRED = "memory_expired"
+    MEMORY_DELETED = "memory_deleted"
+    MEMORY_RETRIEVED = "memory_retrieved"
+    MEMORY_PROMOTED = "memory_promoted"
+    TRACE_STARTED = "trace_started"
+    TRACE_COMPLETED = "trace_completed"
+    SPAN_STARTED = "span_started"
+    SPAN_COMPLETED = "span_completed"
+    PROMPT_RELEASED = "prompt_released"
+    PROMPT_ROLLED_BACK = "prompt_rolled_back"
+    EVALUATION_STARTED = "evaluation_started"
+    EVALUATION_COMPLETED = "evaluation_completed"
+    EVALUATION_FAILED = "evaluation_failed"
+    LEGACY = "legacy_event"
 
 
 class AuditStatus(str, Enum):
@@ -98,12 +175,29 @@ class AuditStatus(str, Enum):
     FAILED = "failed"
     UNAVAILABLE = "unavailable"
     OMITTED = "omitted"
+    RECEIVED = "received"
+    NORMALIZED = "normalized"
+    CLASSIFIED = "classified"
+    PLANNED = "planned"
+    DISPATCHED = "dispatched"
+    RESCHEDULED = "rescheduled"
+    HIT = "hit"
+    MISS = "miss"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    OPEN = "open"
+    PROMOTED = "promoted"
+    RUNNING = "running"
+    ROLLED_BACK = "rolled_back"
+    PASSED = "passed"
+    LEGACY = "legacy_status"
 
 
 class AuditModel(str, Enum):
     LUNA = "gpt-5.6-luna"
     TERRA = "gpt-5.6-terra"
     SOL = "gpt-5.6-sol"
+    LEGACY = "legacy_model"
 
 
 class AuditOutcome(str, Enum):
@@ -115,6 +209,23 @@ class AuditOutcome(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     UNAVAILABLE = "unavailable"
+    HIT = "hit"
+    MISS = "miss"
+    ROUTED = "routed"
+    SELECTED = "selected"
+    RESCHEDULED = "rescheduled"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+    OPENED = "opened"
+    CLOSED = "closed"
+    EXHAUSTED = "exhausted"
+    RETRIEVED = "retrieved"
+    PROMOTED = "promoted"
+    RESOLVED = "resolved"
+    CORRECTED = "corrected"
+    APPROVED = "approved"
+    ROLLED_BACK = "rolled_back"
+    PASSED = "passed"
 
 
 class AuditReason(str, Enum):
@@ -125,6 +236,20 @@ class AuditReason(str, Enum):
     MISSING_EVIDENCE = "missing_evidence"
     LEGACY_SCHEMA = "legacy_schema"
     AUDIT_FAILURE = "audit_failure"
+    CACHE_HIT = "cache_hit"
+    CACHE_MISS = "cache_miss"
+    RETRYABLE_ERROR = "retryable_error"
+    TIMEOUT = "timeout"
+    CANCELLATION = "cancellation"
+    BACKOFF = "backoff"
+    CIRCUIT_OPEN = "circuit_open"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    LOCAL_KNOWLEDGE = "local_knowledge"
+    FALLBACK = "fallback"
+    REFLECTION_FAILURE = "reflection_failure"
+    RISK_REJECTED = "risk_rejected"
+    PROMPT_ROLLBACK = "prompt_rollback"
+    EVALUATION_FAILURE = "evaluation_failure"
 
 
 _ACTORS = frozenset(item.value for item in AuditActor)
@@ -196,11 +321,14 @@ class AuditEvent(ContractModel):
     estimated_cost: NonNegativeFinite = 0.0
     cumulative_cost: NonNegativeFinite = 0.0
     model: AuditCode | None = None
-    prompt_version: AuditCode | None = None
-    schema_name: AuditCode | None = None
+    prompt_version: AuditPromptVersion | None = None
+    schema_name: AuditSchemaName | None = None
     schema_hash: Digest | None = None
     source_references: tuple[AuditSourceReference, ...] = Field(default_factory=tuple, max_length=50)
     payload: AuditPayload
+    source_schema_lineage: Literal["v0", "generic_v1", "current_v1"] = "current_v1"
+    hash_policy: Literal["null_noncanonical_v1", "strict_canonical_v1"] = "strict_canonical_v1"
+    legacy_semantic_digest: Digest | None = None
 
     @field_validator("occurred_at")
     @classmethod
@@ -247,6 +375,11 @@ class AuditEvent(ContractModel):
         encoded_payload = json.dumps(self.payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(encoded_payload) > _MAX_PAYLOAD_BYTES:
             raise ValueError("audit payload exceeds encoded-byte limit")
+        if self.source_schema_lineage == "current_v1":
+            if self.hash_policy != "strict_canonical_v1" or self.legacy_semantic_digest is not None:
+                raise ValueError("current audit rows require strict canonical metadata")
+        elif self.hash_policy != _LEGACY_HASH_POLICY or self.legacy_semantic_digest is None:
+            raise ValueError("transformed legacy audit rows require lineage and semantic digest metadata")
         return self
 
 
@@ -254,6 +387,28 @@ class AuditPage(list[AuditEvent]):
     def __init__(self, items: Iterable[AuditEvent] = (), next_cursor: str | None = None) -> None:
         super().__init__(items)
         self.next_cursor = next_cursor
+
+
+_STORAGE_COLUMNS = (
+    "event_id", "trace_id", "workflow_id", "task_id", "attempt_id", "sequence", "occurred_at", "actor",
+    "event_type", "status", "input_hash", "output_hash", "latency_ms", "token_usage", "cached_token_usage",
+    "estimated_cost", "cumulative_cost", "model", "prompt_version", "schema_name", "schema_hash",
+    "source_references", "payload", "schema_version", "source_schema_lineage", "hash_policy",
+    "legacy_semantic_digest",
+)
+
+
+def _event_from_storage_row(row: tuple[object, ...]) -> AuditEvent:
+    values = dict(zip(_STORAGE_COLUMNS, row, strict=True))
+    payload = json.loads(str(values["payload"]))
+    if isinstance(payload, dict) and isinstance(payload.get("subject_ids"), list):
+        payload["subject_ids"] = tuple(payload["subject_ids"])
+    return AuditEvent.model_validate({
+        **values,
+        "occurred_at": datetime.fromisoformat(str(values["occurred_at"])),
+        "source_references": tuple(json.loads(str(values["source_references"]))),
+        "payload": payload,
+    })
 
 
 class AuditStore:
@@ -273,7 +428,7 @@ class AuditStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("BEGIN IMMEDIATE")
             try:
-                connection.execute("CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, workflow_id TEXT NOT NULL, task_id TEXT, attempt_id TEXT, sequence INTEGER NOT NULL, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, event_type TEXT NOT NULL, status TEXT NOT NULL, input_hash TEXT, output_hash TEXT, latency_ms INTEGER NOT NULL, token_usage INTEGER NOT NULL, cached_token_usage INTEGER NOT NULL, estimated_cost REAL NOT NULL, cumulative_cost REAL NOT NULL, model TEXT, prompt_version TEXT, schema_name TEXT, schema_hash TEXT, source_references TEXT NOT NULL, payload TEXT NOT NULL, schema_version TEXT NOT NULL DEFAULT 'v1', UNIQUE(trace_id, sequence))")
+                connection.execute("CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, workflow_id TEXT NOT NULL, task_id TEXT, attempt_id TEXT, sequence INTEGER NOT NULL, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, event_type TEXT NOT NULL, status TEXT NOT NULL, input_hash TEXT, output_hash TEXT, latency_ms INTEGER NOT NULL, token_usage INTEGER NOT NULL, cached_token_usage INTEGER NOT NULL, estimated_cost REAL NOT NULL, cumulative_cost REAL NOT NULL, model TEXT, prompt_version TEXT, schema_name TEXT, schema_hash TEXT, source_references TEXT NOT NULL, payload TEXT NOT NULL, schema_version TEXT NOT NULL DEFAULT 'v1', source_schema_lineage TEXT NOT NULL DEFAULT 'current_v1', hash_policy TEXT NOT NULL DEFAULT 'strict_canonical_v1', legacy_semantic_digest TEXT, UNIQUE(trace_id, sequence))")
                 self._migrate_legacy_payloads(connection)
                 self._rebuild_indexes(connection)
                 self._create_triggers(connection)
@@ -289,13 +444,22 @@ class AuditStore:
     def _migrate_legacy_payloads(connection: sqlite3.Connection) -> None:
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(audit_events)")}
         had_schema_version = "schema_version" in columns
+        had_row_metadata = {"source_schema_lineage", "hash_policy", "legacy_semantic_digest"}.issubset(columns)
         schema_expression = "schema_version" if had_schema_version else "'v0'"
-        rows = connection.execute(f"SELECT event_id, payload, input_hash, output_hash, schema_hash, {schema_expression} FROM audit_events ORDER BY event_id").fetchall()
-        migrations: list[tuple[str | None, str | None, str | None, str | None, str]] = []
-        for event_id, payload_text, input_hash, output_hash, schema_hash, schema_version in rows:
-            legacy_value: object
+        lineage_expression = "source_schema_lineage" if had_row_metadata else "'current_v1'"
+        policy_expression = "hash_policy" if had_row_metadata else "'strict_canonical_v1'"
+        semantic_expression = "legacy_semantic_digest" if had_row_metadata else "NULL"
+        base_columns = ", ".join(_STORAGE_COLUMNS[:23])
+        rows = connection.execute(f"SELECT {base_columns}, {schema_expression}, {lineage_expression}, {policy_expression}, {semantic_expression} FROM audit_events ORDER BY event_id").fetchall()
+        migrations: list[tuple[object, ...]] = []
+        for raw_row in rows:
+            row = list(raw_row)
+            if had_row_metadata:
+                _event_from_storage_row(tuple(row))
+                continue
+            payload_text = row[22]
             try:
-                legacy_value = json.loads(str(payload_text))
+                legacy_value: object = json.loads(str(payload_text))
             except (TypeError, ValueError):
                 legacy_value = str(payload_text)
             payload_value = dict(legacy_value) if isinstance(legacy_value, dict) else legacy_value
@@ -303,24 +467,61 @@ class AuditStore:
                 payload_value["subject_ids"] = tuple(payload_value["subject_ids"])
             try:
                 validated_payload = AuditPayload.model_validate(payload_value)
-                migrated_payload = None
             except Exception:
-                canonical = json.dumps(legacy_value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-                item_count = len(legacy_value) if isinstance(legacy_value, (dict, list)) else 1
-                migrated_payload = json.dumps(AuditPayload(kind="legacy_migration", outcome_code="legacy_payload", item_count=item_count, legacy_payload_digest=sha256(canonical.encode("utf-8")).hexdigest(), legacy_schema_lineage="v1" if schema_version == "v1" else "v0", legacy_hash_policy=_LEGACY_HASH_POLICY).model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
                 validated_payload = None
-            cleaned_hashes = tuple(value if value is None or _DIGEST.fullmatch(str(value)) else None for value in (input_hash, output_hash, schema_hash))
-            if migrated_payload is not None or cleaned_hashes != (input_hash, output_hash, schema_hash) or schema_version != "v1" or not had_schema_version:
-                payload_update = migrated_payload if migrated_payload is not None else json.dumps(validated_payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-                migrations.append((payload_update, *cleaned_hashes, str(event_id)))
-        if not had_schema_version or migrations:
+            is_v0 = not had_schema_version
+            is_generic_v1 = had_schema_version and validated_payload is None
+            if not is_v0 and not is_generic_v1:
+                row[24] = "current_v1"
+                row[25] = "strict_canonical_v1"
+                row[26] = None
+                _event_from_storage_row(tuple(row))
+                migrations.append(tuple(row))
+                continue
+            source_lineage = "v0" if is_v0 else "generic_v1"
+            payload_lineage = "v0" if is_v0 else "v1"
+            original_semantics = {
+                "actor": row[7],
+                "event_type": row[8],
+                "model": row[17],
+                "prompt_version": row[18],
+                "schema_name": row[19],
+                "status": row[9],
+            }
+            canonical_semantics = json.dumps(original_semantics, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            row[7] = AuditActor.LEGACY.value
+            row[8] = AuditEventType.LEGACY.value
+            row[9] = AuditStatus.LEGACY.value
+            row[17] = AuditModel.LEGACY.value if row[17] is not None else None
+            row[18] = "legacy_identifier" if row[18] is not None else None
+            row[19] = "legacy_identifier" if row[19] is not None else None
+            row[10], row[11], row[20] = tuple(value if value is None or _DIGEST.fullmatch(str(value)) else None for value in (row[10], row[11], row[20]))
+            if validated_payload is None:
+                canonical_payload = json.dumps(legacy_value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                item_count = len(legacy_value) if isinstance(legacy_value, (dict, list)) else 1
+                validated_payload = AuditPayload(kind="legacy_migration", outcome_code="legacy_payload", item_count=item_count, legacy_payload_digest=sha256(canonical_payload.encode("utf-8")).hexdigest(), legacy_schema_lineage=payload_lineage, legacy_hash_policy=_LEGACY_HASH_POLICY)
+            row[22] = json.dumps(validated_payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+            row[23] = "v1"
+            row[24] = source_lineage
+            row[25] = _LEGACY_HASH_POLICY
+            row[26] = sha256(canonical_semantics.encode("utf-8")).hexdigest()
+            _event_from_storage_row(tuple(row))
+            migrations.append(tuple(row))
+        schema_changes = not had_schema_version or not had_row_metadata
+        if schema_changes or migrations:
             connection.execute("DROP TRIGGER IF EXISTS audit_events_no_update")
             connection.execute("DROP TRIGGER IF EXISTS audit_events_no_delete")
             connection.execute("DROP TRIGGER IF EXISTS audit_events_no_replace")
             if not had_schema_version:
                 connection.execute("ALTER TABLE audit_events ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'v1'")
-            for payload_update, input_hash, output_hash, schema_hash, event_id in migrations:
-                connection.execute("UPDATE audit_events SET payload = ?, input_hash = ?, output_hash = ?, schema_hash = ?, schema_version = 'v1' WHERE event_id = ?", (payload_update, input_hash, output_hash, schema_hash, event_id))
+            if "source_schema_lineage" not in columns:
+                connection.execute("ALTER TABLE audit_events ADD COLUMN source_schema_lineage TEXT NOT NULL DEFAULT 'current_v1'")
+            if "hash_policy" not in columns:
+                connection.execute("ALTER TABLE audit_events ADD COLUMN hash_policy TEXT NOT NULL DEFAULT 'strict_canonical_v1'")
+            if "legacy_semantic_digest" not in columns:
+                connection.execute("ALTER TABLE audit_events ADD COLUMN legacy_semantic_digest TEXT")
+            for row in migrations:
+                connection.execute("UPDATE audit_events SET actor = ?, event_type = ?, status = ?, input_hash = ?, output_hash = ?, model = ?, prompt_version = ?, schema_name = ?, schema_hash = ?, payload = ?, schema_version = ?, source_schema_lineage = ?, hash_policy = ?, legacy_semantic_digest = ? WHERE event_id = ?", (row[7], row[8], row[9], row[10], row[11], row[17], row[18], row[19], row[20], row[22], row[23], row[24], row[25], row[26], row[0]))
 
     @staticmethod
     def _rebuild_indexes(connection: sqlite3.Connection) -> None:
@@ -343,6 +544,7 @@ class AuditStore:
         connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_replace BEFORE INSERT ON audit_events WHEN EXISTS (SELECT 1 FROM audit_events WHERE event_id = NEW.event_id) OR EXISTS (SELECT 1 FROM audit_events WHERE trace_id = NEW.trace_id AND sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
 
     def append(self, event: AuditEvent) -> AuditEvent:
+        event = AuditEvent.model_validate(event.model_dump(mode="python"))
         if event.sequence is not None:
             raise ValueError("audit sequence is assigned by the store")
         connection: sqlite3.Connection | None = None
@@ -351,8 +553,8 @@ class AuditStore:
             connection.execute("BEGIN IMMEDIATE")
             next_sequence = connection.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit_events WHERE trace_id = ?", (event.trace_id,)).fetchone()[0]
             connection.execute(
-                "INSERT INTO audit_events (event_id, trace_id, workflow_id, task_id, attempt_id, sequence, occurred_at, actor, event_type, status, input_hash, output_hash, latency_ms, token_usage, cached_token_usage, estimated_cost, cumulative_cost, model, prompt_version, schema_name, schema_hash, source_references, payload, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (event.event_id, event.trace_id, event.workflow_id, event.task_id, event.attempt_id, next_sequence, event.occurred_at.isoformat(), event.actor, event.event_type, event.status, event.input_hash, event.output_hash, event.latency_ms, event.token_usage, event.cached_token_usage, event.estimated_cost, event.cumulative_cost, event.model, event.prompt_version, event.schema_name, event.schema_hash, json.dumps(event.source_references, separators=(",", ":")), json.dumps(event.payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":")), event.schema_version),
+                "INSERT INTO audit_events (event_id, trace_id, workflow_id, task_id, attempt_id, sequence, occurred_at, actor, event_type, status, input_hash, output_hash, latency_ms, token_usage, cached_token_usage, estimated_cost, cumulative_cost, model, prompt_version, schema_name, schema_hash, source_references, payload, schema_version, source_schema_lineage, hash_policy, legacy_semantic_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event.event_id, event.trace_id, event.workflow_id, event.task_id, event.attempt_id, next_sequence, event.occurred_at.isoformat(), event.actor, event.event_type, event.status, event.input_hash, event.output_hash, event.latency_ms, event.token_usage, event.cached_token_usage, event.estimated_cost, event.cumulative_cost, event.model, event.prompt_version, event.schema_name, event.schema_hash, json.dumps(event.source_references, separators=(",", ":")), json.dumps(event.payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":")), event.schema_version, event.source_schema_lineage, event.hash_policy, event.legacy_semantic_digest),
             )
             connection.execute("COMMIT")
         except BaseException:
@@ -368,7 +570,7 @@ class AuditStore:
                     connection.close()
                 except BaseException:
                     pass
-        return event.model_copy(update={"sequence": next_sequence})
+        return AuditEvent.model_validate({**event.model_dump(mode="python"), "sequence": next_sequence})
 
     def list(self, *, trace_id: str | None = None, workflow_id: str | None = None, task_id: str | None = None, attempt_id: str | None = None, event_type: str | None = None, start_time: datetime | None = None, end_time: datetime | None = None, page_size: int = _MAX_PAGE_SIZE, cursor: str | None = None) -> AuditPage:
         if isinstance(page_size, bool) or not 1 <= page_size <= _MAX_PAGE_SIZE:
@@ -425,12 +627,7 @@ class AuditStore:
 
     @staticmethod
     def _row_to_event(row: tuple[object, ...]) -> AuditEvent:
-        columns = ("event_id", "trace_id", "workflow_id", "task_id", "attempt_id", "sequence", "occurred_at", "actor", "event_type", "status", "input_hash", "output_hash", "latency_ms", "token_usage", "cached_token_usage", "estimated_cost", "cumulative_cost", "model", "prompt_version", "schema_name", "schema_hash", "source_references", "payload", "schema_version")
-        values = dict(zip(columns, row, strict=True))
-        payload = json.loads(str(row[22]))
-        if isinstance(payload, dict) and "subject_ids" in payload:
-            payload["subject_ids"] = tuple(payload["subject_ids"])
-        return AuditEvent(**{**values, "occurred_at": datetime.fromisoformat(str(row[6])), "source_references": tuple(json.loads(str(row[21])),), "payload": payload})
+        return _event_from_storage_row(row)
 
 
 class AuditWriter:
