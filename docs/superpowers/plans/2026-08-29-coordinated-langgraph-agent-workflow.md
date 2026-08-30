@@ -168,16 +168,16 @@ def test_technical_agent_cannot_use_web(policy):
 
 **Files:** Create `workflow_coordinator_agent.py`, `workflow_reflection_agent.py`, and six focused `*_agent.py` modules; modify `workflow_contracts.py`; test `test_workflow_agent_prompts.py`, `test_workflow_reflection.py`, `test_workflow_coordinator.py`.
 
-**Interfaces:** Each specialist exports `SYSTEM_PROMPT`, `PROMPT_VERSION`, `build_messages`, `run_node`; reflection exports `reflect_output`; coordinator exports `plan_request`, `dispatch_tasks`, `reconcile_reports`, `reschedule`, `summarize_result`.
+**Interfaces:** Each specialist exports `SYSTEM_PROMPT`, `PROMPT_VERSION`, `build_messages`, `run_node`; reflection exports `reflect_output`, deterministic `build_correction_context`, and `apply_correction_patch`; coordinator exports `plan_request`, `dispatch_tasks`, `reconcile_reports`, `reschedule`, `summarize_result`.
 
-- [ ] **Step 1:** Test stable abstention/stepwise prompts, versioned strict schemas, dynamic user data, web-tool isolation, task bounds, model selection, errors returning to coordinator, conflict reconciliation, and final summary; test Luna-only reflection of exactly decision draft, conditional Sol escalation, and coordinator final summary for format/schema identity, critical fields, conclusion/data consistency, contradictions, uncertainty, strict dispositions, target immutability, no tools, no recursive reflection, and no reflection calls for non-core outputs.
+- [ ] **Step 1:** Test stable abstention/stepwise prompts, versioned strict schemas, dynamic user data, web-tool isolation, task bounds, model selection, errors returning to coordinator, conflict reconciliation, and final summary; test Luna-only reflection of exactly decision draft, conditional Sol escalation, and coordinator final summary for format/schema identity, critical fields, conclusion/data consistency, contradictions, uncertainty, strict dispositions, target immutability, no tools, no recursive reflection, and no reflection calls for non-core outputs; test that `retry_original` creates bounded typed `CorrectionContext`, injects its error codes/field paths/evidence IDs only in dynamic user content, requests a strict allowlisted `CorrectionPatch`, deterministically revalidates the patched full output, and uses complete rewrite only as the single fallback.
 ```python
 def test_conflict_returns_to_coordinator():
     result = reconcile_reports(plan(), conflicting_reports(), budget())
     assert result.action == "schedule_reconciliation"
 ```
 - [ ] **Step 2:** Run both focused files; expect failure.
-- [ ] **Step 3:** Implement stable injection-resistant prefixes, JSON user content, bounded catalog, difficulty routing, report validation, Luna reflection gates, retry/reschedule, Sol reconciliation, and fail-closed summary.
+- [ ] **Step 3:** Implement stable injection-resistant prefixes, JSON user content, bounded catalog, difficulty routing, report validation, Luna reflection gates, deterministic error-carrying correction contexts, targeted patch application, one fallback full rewrite, retry/reschedule, Sol reconciliation, and fail-closed summary.
 - [ ] **Step 4:** Rerun and verify each dispatched task contains three to five steps and a scoped capability, each configured core result is reflected exactly once, non-core results are not reflected, and no rejected core target reaches downstream state/cache/memory.
 - [ ] **Step 5:** Commit `feat: add coordinator and focused trading agents`.
 
@@ -187,7 +187,7 @@ def test_conflict_returns_to_coordinator():
 
 **Interfaces:** `evaluate_risk`, `assemble_playbook`, `unknown_playbook`, and `LLMWorkflow.invoke(request, services) -> WorkflowResult`.
 
-- [ ] **Step 1:** Test invalid values/stops/scenarios, insufficiency, conflict/Sol, unknown/no_trade, active/passive routes, fan-out/join, memory summary, reflection accept/retry/coordinator/safe-reject routes, reflection outage, reschedule cycles, budgets, permissions, and audit-finalize.
+- [ ] **Step 1:** Test invalid values/stops/scenarios, insufficiency, conflict/Sol, unknown/no_trade, active/passive routes, fan-out/join, memory summary, reflection accept/targeted-patch/fallback-full-rewrite/coordinator/safe-reject routes, repeated-reflection cap, reflection outage, reschedule cycles, budgets, permissions, and audit-finalize.
 ```python
 def test_specialists_receive_summaries(graph, services):
     graph.invoke(request(), services)
