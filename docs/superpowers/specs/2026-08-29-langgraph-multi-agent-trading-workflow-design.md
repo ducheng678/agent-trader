@@ -40,7 +40,9 @@ The passive path already separates event judging from technical pricing. This de
 START
   -> response_seed_cache_lookup
        -> cached_informational_answer -> END
-       -> context_builder
+       -> semantic_request_cache_lookup
+            -> compatible_unexpired_similarity_above_0_95 -> cached_informational_answer -> END
+            -> context_builder
   -> market_context_route
        -> market_context_agent (Terra when an active refresh is required)
        -> cached_context_loader (deterministic)
@@ -197,16 +199,23 @@ Each agent file owns one stable system prompt. The invariant prefix includes:
 
 No timestamp, symbol, event, price, threshold, or runtime state appears in the system prefix. Dynamic content is serialized in the user message. Prompt cache keys are `market-agent-{node}-{model}-{prompt-version}`. Tool definitions and schemas are stable per node. Only the market-context agent receives `web_search`.
 
-## High-Frequency Answer Cache
+## Fixed and Semantic Answer Cache
 
-`market_agent/workflow_response_cache.py` exposes exact normalized lookup and bounded TTL storage. It has two namespaces:
+`market_agent/workflow_response_cache.py` exposes exact normalized lookup and bounded TTL storage. `market_agent/workflow_semantic_request_cache.py` owns vectorization, similarity lookup, compatibility checks, expiry, and request/response metadata. The cache has three namespaces:
 
-1. `fixed_seed`: versioned curated informational answers with no expiry until the seed version changes.
+1. `fixed_seed`: versioned curated informational answers with a renewable long TTL and immediate invalidation when the seed version changes.
 2. `agent_response`: exact-input agent results with TTL, model, prompt version, schema version, and context fingerprint.
+3. `semantic_response`: historical safe informational requests, request embeddings, strictly validated responses, and compatibility metadata.
 
 Final trade decisions, event judgments, current prices, position management, web-search responses, and any response containing live market context are never cacheable. Agent-response caching is initially enabled only for stable informational nodes; future nodes must opt in explicitly.
 
-Cache keys include namespace, normalized intent/input hash, locale, prompt version, schema version, and seed corpus version. Matching is exact or alias-based, never free-form semantic similarity. This avoids reusing an answer for a merely similar trading question.
+The lookup order is fixed seed, exact response, then semantic response. A semantic response is returned directly only when cosine similarity is strictly greater than `0.95` and every compatibility gate passes: same tenant and authorization scope, intent category, locale, output schema name/version/hash, safety-policy version, prompt compatibility, model-compatibility policy, knowledge/context fingerprint, and freshness class. Similarity is only a candidate gate and never overrides those exact checks. Ties are resolved deterministically by similarity, newest compatible response timestamp, and stable cache ID.
+
+Every semantic cache row stores cache ID, normalized request and request hash, embedding vector, embedding model/version/dimensions, request timestamp, response timestamp, response payload and hash, model ID/version, prompt version, schema name/version/hash, safety-policy version, knowledge/context fingerprint, tenant/scope, locale, category, source references, hit count, last-hit timestamp, TTL class, and `expires_at`. Raw secrets and credentials are never embedded or stored.
+
+Expiry is hard, not stale-while-revalidate: expired rows are excluded before nearest-neighbor search and can never be used as a fallback. Configurable category policies default to 30 days for curated seeds, 7 days for stable capability or documentation answers, and 24 hours for other explicitly cacheable informational answers, with a 30-day global maximum. Live-context and trading-decision categories have TTL zero and are rejected. Prompt, schema, embedding, safety-policy, seed-corpus, knowledge-snapshot, or incompatible model-version changes invalidate entries early. Capacity eviction and an idempotent background cleanup remove expired vectors and payloads while preserving redacted audit events.
+
+Cache keys include namespace, normalized intent/input hash, locale, prompt version, schema version/hash, model compatibility version, knowledge/context fingerprint, and seed corpus version. Approximate semantic matching is allowed only in the governed `semantic_response` namespace under the strict threshold and compatibility rules above.
 
 Initial curated seeds live in `market_agent/knowledge/high_frequency_answers.json`:
 
@@ -219,7 +228,7 @@ Initial curated seeds live in `market_agent/knowledge/high_frequency_answers.jso
 
 Each seed contains a stable ID, Chinese and English exact aliases, locale-specific verbatim answer, category, version, and source label. Seed answers contain no live claims.
 
-The cache uses a small in-process LRU front and SQLite backing at `runtime/llm_response_cache.sqlite3`, with WAL mode, bounded rows, expiration cleanup, and parameterized SQL. Corruption or lock failure degrades to cache miss and never blocks trading analysis.
+The exact cache uses a small in-process LRU front and SQLite backing at `runtime/llm_response_cache.sqlite3`, with WAL mode, bounded rows, expiration cleanup, and parameterized SQL. The production semantic cache uses PostgreSQL plus `pgvector` with tenant/category/version filters applied before cosine ordering; local development uses the same repository contract with SQLite metadata and deterministic in-process cosine search. Vector database failure degrades to an audited cache miss and normal execution, never to an unvalidated or expired answer.
 
 ## Local Knowledge Base
 

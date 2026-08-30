@@ -68,6 +68,7 @@ Every workflow transition writes an append-only audit event. Required event cate
 - model route selected and changed;
 - prompt version and prompt-cache key used;
 - high-frequency answer cache lookup and result;
+- semantic request-cache embedding, filtered candidates, similarity, compatibility, expiry, model/schema metadata, and result;
 - tool call requested, allowed, completed, or denied;
 - structured output validation result;
 - retry, timeout, cancellation, and cost reservation or settlement;
@@ -196,7 +197,9 @@ Administrative restore, legal hold, tenant erasure, and policy change operations
 
 Long-term memory retrieval and application follows four mandatory stages.
 
-Stage 1, receive the new task: the coordinator normalizes the user objective, immutable constraints, tenant/scope, locale, symbols, time horizon, task type, risk class, required evidence types, and maximum memory token budget. It creates a traceable `MemoryQuery` and checks the exact high-frequency seed cache first for safe informational intents. Live trading requests never terminate from a cached trading answer.
+Stage 1, receive the new task: the coordinator normalizes the user objective, immutable constraints, tenant/scope, locale, symbols, time horizon, task type, risk class, required evidence types, and maximum memory token budget. It creates a traceable `MemoryQuery` and checks the exact high-frequency seed cache first for safe informational intents. It then creates a `SemanticCacheQuery`, embeds the normalized historical-request projection, and asks the vector cache for the highest compatible unexpired result. A result is returned directly only when cosine similarity is strictly greater than `0.95` and tenant/scope, intent, locale, prompt, model policy, schema/hash, safety policy, knowledge/context fingerprint, and freshness gates all match. Live trading requests never terminate from a cached trading answer.
+
+The semantic-cache audit records the query hash, embedding model/version, threshold, filtered candidate IDs and scores, compatibility rejections, selected cache ID, original request/response timestamps, model ID/version, prompt and schema versions/hashes, TTL class, expiry, and hit/miss reason. Expired entries are removed from eligibility before similarity ranking and are never used by local-knowledge fallback. Vector cache failure is a cache miss, not a workflow failure.
 
 Stage 2, vector retrieval: the memory service embeds the normalized task with the configured embedding model/version and performs filtered Top-K retrieval. It first searches completed decision lessons for comparable situations and active knowledge revisions for reusable experience; it follows their evidence links into the event layer when raw support is required. Filters enforce tenant/scope, symbol/market applicability, lifecycle state, effective/expiry time, knowledge version, legal visibility, and maximum staleness before similarity search. Recommended defaults are configurable `decision_k=5`, `knowledge_k=8`, and `event_evidence_k=12`.
 

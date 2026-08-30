@@ -129,21 +129,21 @@ def test_referenced_event_cannot_be_purged(worker, repo):
 - [ ] **Step 4:** Rerun and verify expired evidence creates an explicit gap and `不知道`/`no_trade`.
 - [ ] **Step 5:** Commit `feat: add governed memory forgetting`.
 
-### Task 7: Fixed Answers and Resilient Agent Runner
+### Task 7: Fixed/Semantic Answers and Resilient Agent Runner
 
-**Files:** Create `workflow_response_cache.py`, `local_knowledge_base.py`, `workflow_agent_runner.py`, two knowledge JSON files; modify `langchain_runtime.py`; test `test_workflow_cache_knowledge.py`, `test_workflow_agent_runner.py`.
+**Files:** Create `workflow_response_cache.py`, `workflow_semantic_request_cache.py`, `local_knowledge_base.py`, `workflow_agent_runner.py`, two knowledge JSON files; modify `langchain_runtime.py`; test `test_workflow_cache_knowledge.py`, `test_workflow_semantic_request_cache.py`, `test_workflow_agent_runner.py`.
 
-**Interfaces:** `ResponseCache.get/put/lookup_seed`, `LocalKnowledgeBase.lookup`, and `AgentRunner.run`.
+**Interfaces:** `ResponseCache.get/put/lookup_seed`, `SemanticRequestCache.lookup/store/expire`, `LocalKnowledgeBase.lookup`, and `AgentRunner.run`.
 
-- [ ] **Step 1:** Test fixed aliases/TTL/unsafe categories plus strict schema parsing, rejection of prose/fences/extra fields, 408/409/429/5xx retry, auth nonretry, timeout cost, downgrade, knowledge fallback, unknown, and unhealthy-audit denial.
+- [ ] **Step 1:** Test fixed aliases/TTL/unsafe categories; semantic vector storage, strict `>0.95` threshold, metadata, tenant/version/context gates, deterministic ties, hard expiry and cleanup; plus strict schema parsing, rejection of prose/fences/extra fields, 408/409/429/5xx retry, auth nonretry, timeout cost, downgrade, knowledge fallback, unknown, and unhealthy-audit denial.
 ```python
 def test_trade_result_is_not_cacheable(cache):
     with pytest.raises(UnsafeCacheEntryError):
         cache.put(key(), CachedAnswer(category="trade_decision", answer="long"), policy())
 ```
 - [ ] **Step 2:** Run both focused files; expect failure.
-- [ ] **Step 3:** Implement safe seeds, LRU/SQLite, exact retrieval, audit/reserve-before-call, bounded retries/deadlines, tiers, knowledge, unknown, and usage.
-- [ ] **Step 4:** Run focused and `-k "prompt_cache or request_timeout"` tests.
+- [ ] **Step 3:** Implement safe seeds, LRU/SQLite exact retrieval, PostgreSQL/pgvector semantic retrieval with local repository fallback, request/response/model/schema metadata, category TTLs and invalidation, audit/reserve-before-call, bounded retries/deadlines, tiers, knowledge, unknown, and usage.
+- [ ] **Step 4:** Run focused and `-k "prompt_cache or semantic_cache or request_timeout"` tests.
 - [ ] **Step 5:** Commit `feat: add resilient cached agent runner`.
 
 ### Task 8: Capability Enforcement
@@ -252,5 +252,5 @@ def test_agent_modules_do_not_import_exchange():
 - [ ] **Step 1:** Trace active, passive-unrelated, conflict, timeout/downgrade, knowledge, unknown, memory promotion, and forgetting paths through audit finalize.
 - [ ] **Step 2:** Verify summarized handoffs, audit/reservation/capability before calls, and bounded exits on every cycle.
 - [ ] **Step 3:** Verify abstention prompts, dynamic-free system prefixes, actor permission matrix, and no direct durable writes by agents.
-- [ ] **Step 4:** Verify vector retrieval citations, anti-circular promotion, protected evidence, legal holds, tombstones, and no live claims in fixed cache.
+- [ ] **Step 4:** Verify vector retrieval citations, anti-circular promotion, protected evidence, legal holds, tombstones, strict semantic-cache threshold/expiry/version metadata, and no live claims in fixed or semantic caches.
 - [ ] **Step 5:** For each confirmed finding, add a failing test, patch it, rerun affected/full suites, and record final evidence.
