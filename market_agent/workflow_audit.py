@@ -457,7 +457,11 @@ def _has_legacy_semantic_signature(row: list[object]) -> bool:
                 _require_code(value)
     except ValueError:
         return False
-    return not _has_current_semantics(row)
+    return (
+        row[7] not in _ACTORS
+        and row[8] not in _EVENT_TYPES
+        and row[9] not in _STATUSES
+    )
 
 
 def _has_known_generic_payload_shape(value: object) -> bool:
@@ -721,6 +725,8 @@ class AuditStore:
 
 
 class AuditWriter:
+    """Compatibility writer for the audit projection, not orchestration state."""
+
     def __init__(self, store: AuditStore) -> None:
         self._store = store
         self._healthy = True

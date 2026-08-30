@@ -486,6 +486,9 @@ def test_complete_row_classifier_migrates_only_positive_pre_metadata_signatures(
         assert (migrated.source_schema_lineage, migrated.hash_policy) == ("generic_v1", "null_noncanonical_v1")
         assert migrated.legacy_semantic_digest is not None
         assert (migrated.actor, migrated.event_type, migrated.status) == ("legacy_actor", "legacy_event", "legacy_status")
+        assert migrated.output_hash == "b" * 64
+    assert by_id["event-semantic-legacy"].input_hash == "a" * 64
+    assert by_id["event-generic"].input_hash is None
 
 
 @pytest.mark.parametrize(("payload", "input_hash"), [(json.dumps({"kind": "transition", "subject_ids": []}), "a" * 64), (json.dumps({"kind": "transition", "subject_ids": ["task-1"]}), "BAD")])
@@ -493,6 +496,39 @@ def test_pre_metadata_current_shaped_corruption_fails_instead_of_migrating(tmp_p
     database_path = tmp_path / f"current-corrupt-{len(payload)}-{len(input_hash)}.sqlite3"
     row = _legacy_row("event-current", 1, payload, input_hash=input_hash, schema_version="v1")
     _create_legacy_database(database_path, [row], schema_version=True)
+
+    with pytest.raises(ValidationError):
+        AuditStore(database_path)
+
+
+@pytest.mark.parametrize(
+    ("field_index", "corrupt_value"),
+    [
+        (7, "coordinator_typo"),
+        (8, "task_dispatched_typo"),
+        (9, "accepted_typo"),
+        (17, "gpt-5.6-terra-typo"),
+    ],
+)
+def test_pre_metadata_current_row_with_one_semantic_corruption_is_not_legacy(
+    tmp_path, field_index, corrupt_value
+):
+    database_path = tmp_path / f"isolated-semantic-corruption-{field_index}.sqlite3"
+    payload = json.dumps({"kind": "transition", "subject_ids": ["task-1"]})
+    row = list(
+        _legacy_row(
+            "event-current",
+            1,
+            payload,
+            input_hash="a" * 64,
+            schema_version="v1",
+        )
+    )
+    row[17] = "gpt-5.6-terra"
+    row[18] = "prompt-v1"
+    row[19] = "AgentTask"
+    row[field_index] = corrupt_value
+    _create_legacy_database(database_path, [tuple(row)], schema_version=True)
 
     with pytest.raises(ValidationError):
         AuditStore(database_path)
