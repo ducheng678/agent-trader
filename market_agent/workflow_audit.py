@@ -50,11 +50,13 @@ def _require_utc(value: datetime) -> datetime:
 
 
 class AuditPayload(ContractModel):
-    kind: Literal["transition", "validation", "usage", "selection", "summary"]
+    kind: Literal["transition", "validation", "usage", "selection", "summary", "legacy_migration"]
     subject_ids: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=50)
     outcome_code: ShortText | None = None
     reason_code: ShortText | None = None
     item_count: NonNegativeInt | None = None
+    legacy_payload_digest: str | None = None
+    legacy_schema_lineage: Literal["v0", "v1"] | None = None
 
     @field_validator("subject_ids", "outcome_code", "reason_code")
     @classmethod
@@ -148,6 +150,7 @@ class AuditStore:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_events)")}
             if "schema_version" not in columns:
                 connection.execute("ALTER TABLE audit_events ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'v1'")
+            self._migrate_legacy_payloads(connection)
             connection.execute("CREATE INDEX IF NOT EXISTS audit_events_trace_sequence_idx ON audit_events(trace_id, sequence)")
             connection.execute("CREATE INDEX IF NOT EXISTS audit_events_workflow_idx ON audit_events(workflow_id, sequence)")
             connection.execute("CREATE INDEX IF NOT EXISTS audit_events_attempt_idx ON audit_events(attempt_id, sequence)")
@@ -158,6 +161,30 @@ class AuditStore:
             connection.execute("CREATE TRIGGER IF NOT EXISTS audit_events_no_replace BEFORE INSERT ON audit_events WHEN EXISTS (SELECT 1 FROM audit_events WHERE event_id = NEW.event_id) OR EXISTS (SELECT 1 FROM audit_events WHERE trace_id = NEW.trace_id AND sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END")
         finally:
             connection.close()
+
+    @staticmethod
+    def _migrate_legacy_payloads(connection: sqlite3.Connection) -> None:
+        connection.execute("DROP TRIGGER IF EXISTS audit_events_no_update")
+        connection.execute("DROP TRIGGER IF EXISTS audit_events_no_delete")
+        connection.execute("DROP TRIGGER IF EXISTS audit_events_no_replace")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute("SELECT event_id, payload, schema_version FROM audit_events").fetchall()
+            for event_id, payload_text, schema_version in rows:
+                try:
+                    parsed = json.loads(payload_text)
+                    AuditPayload.model_validate(parsed)
+                    continue
+                except Exception:
+                    pass
+                canonical = json.dumps(parsed if 'parsed' in locals() else str(payload_text), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                migrated = {"kind": "legacy_migration", "subject_ids": (), "outcome_code": "legacy_payload", "item_count": len(parsed) if isinstance(parsed, (dict, list)) else 1, "legacy_payload_digest": __import__("hashlib").sha256(canonical.encode("utf-8")).hexdigest(), "legacy_schema_lineage": "v0" if schema_version != "v1" else "v1"}
+                connection.execute("UPDATE audit_events SET payload = ? WHERE event_id = ?", (json.dumps(migrated, sort_keys=True, separators=(",", ":")), event_id))
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
 
     def append(self, event: AuditEvent) -> AuditEvent:
         if event.sequence is not None:

@@ -96,6 +96,15 @@ def _selected_hash(records: tuple[ContextRecord, ...], policy_version: str, max_
     return _canonical_hash({"policy_version": policy_version, "max_records": max_records, "max_bytes": max_bytes, "records": [record.model_dump(mode="json") for record in records]})
 
 
+class CandidateManifestEntry(ContractModel):
+    record_id: ShortText
+    record_hash: ShortText
+
+
+def _manifest_hash(entries: tuple[CandidateManifestEntry, ...], policy_version: str, max_records: int, max_bytes: int) -> str:
+    return _canonical_hash({"policy_version": policy_version, "max_records": max_records, "max_bytes": max_bytes, "entries": [entry.model_dump(mode="json") for entry in entries]})
+
+
 class ContextSelection(ContractModel):
     records: tuple[ContextRecord, ...] = Field(default_factory=tuple, max_length=30)
     selected_ids: tuple[ShortText, ...] = Field(default_factory=tuple, max_length=30)
@@ -108,6 +117,9 @@ class ContextSelection(ContractModel):
     max_bytes: NonNegativeInt
     selected_record_hash: ShortText
     all_input_hash: ShortText
+    candidate_count: NonNegativeInt = 0
+    candidate_manifest: tuple[CandidateManifestEntry, ...] = Field(default_factory=tuple, max_length=_MAX_CANDIDATES)
+    manifest_hash: ShortText = "0"
 
     @property
     def input_hash(self) -> str:
@@ -126,6 +138,13 @@ class ContextSelection(ContractModel):
             raise ValueError("selection bounds are invalid")
         if self.selected_record_hash != _selected_hash(self.records, self.selection_policy_version, self.max_records, self.max_bytes):
             raise ValueError("selection hash does not match selected records")
+        if self.candidate_count != len(self.candidate_manifest) or len({entry.record_id for entry in self.candidate_manifest}) != self.candidate_count:
+            raise ValueError("candidate manifest count or identifiers are inconsistent")
+        if self.manifest_hash != _manifest_hash(self.candidate_manifest, self.selection_policy_version, self.max_records, self.max_bytes) or self.all_input_hash != self.manifest_hash:
+            raise ValueError("candidate manifest hashes are inconsistent")
+        entries = {entry.record_id: entry.record_hash for entry in self.candidate_manifest}
+        if any(entries.get(record.record_id) != _canonical_hash(record.model_dump(mode="json")) for record in self.records):
+            raise ValueError("selected records do not match candidate manifest")
         return self
 
 
@@ -146,12 +165,16 @@ class ContextHandoff(ContractModel):
     supporting_evidence: tuple[EvidenceReference, ...] = Field(default_factory=tuple, max_length=50)
     contradicting_evidence: tuple[EvidenceReference, ...] = Field(default_factory=tuple, max_length=50)
     selection_policy_version: ShortText
+    candidate_count: NonNegativeInt
+    manifest_hash: ShortText
     untrusted_data: Literal[True]
 
     @model_validator(mode="after")
     def validate_handoff(self) -> ContextHandoff:
         if self.summary.source_record_hash != self.input_hash or self.selected_count != len(self.selected_ids):
             raise ValueError("handoff identity contradicts summary selection")
+        if self.candidate_count < self.selected_count:
+            raise ValueError("handoff candidate inventory contradicts selected records")
         if self.omitted_count < len(self.omitted_ids) or self.unreported_omitted_count != self.omitted_count - len(self.omitted_ids):
             raise ValueError("handoff omitted metadata is inconsistent")
         if self.omitted_ids_truncated != (self.unreported_omitted_count > 0):
@@ -221,6 +244,8 @@ def select_context(source_records: Iterable[ContextRecord | Mapping[str, object]
         else:
             omitted.extend(record.record_id for record in ordered_group)
     selected_tuple = tuple(selected)
+    manifest = tuple(CandidateManifestEntry(record_id=record.record_id, record_hash=_canonical_hash(record.model_dump(mode="json"))) for record in sorted(normalized, key=lambda item: item.record_id))
+    manifest_hash = _manifest_hash(manifest, _POLICY_VERSION, max_records, selected_max_bytes)
     reported_omitted = tuple(omitted[:_MAX_OMITTED_IDS])
     return ContextSelection(
         records=selected_tuple,
@@ -233,7 +258,10 @@ def select_context(source_records: Iterable[ContextRecord | Mapping[str, object]
         max_records=max_records,
         max_bytes=selected_max_bytes,
         selected_record_hash=_selected_hash(selected_tuple, _POLICY_VERSION, max_records, selected_max_bytes),
-        all_input_hash=_canonical_hash({"policy_version": _POLICY_VERSION, "records": [record.model_dump(mode="json") for record in sorted(normalized, key=lambda item: item.record_id)]}),
+        all_input_hash=manifest_hash,
+        candidate_count=len(normalized),
+        candidate_manifest=manifest,
+        manifest_hash=manifest_hash,
     )
 
 
@@ -280,7 +308,7 @@ def summarize_context(selection: ContextSelection, *, workflow_id: str, trace_id
     explicit_contradictions = tuple(item for record in selection.records for item in record.contradicting_evidence)
     inferred_contradictions = tuple(EvidenceReference(evidence_id=record.record_id, source_id=record.claim.source_id, observed_at=record.claim.observed_at, relation="contradicting") for group in conflicts for record in selection.records if record.conflict_group_id == group.group_id and record.record_id != group.record_ids[0])
     contradicting = dedupe(explicit_contradictions + inferred_contradictions)
-    base = {"summary": summary, "input_hash": selection.selected_record_hash, "all_input_hash": selection.all_input_hash, "selected_ids": selection.selected_ids, "omitted_ids": selection.omitted_ids, "selected_count": selection.selected_count, "omitted_count": selection.omitted_count, "omitted_ids_truncated": selection.omitted_ids_truncated, "unreported_omitted_count": selection.omitted_count - len(selection.omitted_ids), "uncertainty_markers": uncertainty, "omitted_uncertainty_count": len(all_uncertainty) - len(uncertainty), "conflicts": conflicts, "supporting_evidence": supporting, "contradicting_evidence": contradicting, "selection_policy_version": selection.selection_policy_version, "untrusted_data": True}
+    base = {"summary": summary, "input_hash": selection.selected_record_hash, "all_input_hash": selection.all_input_hash, "selected_ids": selection.selected_ids, "omitted_ids": selection.omitted_ids, "selected_count": selection.selected_count, "omitted_count": selection.omitted_count, "omitted_ids_truncated": selection.omitted_ids_truncated, "unreported_omitted_count": selection.omitted_count - len(selection.omitted_ids), "uncertainty_markers": uncertainty, "omitted_uncertainty_count": len(all_uncertainty) - len(uncertainty), "conflicts": conflicts, "supporting_evidence": supporting, "contradicting_evidence": contradicting, "selection_policy_version": selection.selection_policy_version, "candidate_count": selection.candidate_count, "manifest_hash": selection.manifest_hash, "untrusted_data": True}
     provisional = ContextHandoff.model_construct(**base, output_hash="pending")
     output_hash = _canonical_hash({key: value for key, value in provisional.model_dump(mode="json").items() if key != "output_hash"})
     return ContextHandoff(**base, output_hash=output_hash)

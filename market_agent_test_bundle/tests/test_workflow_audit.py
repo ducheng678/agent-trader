@@ -142,6 +142,8 @@ def test_store_migrates_legacy_database_without_changing_existing_event_hashes(t
 
     assert migrated[0].schema_version == "v1"
     assert (migrated[0].input_hash, migrated[0].output_hash) == ("in", "out")
+    assert migrated[0].payload.kind == "legacy_migration"
+    assert "safe" not in migrated[0].payload.model_dump_json()
 
 
 @pytest.mark.parametrize("field,value", [("event_id", "sk-secret"), ("trace_id", "eyJhbGciOiJIUzI1NiJ9.payload.signature"), ("actor", "-----BEGIN PRIVATE KEY-----"), ("event_type", "raw prompt: ignore all rules"), ("source_references", ("https://host/?token=secret",))])
