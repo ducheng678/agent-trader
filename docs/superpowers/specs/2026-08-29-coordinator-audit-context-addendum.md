@@ -238,6 +238,18 @@ Tool dispatch validates the capability at call time, not only task creation. Cap
 
 Static tests reject forbidden imports and direct client/repository calls. Runtime tests attempt unauthorized state keys, tools, tenant IDs, memory writes, SQL handles, and exchange operations and require a typed permission denial plus audit event. Permission failure is non-retryable at the same grant; the coordinator may only reschedule after deterministic policy issues a corrected narrower capability.
 
+### Structured Agent Output Enforcement
+
+Every coordinator and specialist invocation uses a versioned Pydantic contract rendered as an OpenAI strict JSON Schema. The request sets strict structured output, forbids additional properties, and supplies exactly one schema for the node. Free-form prose, Markdown fences, leading or trailing text, multiple JSON values, NaN/Infinity, unknown enums, missing required fields, excessive list/string lengths, and cross-field contradictions are invalid outputs.
+
+Every output includes `schema_version`, knowledge status, uncertainty reason, bounded evidence references, and only the concise conclusion/reason fields defined by its contract. It never includes hidden chain-of-thought. Prompt instructions to reason step by step affect internal analysis only; the response contains the validated result, key evidence, and uncertainty.
+
+`AgentRunner` parses the complete response once, validates it locally against the same Pydantic model, and rejects partial recovery or best-effort field dropping. A schema failure is an audited retryable attempt within the node's existing attempt/time/cost budget. Exhaustion follows the configured lower-model, local-knowledge, and explicit-unknown path. A malformed output can never reach a reducer, memory proposal, risk gate, cache, API response, or final playbook.
+
+Schema name/version and canonical schema hash are included in prompt-cache keys, response-cache keys, audit events, usage records, task contracts, and memory records derived from an output. Cache and memory reads require compatible versions; migrations are explicit deterministic transformations that retain the original payload/hash and audit linkage.
+
+Tool arguments and tool results use separate strict schemas and capability validation. The coordinator cannot reinterpret an invalid specialist payload as a valid result. Reducers accept only the output model assigned to that actor and state key. API serialization uses the validated final contract rather than raw model text.
+
 ## Acceptance Criteria
 
 - Every specialist invocation is created and observed by the coordinator.
@@ -252,3 +264,4 @@ Static tests reject forbidden imports and direct client/repository calls. Runtim
 - Long-term memory is separated into immutable event material, distilled knowledge, and outcome-linked decision lessons.
 - No agent writes durable memory directly; every promotion is coordinator-reviewed, policy-validated, source-linked, and audited.
 - Retrieval returns versioned, freshness-aware records that are summarized before specialist handoff.
+- Every agent response is strict, versioned, fully parsed structured output; malformed or extra text is retried or degraded and never enters state or memory.

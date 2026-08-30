@@ -15,6 +15,7 @@
 - Preserve `get_playbook(...) -> tuple[GenericPlaybook, str]` and modes.
 - Luna classifies, Terra reasons, and Sol reviews difficult conflicts.
 - Stable system prompts precede dynamic summarized context.
+- Every agent/tool output uses versioned strict JSON Schema plus local Pydantic validation; malformed or extra text never enters state or memory.
 - Agent prompts include the approved stepwise-analysis and uncertainty/unknown instruction.
 - Enforce active 300s/10 attempts/$0.75 and passive 130s/10/$0.30 caps.
 - Degrade through allowed lower models, local knowledge, then `不知道`; trading unknown is `no_trade`.
@@ -134,7 +135,7 @@ def test_referenced_event_cannot_be_purged(worker, repo):
 
 **Interfaces:** `ResponseCache.get/put/lookup_seed`, `LocalKnowledgeBase.lookup`, and `AgentRunner.run`.
 
-- [ ] **Step 1:** Test fixed aliases/TTL/unsafe categories plus 408/409/429/5xx retry, auth nonretry, timeout cost, model downgrade, knowledge fallback, unknown, and unhealthy-audit denial.
+- [ ] **Step 1:** Test fixed aliases/TTL/unsafe categories plus strict schema parsing, rejection of prose/fences/extra fields, 408/409/429/5xx retry, auth nonretry, timeout cost, downgrade, knowledge fallback, unknown, and unhealthy-audit denial.
 ```python
 def test_trade_result_is_not_cacheable(cache):
     with pytest.raises(UnsafeCacheEntryError):
@@ -169,7 +170,7 @@ def test_technical_agent_cannot_use_web(policy):
 
 **Interfaces:** Each specialist exports `SYSTEM_PROMPT`, `PROMPT_VERSION`, `build_messages`, `run_node`; coordinator exports `plan_request`, `dispatch_tasks`, `reconcile_reports`, `reschedule`, `summarize_result`.
 
-- [ ] **Step 1:** Test stable abstention/stepwise prompts, dynamic user data, web-tool isolation, task bounds, model selection, errors returning to coordinator, conflict reconciliation, and final summary.
+- [ ] **Step 1:** Test stable abstention/stepwise prompts, versioned strict schemas, dynamic user data, web-tool isolation, task bounds, model selection, errors returning to coordinator, conflict reconciliation, and final summary.
 ```python
 def test_conflict_returns_to_coordinator():
     result = reconcile_reports(plan(), conflicting_reports(), budget())
