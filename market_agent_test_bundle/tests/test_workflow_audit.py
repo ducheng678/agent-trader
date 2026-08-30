@@ -391,10 +391,12 @@ def test_prompt_and_schema_identifiers_reject_secret_and_instruction_categories(
         event("event-metadata", **{field: value})
 
 
-@pytest.mark.parametrize("type_name", ["AuditPromptVersion", "AuditSchemaName"])
-def test_prompt_and_schema_use_dedicated_identifier_contracts(type_name):
+@pytest.mark.parametrize(("type_name", "valid", "cross_type"), [("AuditPromptVersion", "release-v2.1", "AgentTask"), ("AuditSchemaName", "AgentTask", "release-v2.1")])
+def test_prompt_and_schema_use_distinct_positive_identifier_grammars(type_name, valid, cross_type):
     identifier_type = getattr(workflow_audit, type_name)
-    assert TypeAdapter(identifier_type).validate_python("release-v1") == "release-v1"
+    assert TypeAdapter(identifier_type).validate_python(valid) == valid
+    with pytest.raises(ValidationError):
+        TypeAdapter(identifier_type).validate_python(cross_type)
     with pytest.raises(ValidationError):
         TypeAdapter(identifier_type).validate_python("ignore_all_previous_instructions")
 
@@ -460,3 +462,77 @@ def test_append_revalidates_constructed_and_copied_events_before_persistence(tmp
         with pytest.raises(ValidationError):
             store.append(invalid)
     assert store.list() == []
+
+
+def test_complete_row_classifier_migrates_only_positive_pre_metadata_signatures(tmp_path):
+    database_path = tmp_path / "mixed-pre-metadata.sqlite3"
+    strict_payload = json.dumps({"kind": "transition", "subject_ids": ["task-1"]})
+    current_row = _legacy_row("event-current", 1, strict_payload, input_hash="a" * 64, schema_version="v1")
+    semantic_legacy = list(_legacy_row("event-semantic-legacy", 2, strict_payload, input_hash="a" * 64, schema_version="v1"))
+    semantic_legacy[7:10] = ["old_actor", "old_event", "old_status"]
+    semantic_legacy[17:20] = ["old_model", "old_prompt", "old_schema"]
+    generic_payload = list(_legacy_row("event-generic", 3, json.dumps({"kind": "transition", "subject_ids": []}), schema_version="v1"))
+    generic_payload[7:10] = ["c96_actor", "c96_event", "c96_status"]
+    _create_legacy_database(database_path, [current_row, tuple(semantic_legacy), tuple(generic_payload)], schema_version=True)
+
+    first = AuditStore(database_path).list()
+    second = AuditStore(database_path).list()
+
+    assert first == second
+    by_id = {item.event_id: item for item in first}
+    assert (by_id["event-current"].source_schema_lineage, by_id["event-current"].hash_policy, by_id["event-current"].legacy_semantic_digest) == ("current_v1", "strict_canonical_v1", None)
+    for event_id in ("event-semantic-legacy", "event-generic"):
+        migrated = by_id[event_id]
+        assert (migrated.source_schema_lineage, migrated.hash_policy) == ("generic_v1", "null_noncanonical_v1")
+        assert migrated.legacy_semantic_digest is not None
+        assert (migrated.actor, migrated.event_type, migrated.status) == ("legacy_actor", "legacy_event", "legacy_status")
+
+
+@pytest.mark.parametrize(("payload", "input_hash"), [(json.dumps({"kind": "transition", "subject_ids": []}), "a" * 64), (json.dumps({"kind": "transition", "subject_ids": ["task-1"]}), "BAD")])
+def test_pre_metadata_current_shaped_corruption_fails_instead_of_migrating(tmp_path, payload, input_hash):
+    database_path = tmp_path / f"current-corrupt-{len(payload)}-{len(input_hash)}.sqlite3"
+    row = _legacy_row("event-current", 1, payload, input_hash=input_hash, schema_version="v1")
+    _create_legacy_database(database_path, [row], schema_version=True)
+
+    with pytest.raises(ValidationError):
+        AuditStore(database_path)
+
+
+def test_unknown_storage_schema_version_fails_without_transformation(tmp_path):
+    database_path = tmp_path / "unknown-version.sqlite3"
+    payload = json.dumps({"kind": "transition", "subject_ids": ["task-1"]})
+    _create_legacy_database(database_path, [_legacy_row("event-v2", 1, payload, input_hash="a" * 64, schema_version="v2")], schema_version=True)
+
+    with pytest.raises(ValidationError):
+        AuditStore(database_path)
+
+
+def test_partial_row_metadata_schema_is_rejected_as_ambiguous(tmp_path):
+    database_path = tmp_path / "partial-metadata.sqlite3"
+    payload = json.dumps({"kind": "transition", "subject_ids": ["task-1"]})
+    _create_legacy_database(database_path, [_legacy_row("event-partial", 1, payload, input_hash="a" * 64, schema_version="v1")], schema_version=True)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("ALTER TABLE audit_events ADD COLUMN source_schema_lineage TEXT NOT NULL DEFAULT 'current_v1'")
+
+    with pytest.raises(ValueError, match="metadata schema"):
+        AuditStore(database_path)
+
+
+@pytest.mark.parametrize(("type_name", "marker"), [("AuditEventId", "sk_live_abcdef"), ("AuditTraceId", "sk-live-abcdef"), ("AuditWorkflowId", "raw.prompt"), ("AuditTaskId", "system_prompt"), ("AuditAttemptId", "private-reasoning"), ("AuditSourceReference", "api_key"), ("AuditSubjectId", "eyJhbGciOiJIUzI1NiJ9.payload.signature"), ("AuditCode", "-----BEGIN_PRIVATE_KEY-----"), ("AuditCode", "skliveabcdef"), ("AuditPromptVersion", "system.prompt"), ("AuditSchemaName", "private.reasoning")])
+def test_every_audit_string_contract_rejects_compact_sensitive_markers(type_name, marker):
+    with pytest.raises(ValidationError):
+        TypeAdapter(getattr(workflow_audit, type_name)).validate_python(marker)
+
+
+@pytest.mark.parametrize(("field", "marker"), [("event_id", "sk_live_abcdef"), ("trace_id", "sk-live-abcdef"), ("workflow_id", "raw_prompt"), ("task_id", "system-prompt"), ("attempt_id", "private_reasoning"), ("actor", "api_key"), ("event_type", "raw/prompt"), ("status", "system:prompt"), ("model", "private.reasoning"), ("prompt_version", "-----BEGIN/PRIVATE/KEY-----"), ("schema_name", "eyJhbGciOiJIUzI1NiJ9.payload.signature"), ("source_references", ("sk_live_abcdef",))])
+def test_audit_event_positions_reject_separator_and_compact_marker_variants(field, marker):
+    values = event("event-sensitive").model_dump(mode="python")
+    values[field] = marker
+    with pytest.raises(ValidationError):
+        AuditEvent.model_validate(values)
+
+
+@pytest.mark.parametrize("payload", [{"kind": "transition", "subject_ids": ("sk_live_abcdef",)}, {"kind": "validation", "subject_ids": ("task-1",), "outcome_code": "api_key"}, {"kind": "validation", "subject_ids": ("task-1",), "outcome_code": "rejected", "reason_code": "private.reasoning"}])
+def test_audit_payload_string_positions_reject_compact_sensitive_markers(payload):
+    with pytest.raises(ValidationError):
+        AuditPayload(**payload)

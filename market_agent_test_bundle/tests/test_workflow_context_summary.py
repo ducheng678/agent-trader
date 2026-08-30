@@ -402,3 +402,69 @@ def test_handoff_carries_manifest_identity_separately_from_raw_attestations():
     assert (handoff.input_hash, handoff.selected_byte_length) == (selection.selected_record_hash, selection.selected_byte_length)
     assert (handoff.all_input_hash, handoff.full_input_byte_length) == (selection.all_input_hash, selection.full_input_byte_length)
     assert (handoff.manifest_hash, handoff.manifest_byte_length) == (selection.manifest_hash, selection.manifest_byte_length)
+
+
+def _canonical_multi_group_handoff():
+    observed_at = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    candidates = []
+    for group_index, unresolved in enumerate((True, False)):
+        for member_index in range(2):
+            candidates.append(ContextRecord(record_id=f"member-{group_index}-{member_index}", claim=NormalizedClaim(claim_id=f"claim-{group_index}-{member_index}", source_id=f"source-{group_index}-{member_index}", observed_at=observed_at, value=f"value {group_index} {member_index}", negated=False, untrusted_data=True), relevance=1.0 - group_index / 10.0 - member_index / 100.0, conflict_group_id=f"group-{group_index}", conflict_description=f"conflict {group_index}", conflict_unresolved=unresolved))
+    return summarize_context(select_context(candidates, max_records=4, max_bytes=500000), workflow_id="workflow-1", trace_id="trace-1", task_id="task-1", user_objective="Assess BTC")
+
+
+def test_valid_canonical_multi_group_handoff_round_trips():
+    handoff = _canonical_multi_group_handoff()
+
+    assert ContextHandoff.model_validate(handoff.model_dump(mode="python")) == handoff
+    assert tuple(group.group_id for group in handoff.conflicts) == ("group-0", "group-1")
+
+
+def test_resigned_handoff_rejects_duplicate_conflict_groups_with_same_resolution():
+    handoff = _canonical_multi_group_handoff()
+    duplicate = handoff.conflicts[1]
+    forged = _resign_handoff(handoff.model_copy(update={"conflicts": (handoff.conflicts[0], duplicate, duplicate)}))
+
+    with pytest.raises(ValidationError, match="conflict"):
+        ContextHandoff.model_validate(forged)
+
+
+def test_resigned_handoff_rejects_duplicate_conflict_groups_with_conflicting_resolution():
+    handoff = _canonical_multi_group_handoff()
+    unresolved = handoff.conflicts[0]
+    resolved_copy = unresolved.model_copy(update={"unresolved": False})
+    forged = _resign_handoff(handoff.model_copy(update={"conflicts": (resolved_copy, unresolved, handoff.conflicts[1])}))
+
+    with pytest.raises(ValidationError, match="conflict"):
+        ContextHandoff.model_validate(forged)
+
+
+def test_resigned_handoff_rejects_reversed_conflict_group_order():
+    handoff = _canonical_multi_group_handoff()
+    forged = _resign_handoff(handoff.model_copy(update={"conflicts": tuple(reversed(handoff.conflicts))}))
+
+    with pytest.raises(ValidationError, match="conflict"):
+        ContextHandoff.model_validate(forged)
+
+
+def test_resigned_handoff_rejects_duplicate_conflict_questions_and_evidence():
+    handoff = _canonical_multi_group_handoff()
+    duplicated_question = _resign_handoff(handoff.model_copy(update={"conflict_questions": handoff.conflict_questions + handoff.conflict_questions}))
+    first_evidence = handoff.contradicting_evidence[0]
+    duplicated_evidence = tuple(sorted(handoff.contradicting_evidence + (first_evidence,), key=lambda item: item.evidence_id))
+    duplicated_reference = _resign_handoff(handoff.model_copy(update={"contradicting_evidence": duplicated_evidence}))
+
+    with pytest.raises(ValidationError, match="conflict-question"):
+        ContextHandoff.model_validate(duplicated_question)
+    with pytest.raises(ValidationError, match="evidence"):
+        ContextHandoff.model_validate(duplicated_reference)
+
+
+@pytest.mark.parametrize("summary_update", [{"conflicts": ("group-1: conflict 1", "group-0: conflict 0")}, {"conflicts": ("group-0: conflict 0", "group-0: conflict 0", "group-1: conflict 1")}, {"unresolved_questions": ()}])
+def test_resigned_handoff_rejects_summary_conflict_inventory_divergence(summary_update):
+    handoff = _canonical_multi_group_handoff()
+    forged_summary = handoff.summary.model_copy(update=summary_update)
+    forged = _resign_handoff(handoff.model_copy(update={"summary": forged_summary}))
+
+    with pytest.raises(ValidationError, match="summary conflict"):
+        ContextHandoff.model_validate(forged)

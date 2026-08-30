@@ -313,21 +313,37 @@ class ContextHandoff(ContractModel):
             raise ValueError("handoff omitted metadata is inconsistent")
         if self.omitted_ids_truncated != (self.unreported_omitted_count > 0):
             raise ValueError("handoff omitted truncation metadata is inconsistent")
+        group_ids = tuple(group.group_id for group in self.conflicts)
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("handoff conflict group identifiers must be unique")
+        if self.conflicts != tuple(sorted(self.conflicts, key=lambda group: group.group_id)):
+            raise ValueError("handoff conflict groups must use canonical order")
         expected_questions = tuple(sorted(f"unresolved conflict: {group.group_id}" for group in self.conflicts if group.unresolved))
         if self.conflict_questions != expected_questions[:_MAX_CONFLICT_QUESTIONS] or self.omitted_conflict_question_count != len(expected_questions) - len(self.conflict_questions):
             raise ValueError("handoff conflict-question aggregation is inconsistent")
+        if len(self.conflict_questions) != len(set(self.conflict_questions)):
+            raise ValueError("handoff conflict-question identifiers must be unique")
         manifest_entries = {entry.record_id: entry for entry in self.candidate_manifest}
         expected_conflict_members: dict[str, tuple[str, ...]] = {}
         for record_id in self.selected_ids:
             group_id = manifest_entries[record_id].conflict_group_id
             if group_id is not None:
-                expected_conflict_members[group_id] = tuple(sorted((*expected_conflict_members.get(group_id, ()), record_id)))
-        actual_conflict_members = {group.group_id: tuple(sorted(group.record_ids)) for group in self.conflicts}
+                expected_conflict_members[group_id] = (*expected_conflict_members.get(group_id, ()), record_id)
+        actual_conflict_members = {group.group_id: group.record_ids for group in self.conflicts}
         if actual_conflict_members != expected_conflict_members:
             raise ValueError("handoff conflicts do not match selected manifest groups")
+        expected_summary_conflicts = tuple(f"{group.group_id}: {group.description}" for group in self.conflicts)
+        expected_summary_questions = (self.uncertainty_markers + self.conflict_questions)[:_MAX_UNCERTAINTIES] or (("insufficient source evidence",) if not self.selected_ids else ())
+        unresolved_count = sum(group.unresolved for group in self.conflicts)
+        unresolved_sections = tuple(section for section in self.summary.omitted_sections if section.section == "unresolved_conflicts")
+        expected_unresolved_sections = () if unresolved_count == 0 else (OmittedSection(section="unresolved_conflicts", count=unresolved_count),)
+        if self.summary.conflicts != expected_summary_conflicts or self.summary.unresolved_questions != expected_summary_questions or unresolved_sections != expected_unresolved_sections:
+            raise ValueError("handoff summary conflict inventory is inconsistent")
         for items, omitted, relation in ((self.supporting_evidence, self.omitted_supporting_evidence_count, "supporting"), (self.contradicting_evidence, self.omitted_contradicting_evidence_count, "contradicting")):
             if any(item.relation != relation for item in items) or items != tuple(sorted(items, key=lambda item: item.evidence_id)):
                 raise ValueError("handoff evidence aggregation is noncanonical")
+            if len({item.evidence_id for item in items}) != len(items):
+                raise ValueError("handoff evidence identifiers must be unique")
             if (omitted > 0 and len(items) != _MAX_EVIDENCE) or (len(items) < _MAX_EVIDENCE and omitted != 0):
                 raise ValueError("handoff evidence omission metadata is inconsistent")
         _validate_evidence_registry(self.supporting_evidence, self.contradicting_evidence)

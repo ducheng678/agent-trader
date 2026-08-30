@@ -21,6 +21,8 @@ _MAX_PAYLOAD_BYTES = 4096
 _UNSAFE_VALUE = re.compile(r"(?:authorization|bearer|cookie|api[ _-]?key|credential|secret|token|password|private[ _-]?key|raw[ _-]?prompt|system[ _-]?prompt|reasoning|instruction|ignore.*previous|chain[ _-]?of[ _-]?thought|(?:^|[^a-z0-9])sk-[a-z0-9]|-----BEGIN|eyJ[a-zA-Z0-9_-]*\.|https?://\S+[?&](?:token|key|secret|signature)=)", re.IGNORECASE)
 _OPAQUE_ID = re.compile(r"^(?!sk-)(?!eyJ)[a-z][a-z0-9_-]{0,63}$")
 _CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_PROMPT_VERSION = re.compile(r"^(?:(?:prompt|release)-v[0-9]+(?:\.[0-9]+){0,2}(?:-[a-z][a-z0-9]*)?|legacy_identifier)$")
+_SCHEMA_NAME = re.compile(r"^(?:[A-Z][A-Za-z0-9]{0,63}|[a-z][a-z0-9]*(?:_[a-z0-9]+){1,15}|legacy_identifier)$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _LEGACY_HASH_POLICY = "null_noncanonical_v1"
 
@@ -30,7 +32,12 @@ class AuditUnavailableError(RuntimeError):
 
 
 def _require_safe_text(value: str) -> str:
-    if _UNSAFE_VALUE.search(value):
+    compact = re.sub(r"[^a-z0-9]+", "", value.casefold())
+    compact_markers = ("rawprompt", "systemprompt", "privatereasoning", "chainofthought", "apikey", "privatekey")
+    secret_prefix = re.search(r"(?:^|[^a-z0-9])sk[._/:-]+(?:live(?:[._/:-]+)?)?[a-z0-9]", value, re.IGNORECASE)
+    pem_variant = compact.startswith("begin") and "privatekey" in compact
+    compact_secret_prefix = compact.startswith(("sklive", "skprod", "skproj", "sktest"))
+    if _UNSAFE_VALUE.search(value) or any(marker in compact for marker in compact_markers) or secret_prefix or compact_secret_prefix or pem_variant:
         raise ValueError("audit values cannot contain credentials, authorization data, or URL secrets")
     return value
 
@@ -49,6 +56,20 @@ def _require_code(value: str) -> str:
     return value
 
 
+def _require_prompt_version(value: str) -> str:
+    _require_safe_text(value)
+    if not _PROMPT_VERSION.fullmatch(value):
+        raise ValueError("audit prompt versions must use the release identifier grammar")
+    return value
+
+
+def _require_schema_name(value: str) -> str:
+    _require_safe_text(value)
+    if not _SCHEMA_NAME.fullmatch(value):
+        raise ValueError("audit schema names must use the schema identifier grammar")
+    return value
+
+
 def _require_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() != timedelta(0):
         raise ValueError("audit timestamps must be UTC")
@@ -63,8 +84,8 @@ AuditAttemptId = Annotated[str, StringConstraints(strip_whitespace=True), AfterV
 AuditSourceReference = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
 AuditSubjectId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
 AuditCode = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_code)]
-AuditPromptVersion = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_code)]
-AuditSchemaName = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_code)]
+AuditPromptVersion = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_prompt_version)]
+AuditSchemaName = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_schema_name)]
 
 
 class AuditActor(str, Enum):
@@ -411,6 +432,72 @@ def _event_from_storage_row(row: tuple[object, ...]) -> AuditEvent:
     })
 
 
+def _has_current_semantics(row: list[object]) -> bool:
+    if row[7] not in _ACTORS or row[8] not in _EVENT_TYPES or row[9] not in _STATUSES:
+        return False
+    if row[17] is not None and row[17] not in _MODELS:
+        return False
+    try:
+        if row[18] is not None:
+            _require_prompt_version(str(row[18]))
+        if row[19] is not None:
+            _require_schema_name(str(row[19]))
+    except ValueError:
+        return False
+    return True
+
+
+def _has_legacy_semantic_signature(row: list[object]) -> bool:
+    values = (row[7], row[8], row[9], row[17], row[18], row[19])
+    if any(value is not None and (not isinstance(value, str) or len(value) > 256) for value in values):
+        return False
+    try:
+        for value in values:
+            if value is not None:
+                _require_code(value)
+    except ValueError:
+        return False
+    return not _has_current_semantics(row)
+
+
+def _has_known_generic_payload_shape(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if "kind" not in value:
+        return bool(value) and all(isinstance(key, str) for key in value)
+    allowed = {"kind", "subject_ids", "outcome_code", "reason_code", "item_count", "schema_version"}
+    if set(value) - allowed or value.get("kind") not in {"transition", "validation", "usage", "selection", "summary"}:
+        return False
+    if value.get("schema_version", "v1") != "v1":
+        return False
+    subjects = value.get("subject_ids", ())
+    if not isinstance(subjects, (list, tuple)) or len(subjects) > 50 or any(not isinstance(item, str) for item in subjects):
+        return False
+    if any(value.get(field) is not None and not isinstance(value.get(field), str) for field in ("outcome_code", "reason_code")):
+        return False
+    item_count = value.get("item_count")
+    return item_count is None or isinstance(item_count, int) and not isinstance(item_count, bool) and item_count >= 0
+
+
+def _classify_storage_row(row: list[object], *, had_schema_version: bool, had_row_metadata: bool, parsed_payload: object, validated_payload: AuditPayload | None) -> Literal["stored", "current_v1", "v0", "generic_v1"]:
+    if had_row_metadata:
+        return "stored"
+    if not had_schema_version:
+        return "v0"
+    if row[23] != "v1":
+        return "current_v1"
+    current_semantics = _has_current_semantics(row)
+    if current_semantics and validated_payload is not None:
+        return "current_v1"
+    if current_semantics:
+        if isinstance(parsed_payload, dict) and "kind" not in parsed_payload and _has_known_generic_payload_shape(parsed_payload):
+            return "generic_v1"
+        return "current_v1"
+    if _has_legacy_semantic_signature(row) and (validated_payload is not None or _has_known_generic_payload_shape(parsed_payload)):
+        return "generic_v1"
+    return "current_v1"
+
+
 class AuditStore:
     def __init__(self, database_path: str | Path) -> None:
         self._database_path = str(database_path)
@@ -444,7 +531,11 @@ class AuditStore:
     def _migrate_legacy_payloads(connection: sqlite3.Connection) -> None:
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(audit_events)")}
         had_schema_version = "schema_version" in columns
-        had_row_metadata = {"source_schema_lineage", "hash_policy", "legacy_semantic_digest"}.issubset(columns)
+        metadata_columns = {"source_schema_lineage", "hash_policy", "legacy_semantic_digest"}
+        present_metadata_columns = metadata_columns & columns
+        if present_metadata_columns and present_metadata_columns != metadata_columns:
+            raise ValueError("audit row metadata schema is incomplete")
+        had_row_metadata = metadata_columns.issubset(columns)
         schema_expression = "schema_version" if had_schema_version else "'v0'"
         lineage_expression = "source_schema_lineage" if had_row_metadata else "'current_v1'"
         policy_expression = "hash_policy" if had_row_metadata else "'strict_canonical_v1'"
@@ -454,9 +545,6 @@ class AuditStore:
         migrations: list[tuple[object, ...]] = []
         for raw_row in rows:
             row = list(raw_row)
-            if had_row_metadata:
-                _event_from_storage_row(tuple(row))
-                continue
             payload_text = row[22]
             try:
                 legacy_value: object = json.loads(str(payload_text))
@@ -469,17 +557,19 @@ class AuditStore:
                 validated_payload = AuditPayload.model_validate(payload_value)
             except Exception:
                 validated_payload = None
-            is_v0 = not had_schema_version
-            is_generic_v1 = had_schema_version and validated_payload is None
-            if not is_v0 and not is_generic_v1:
+            classification = _classify_storage_row(row, had_schema_version=had_schema_version, had_row_metadata=had_row_metadata, parsed_payload=legacy_value, validated_payload=validated_payload)
+            if classification == "stored":
+                _event_from_storage_row(tuple(row))
+                continue
+            if classification == "current_v1":
                 row[24] = "current_v1"
                 row[25] = "strict_canonical_v1"
                 row[26] = None
                 _event_from_storage_row(tuple(row))
                 migrations.append(tuple(row))
                 continue
-            source_lineage = "v0" if is_v0 else "generic_v1"
-            payload_lineage = "v0" if is_v0 else "v1"
+            source_lineage = classification
+            payload_lineage = "v0" if classification == "v0" else "v1"
             original_semantics = {
                 "actor": row[7],
                 "event_type": row[8],
