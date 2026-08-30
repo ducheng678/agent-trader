@@ -105,18 +105,53 @@ class HarnessOutcome(ContractModel):
     @model_validator(mode="after")
     def validate_terminal_mapping(self) -> HarnessOutcome:
         allowed = {
-            (RunState.SUCCEEDED, OutcomeKind.ANSWER, "known"),
-            (RunState.SUCCEEDED, OutcomeKind.ANSWER, "partial"),
-            (RunState.SUCCEEDED, OutcomeKind.NO_TRADE, "known"),
-            (RunState.DEGRADED, OutcomeKind.ANSWER, "known"),
-            (RunState.DEGRADED, OutcomeKind.ANSWER, "partial"),
-            (RunState.DEGRADED, OutcomeKind.UNKNOWN, "unknown"),
-            (RunState.DEGRADED, OutcomeKind.NO_TRADE, "unknown"),
-            (RunState.DEGRADED, OutcomeKind.NO_TRADE, "partial"),
-            (RunState.FAILED, OutcomeKind.NONE, "not_applicable"),
-            (RunState.CANCELLED, OutcomeKind.NONE, "not_applicable"),
+            (RunState.SUCCEEDED, OutcomeKind.ANSWER, "known"): frozenset(
+                {
+                    "completed",
+                    "fixed_seed_cache_hit",
+                    "compatible_semantic_cache_hit",
+                }
+            ),
+            (RunState.SUCCEEDED, OutcomeKind.ANSWER, "partial"): frozenset(
+                {
+                    "completed",
+                    "fixed_seed_cache_hit",
+                    "compatible_semantic_cache_hit",
+                }
+            ),
+            (RunState.SUCCEEDED, OutcomeKind.NO_TRADE, "known"): frozenset(
+                {"strategy_no_trade", "risk_gate_no_trade"}
+            ),
+            (RunState.DEGRADED, OutcomeKind.ANSWER, "known"): frozenset(
+                {"lower_model_fallback", "verified_local_knowledge_fallback"}
+            ),
+            (RunState.DEGRADED, OutcomeKind.ANSWER, "partial"): frozenset(
+                {"lower_model_fallback", "verified_local_knowledge_fallback"}
+            ),
+            (RunState.DEGRADED, OutcomeKind.UNKNOWN, "unknown"): frozenset(
+                {
+                    "insufficient_evidence",
+                    "confidence_recovery_exhausted",
+                    "dependency_unavailable",
+                }
+            ),
+            (RunState.DEGRADED, OutcomeKind.NO_TRADE, "unknown"): frozenset(
+                {"safe_no_trade_due_to_degradation"}
+            ),
+            (RunState.DEGRADED, OutcomeKind.NO_TRADE, "partial"): frozenset(
+                {"safe_no_trade_due_to_degradation"}
+            ),
+            (RunState.FAILED, OutcomeKind.NONE, "not_applicable"): frozenset(
+                {"permanent_policy", "integrity", "audit", "configuration_failure"}
+            ),
+            (RunState.CANCELLED, OutcomeKind.NONE, "not_applicable"): frozenset(
+                {"cancellation_completed"}
+            ),
         }
-        if (self.terminal_state, self.outcome_kind, self.knowledge_status) not in allowed:
+        reasons = allowed.get(
+            (self.terminal_state, self.outcome_kind, self.knowledge_status)
+        )
+        if reasons is None or self.terminal_reason not in reasons:
             raise ValueError("terminal state, outcome, and knowledge status are incompatible")
         return self
 
@@ -356,6 +391,13 @@ class HarnessSessionView(ContractModel):
     def validate_identity_and_terminal_outcome(self) -> HarnessSessionView:
         if (self.run_id is None) != (self.trace_id is None):
             raise ValueError("run and trace identity must be present together")
+        if self.external_side_effect_unknown and (
+            self.run_state is not RunState.WAITING_RECONCILIATION
+            or self.outcome is not None
+        ):
+            raise ValueError(
+                "unknown external effects require unsealed waiting reconciliation state"
+            )
         if self.outcome is not None and self.run_state is not self.outcome.terminal_state:
             raise ValueError("the sealed outcome must match the current run state")
         _require_unique(tuple(key for key, _ in self.work_item_states), "work-item states")

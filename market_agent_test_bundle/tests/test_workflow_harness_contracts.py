@@ -260,24 +260,101 @@ def test_progress_vector_requires_source_coverage_in_unit_interval(coverage):
 
 
 @pytest.mark.parametrize(
-    ("state", "kind", "knowledge"),
+    ("state", "kind", "knowledge", "reason"),
     [
-        (RunState.SUCCEEDED, OutcomeKind.ANSWER, "known"),
-        (RunState.SUCCEEDED, OutcomeKind.ANSWER, "partial"),
-        (RunState.SUCCEEDED, OutcomeKind.NO_TRADE, "known"),
-        (RunState.DEGRADED, OutcomeKind.ANSWER, "known"),
-        (RunState.DEGRADED, OutcomeKind.ANSWER, "partial"),
-        (RunState.DEGRADED, OutcomeKind.UNKNOWN, "unknown"),
-        (RunState.DEGRADED, OutcomeKind.NO_TRADE, "unknown"),
-        (RunState.DEGRADED, OutcomeKind.NO_TRADE, "partial"),
-        (RunState.FAILED, OutcomeKind.NONE, "not_applicable"),
-        (RunState.CANCELLED, OutcomeKind.NONE, "not_applicable"),
+        (RunState.SUCCEEDED, OutcomeKind.ANSWER, "known", "completed"),
+        (
+            RunState.SUCCEEDED,
+            OutcomeKind.ANSWER,
+            "partial",
+            "fixed_seed_cache_hit",
+        ),
+        (
+            RunState.SUCCEEDED,
+            OutcomeKind.ANSWER,
+            "known",
+            "compatible_semantic_cache_hit",
+        ),
+        (
+            RunState.SUCCEEDED,
+            OutcomeKind.NO_TRADE,
+            "known",
+            "strategy_no_trade",
+        ),
+        (
+            RunState.SUCCEEDED,
+            OutcomeKind.NO_TRADE,
+            "known",
+            "risk_gate_no_trade",
+        ),
+        (
+            RunState.DEGRADED,
+            OutcomeKind.ANSWER,
+            "known",
+            "lower_model_fallback",
+        ),
+        (
+            RunState.DEGRADED,
+            OutcomeKind.ANSWER,
+            "partial",
+            "verified_local_knowledge_fallback",
+        ),
+        (
+            RunState.DEGRADED,
+            OutcomeKind.UNKNOWN,
+            "unknown",
+            "insufficient_evidence",
+        ),
+        (
+            RunState.DEGRADED,
+            OutcomeKind.UNKNOWN,
+            "unknown",
+            "confidence_recovery_exhausted",
+        ),
+        (
+            RunState.DEGRADED,
+            OutcomeKind.UNKNOWN,
+            "unknown",
+            "dependency_unavailable",
+        ),
+        (
+            RunState.DEGRADED,
+            OutcomeKind.NO_TRADE,
+            "unknown",
+            "safe_no_trade_due_to_degradation",
+        ),
+        (
+            RunState.DEGRADED,
+            OutcomeKind.NO_TRADE,
+            "partial",
+            "safe_no_trade_due_to_degradation",
+        ),
+        (
+            RunState.FAILED,
+            OutcomeKind.NONE,
+            "not_applicable",
+            "permanent_policy",
+        ),
+        (RunState.FAILED, OutcomeKind.NONE, "not_applicable", "integrity"),
+        (RunState.FAILED, OutcomeKind.NONE, "not_applicable", "audit"),
+        (
+            RunState.FAILED,
+            OutcomeKind.NONE,
+            "not_applicable",
+            "configuration_failure",
+        ),
+        (
+            RunState.CANCELLED,
+            OutcomeKind.NONE,
+            "not_applicable",
+            "cancellation_completed",
+        ),
     ],
 )
 def test_terminal_outcome_accepts_only_declared_state_kind_knowledge_rows(
-    state, kind, knowledge
+    state, kind, knowledge, reason
 ):
-    assert outcome(state, kind, knowledge, "declared_reason").terminal_state is state
+    assert outcome(state, kind, knowledge, reason).terminal_state is state
 
 
 @pytest.mark.parametrize(
@@ -295,6 +372,42 @@ def test_terminal_outcome_rejects_undeclared_state_kind_knowledge_rows(
 ):
     with pytest.raises(ValidationError):
         outcome(state, kind, knowledge, "invalid_combination")
+
+
+@pytest.mark.parametrize(
+    ("state", "kind", "knowledge", "reason"),
+    [
+        (
+            RunState.FAILED,
+            OutcomeKind.NONE,
+            "not_applicable",
+            "cancellation_completed",
+        ),
+        (
+            RunState.SUCCEEDED,
+            OutcomeKind.ANSWER,
+            "known",
+            "safe_no_trade_due_to_degradation",
+        ),
+        (
+            RunState.DEGRADED,
+            OutcomeKind.NO_TRADE,
+            "unknown",
+            "completed",
+        ),
+        (
+            RunState.SUCCEEDED,
+            OutcomeKind.NO_TRADE,
+            "known",
+            "unregistered_reason",
+        ),
+    ],
+)
+def test_terminal_outcome_rejects_reason_from_another_mapping_row(
+    state, kind, knowledge, reason
+):
+    with pytest.raises(ValidationError):
+        outcome(state, kind, knowledge, reason)
 
 
 def test_terminal_outcome_distinguishes_normal_and_degraded_no_trade():
@@ -351,3 +464,64 @@ def test_empty_session_view_has_replay_identity_and_no_run_state():
         external_side_effect_unknown=False,
         last_event_hash=None,
     )
+
+
+@pytest.mark.parametrize(
+    ("run_state", "sealed_outcome"),
+    [
+        (None, None),
+        (
+            RunState.FAILED,
+            outcome(
+                RunState.FAILED,
+                OutcomeKind.NONE,
+                "not_applicable",
+                "permanent_policy",
+            ),
+        ),
+        (
+            RunState.CANCELLED,
+            outcome(
+                RunState.CANCELLED,
+                OutcomeKind.NONE,
+                "not_applicable",
+                "cancellation_completed",
+            ),
+        ),
+        (
+            RunState.SUCCEEDED,
+            outcome(RunState.SUCCEEDED, OutcomeKind.ANSWER, "known", "completed"),
+        ),
+        (
+            RunState.DEGRADED,
+            outcome(
+                RunState.DEGRADED,
+                OutcomeKind.UNKNOWN,
+                "unknown",
+                "dependency_unavailable",
+            ),
+        ),
+    ],
+)
+def test_unknown_external_side_effect_requires_unsealed_reconciliation_state(
+    run_state, sealed_outcome
+):
+    with pytest.raises(ValidationError):
+        HarnessSessionView(
+            run_id="run-1",
+            trace_id="trace-1",
+            run_state=run_state,
+            outcome=sealed_outcome,
+            external_side_effect_unknown=True,
+        )
+
+
+def test_unknown_external_side_effect_accepts_waiting_reconciliation_without_outcome():
+    view = HarnessSessionView(
+        run_id="run-1",
+        trace_id="trace-1",
+        run_state=RunState.WAITING_RECONCILIATION,
+        external_side_effect_unknown=True,
+    )
+
+    assert view.outcome is None
