@@ -16,6 +16,9 @@ from market_agent.workflow_contracts import ContractModel, NonNegativeFinite, No
 _MAX_PAGE_SIZE = 100
 _MAX_PAYLOAD_BYTES = 4096
 _UNSAFE_VALUE = re.compile(r"(?:authorization\s*[:=]|bearer\s+\S+|cookie\s*[:=]|(?:api[ _-]?key|credential|secret|token|private[ _-]?key)\s*[:=]|https?://\S+[?&](?:token|key|secret|signature)=)", re.IGNORECASE)
+_OPAQUE_ID = re.compile(r"^(?!sk-)(?!eyJ)[a-z][a-z0-9_-]{0,63}$")
+_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 class AuditUnavailableError(RuntimeError):
@@ -25,6 +28,18 @@ class AuditUnavailableError(RuntimeError):
 def _require_safe_text(value: str) -> str:
     if _UNSAFE_VALUE.search(value):
         raise ValueError("audit values cannot contain credentials, authorization data, or URL secrets")
+    return value
+
+
+def _require_id(value: str) -> str:
+    if not _OPAQUE_ID.fullmatch(value):
+        raise ValueError("audit opaque identifiers must be bounded non-secret identifiers")
+    return value
+
+
+def _require_code(value: str) -> str:
+    if not _CODE.fullmatch(value):
+        raise ValueError("audit codes must be compact identifiers, never prose or URLs")
     return value
 
 
@@ -78,6 +93,18 @@ class AuditEvent(ContractModel):
     @classmethod
     def require_utc_timestamp(cls, value: datetime) -> datetime:
         return _require_utc(value)
+
+    @field_validator("event_id", "trace_id", "workflow_id", "task_id", "attempt_id", "source_references")
+    @classmethod
+    def validate_identifiers(cls, value: tuple[str, ...] | str | None) -> tuple[str, ...] | str | None:
+        if isinstance(value, tuple):
+            return tuple(_require_id(item) for item in value)
+        return _require_id(value) if value is not None else value
+
+    @field_validator("actor", "event_type", "status", "model", "prompt_version", "schema_name")
+    @classmethod
+    def validate_codes(cls, value: str | None) -> str | None:
+        return _require_code(value) if value is not None else value
 
     @model_validator(mode="after")
     def reject_sensitive_event_values(self) -> AuditEvent:
@@ -145,13 +172,19 @@ class AuditStore:
                 (event.event_id, event.trace_id, event.workflow_id, event.task_id, event.attempt_id, next_sequence, event.occurred_at.isoformat(), event.actor, event.event_type, event.status, event.input_hash, event.output_hash, event.latency_ms, event.token_usage, event.cached_token_usage, event.estimated_cost, event.cumulative_cost, event.model, event.prompt_version, event.schema_name, event.schema_hash, json.dumps(event.source_references, separators=(",", ":")), json.dumps(event.payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":")), event.schema_version),
             )
             connection.execute("COMMIT")
-        except Exception:
+        except BaseException:
             if connection is not None and connection.in_transaction:
-                connection.execute("ROLLBACK")
+                try:
+                    connection.execute("ROLLBACK")
+                except BaseException:
+                    pass
             raise
         finally:
             if connection is not None:
-                connection.close()
+                try:
+                    connection.close()
+                except BaseException:
+                    pass
         return event.model_copy(update={"sequence": next_sequence})
 
     def list(self, *, trace_id: str | None = None, workflow_id: str | None = None, task_id: str | None = None, attempt_id: str | None = None, event_type: str | None = None, start_time: datetime | None = None, end_time: datetime | None = None, page_size: int = _MAX_PAGE_SIZE, cursor: str | None = None) -> AuditPage:
@@ -167,8 +200,11 @@ class AuditStore:
             if timestamp is not None:
                 clauses.append(f"occurred_at {operator} ?")
                 values.append(_require_utc(timestamp).isoformat())
+        filter_hash = self._filter_hash(trace_id, workflow_id, task_id, attempt_id, event_type, start_time, end_time)
         if cursor is not None:
-            cursor_trace, cursor_sequence, cursor_event = self._decode_cursor(cursor)
+            cursor_trace, cursor_sequence, cursor_event, cursor_filter_hash = self._decode_cursor(cursor)
+            if cursor_filter_hash != filter_hash:
+                raise ValueError("audit cursor does not match active filters")
             clauses.append("(trace_id > ? OR (trace_id = ? AND (sequence > ? OR (sequence = ? AND event_id > ?))))")
             values.extend((cursor_trace, cursor_trace, cursor_sequence, cursor_sequence, cursor_event))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -178,23 +214,29 @@ class AuditStore:
         finally:
             connection.close()
         events = [self._row_to_event(row) for row in rows[:page_size]]
-        next_cursor = self._encode_cursor(events[-1]) if len(rows) > page_size and events else None
+        next_cursor = self._encode_cursor(events[-1], filter_hash) if len(rows) > page_size and events else None
         return AuditPage(events, next_cursor)
 
     @staticmethod
-    def _encode_cursor(event: AuditEvent) -> str:
-        rendered = json.dumps((event.trace_id, event.sequence, event.event_id), separators=(",", ":")).encode("utf-8")
+    def _encode_cursor(event: AuditEvent, filter_hash: str) -> str:
+        rendered = json.dumps((event.trace_id, event.sequence, event.event_id, filter_hash), separators=(",", ":")).encode("utf-8")
         return base64.urlsafe_b64encode(rendered).decode("ascii")
 
     @staticmethod
-    def _decode_cursor(cursor: str) -> tuple[str, int, str]:
+    def _decode_cursor(cursor: str) -> tuple[str, int, str, str]:
+        if len(cursor) > 512:
+            raise ValueError("invalid audit cursor")
         try:
-            trace_id, sequence, event_id = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+            trace_id, sequence, event_id, filter_hash = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
         except Exception as error:
             raise ValueError("invalid audit cursor") from error
-        if not isinstance(trace_id, str) or not isinstance(sequence, int) or not isinstance(event_id, str) or sequence < 1:
+        if not isinstance(trace_id, str) or isinstance(sequence, bool) or not isinstance(sequence, int) or not isinstance(event_id, str) or not isinstance(filter_hash, str) or sequence < 1:
             raise ValueError("invalid audit cursor")
-        return trace_id, sequence, event_id
+        return _require_id(trace_id), sequence, _require_id(event_id), filter_hash
+
+    @staticmethod
+    def _filter_hash(trace_id: str | None, workflow_id: str | None, task_id: str | None, attempt_id: str | None, event_type: str | None, start_time: datetime | None, end_time: datetime | None) -> str:
+        return __import__("hashlib").sha256(json.dumps((trace_id, workflow_id, task_id, attempt_id, event_type, start_time.isoformat() if start_time else None, end_time.isoformat() if end_time else None), separators=(",", ":")).encode("utf-8")).hexdigest()
 
     @staticmethod
     def _row_to_event(row: tuple[object, ...]) -> AuditEvent:

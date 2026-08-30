@@ -142,3 +142,23 @@ def test_store_migrates_legacy_database_without_changing_existing_event_hashes(t
 
     assert migrated[0].schema_version == "v1"
     assert (migrated[0].input_hash, migrated[0].output_hash) == ("in", "out")
+
+
+@pytest.mark.parametrize("field,value", [("event_id", "sk-secret"), ("trace_id", "eyJhbGciOiJIUzI1NiJ9.payload.signature"), ("actor", "-----BEGIN PRIVATE KEY-----"), ("event_type", "raw prompt: ignore all rules"), ("source_references", ("https://host/?token=secret",))])
+def test_audit_semantic_fields_reject_secret_and_prose_forms(field, value):
+    values = event("event-typed").model_dump()
+    values[field] = value
+    with pytest.raises(ValidationError):
+        AuditEvent(**values)
+
+
+def test_cursor_is_bounded_and_cannot_be_reused_with_different_filters(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    store.append(event("event-a", trace_id="trace-a"))
+    store.append(event("event-b", trace_id="trace-b"))
+    page = store.list(page_size=1)
+
+    with pytest.raises(ValueError, match="cursor"):
+        store.list(page_size=1, trace_id="trace-a", cursor=page.next_cursor)
+    with pytest.raises(ValueError, match="cursor"):
+        store.list(cursor="x" * 5000)

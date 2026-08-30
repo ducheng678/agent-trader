@@ -12,24 +12,18 @@ def records() -> list[dict[str, object]]:
     return [
         {
             "record_id": "source-b",
-            "source_id": "fed-1",
-            "observed_at": "2026-08-29T10:00:00Z",
-            "fact": "CPI is 3.2 percent, not 2.9 percent.",
+            "claim": {"claim_id": "claim-b", "source_id": "fed-1", "observed_at": datetime(2026, 8, 29, 10, tzinfo=timezone.utc), "value": "CPI is 3.2 percent, not 2.9 percent.", "unit": None, "negated": False, "untrusted_data": True},
             "relevance": 0.9,
             "uncertainty": "revision may follow",
         },
         {
             "record_id": "source-a",
-            "source_id": "market-1",
-            "observed_at": "2026-08-29T09:00:00Z",
-            "fact": "BTC traded at 61,250 USD.",
+            "claim": {"claim_id": "claim-a", "source_id": "market-1", "observed_at": datetime(2026, 8, 29, 9, tzinfo=timezone.utc), "value": "BTC traded at 61,250 USD.", "unit": None, "negated": False, "untrusted_data": True},
             "relevance": 0.9,
         },
         {
             "record_id": "source-c",
-            "source_id": "market-2",
-            "observed_at": "2026-08-29T08:00:00Z",
-            "fact": "Funding was 0.01 percent.",
+            "claim": {"claim_id": "claim-c", "source_id": "market-2", "observed_at": datetime(2026, 8, 29, 8, tzinfo=timezone.utc), "value": "Funding was 0.01 percent.", "unit": None, "negated": False, "untrusted_data": True},
             "relevance": 0.2,
         },
     ]

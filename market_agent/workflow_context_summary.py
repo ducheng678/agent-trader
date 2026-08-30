@@ -87,6 +87,8 @@ class ContextRecord(ContractModel):
             raise ValueError("conflict identifier and description must be supplied together")
         if self.conflict_unresolved and self.conflict_group_id is None:
             raise ValueError("unresolved conflicts require a conflict group")
+        if any(item.relation != "supporting" for item in self.supporting_evidence) or any(item.relation != "contradicting" for item in self.contradicting_evidence):
+            raise ValueError("evidence must be placed in its matching relation container")
         return self
 
 
@@ -171,17 +173,7 @@ def _normalize_record(record: ContextRecord | Mapping[str, object]) -> ContextRe
         return record
     if "claim" in record:
         return ContextRecord.model_validate(record)
-    record_id = record.get("record_id")
-    source_id = record.get("source_id")
-    fact = record.get("fact")
-    if not all(isinstance(value, str) for value in (record_id, source_id, fact)):
-        raise ValueError("context records require a normalized claim")
-    return ContextRecord(
-        record_id=record_id,
-        claim=NormalizedClaim(claim_id=record_id, source_id=source_id, observed_at=_parse_legacy_timestamp(record.get("observed_at")), value=fact, unit=None, negated=False, untrusted_data=True),
-        relevance=record.get("relevance", 0.0),
-        uncertainty=record.get("uncertainty"),
-    )
+    raise ValueError("context records require a normalized structured claim")
 
 
 def _record_sort_key(record: ContextRecord) -> tuple[float, str]:
@@ -209,6 +201,13 @@ def select_context(source_records: Iterable[ContextRecord | Mapping[str, object]
     grouped: dict[str, list[ContextRecord]] = {}
     for record in normalized:
         grouped.setdefault(record.conflict_group_id or record.record_id, []).append(record)
+    for group_id, group in grouped.items():
+        if group_id == group[0].record_id and group[0].conflict_group_id is None:
+            continue
+        if len(group) < 2:
+            raise ValueError("conflict groups require at least two members")
+        if len({item.conflict_description for item in group}) != 1 or len({item.conflict_unresolved for item in group}) != 1:
+            raise ValueError("conflict group metadata must be consistent")
     selected: list[ContextRecord] = []
     omitted: list[str] = []
     used_bytes = 0
@@ -261,13 +260,26 @@ def summarize_context(selection: ContextSelection, *, workflow_id: str, trace_id
     conflicts = _conflicts(selection.records)
     unresolved = tuple(f"unresolved conflict: {group.group_id}" for group in conflicts if group.unresolved)
     incomplete = selection.omitted_count > 0 or not selection.records or bool(unresolved)
-    omitted_sections = (OmittedSection(section="source_records", count=selection.omitted_count),) if incomplete else ()
-    unresolved_questions = uncertainty + unresolved or (("insufficient source evidence",) if not selection.records else ())
+    if selection.omitted_count:
+        omitted_sections = (OmittedSection(section="source_records", count=selection.omitted_count),)
+    elif unresolved:
+        omitted_sections = (OmittedSection(section="unresolved_conflicts", count=len(unresolved)),)
+    elif not selection.records:
+        omitted_sections = (OmittedSection(section="source_records", count=0),)
+    else:
+        omitted_sections = ()
+    combined_questions = uncertainty + unresolved
+    unresolved_questions = combined_questions[:_MAX_UNCERTAINTIES] or (("insufficient source evidence",) if not selection.records else ())
     summary = ContextSummary(summary_id=_summary_id(selection, workflow_id, trace_id, task_id, user_objective, immutable_constraints, summary_version, uncertainty, conflicts), task_id=task_id, workflow_id=workflow_id, trace_id=trace_id, user_objective=user_objective, immutable_constraints=immutable_constraints, market_facts=facts, unresolved_questions=unresolved_questions, conflicts=tuple(f"{group.group_id}: {group.description}" for group in conflicts), omitted_sections=omitted_sections, token_estimate=sum(len(fact.fact.split()) for fact in facts), completeness=SummaryCompleteness.INCOMPLETE if incomplete else SummaryCompleteness.COMPLETE, summary_version=summary_version, source_record_hash=selection.selected_record_hash, source_references=tuple(fact.source_id for fact in facts))
-    supporting = tuple(item for record in selection.records for item in record.supporting_evidence)
+    def dedupe(items: tuple[EvidenceReference, ...]) -> tuple[EvidenceReference, ...]:
+        values: dict[str, EvidenceReference] = {}
+        for item in items:
+            values.setdefault(item.evidence_id, item)
+        return tuple(values[key] for key in sorted(values)[:50])
+    supporting = dedupe(tuple(item for record in selection.records for item in record.supporting_evidence))
     explicit_contradictions = tuple(item for record in selection.records for item in record.contradicting_evidence)
     inferred_contradictions = tuple(EvidenceReference(evidence_id=record.record_id, source_id=record.claim.source_id, observed_at=record.claim.observed_at, relation="contradicting") for group in conflicts for record in selection.records if record.conflict_group_id == group.group_id and record.record_id != group.record_ids[0])
-    contradicting = explicit_contradictions + inferred_contradictions
+    contradicting = dedupe(explicit_contradictions + inferred_contradictions)
     base = {"summary": summary, "input_hash": selection.selected_record_hash, "all_input_hash": selection.all_input_hash, "selected_ids": selection.selected_ids, "omitted_ids": selection.omitted_ids, "selected_count": selection.selected_count, "omitted_count": selection.omitted_count, "omitted_ids_truncated": selection.omitted_ids_truncated, "unreported_omitted_count": selection.omitted_count - len(selection.omitted_ids), "uncertainty_markers": uncertainty, "omitted_uncertainty_count": len(all_uncertainty) - len(uncertainty), "conflicts": conflicts, "supporting_evidence": supporting, "contradicting_evidence": contradicting, "selection_policy_version": selection.selection_policy_version, "untrusted_data": True}
     provisional = ContextHandoff.model_construct(**base, output_hash="pending")
     output_hash = _canonical_hash({key: value for key, value in provisional.model_dump(mode="json").items() if key != "output_hash"})
