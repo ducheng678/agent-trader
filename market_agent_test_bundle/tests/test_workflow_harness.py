@@ -2,11 +2,29 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
 
 import pytest
+from pydantic import ValidationError
 
 from market_agent.workflow_budget import BudgetSnapshot, WorkflowBudgetLedger
-from market_agent.workflow_confidence_calibration import ConfidenceGate
+from market_agent.workflow_confidence_calibration import (
+    FEATURE_ORDER,
+    AcceptedEvidenceRecord,
+    ConfidenceCalibratorArtifact,
+    ConfidenceFeatureSpec,
+    ConfidenceFoldedState,
+    ConfidenceGate,
+    ConfidenceObservation,
+    ConfidenceTargetSnapshot,
+    ConflictRecord,
+    HardGateSnapshot,
+    SourceRegistryRecord,
+    TrustedConfidencePolicy,
+    TrustedRequestContext,
+    artifact_payload,
+    confidence_snapshot_hashes,
+)
 from market_agent.workflow_contracts import WorkflowMode, WorkflowRequest
 from market_agent.workflow_execution_backend import (
     CommittedExecutionSnapshot,
@@ -14,6 +32,8 @@ from market_agent.workflow_execution_backend import (
     ExecutionHandle,
     ExecutionProjectionError,
     ExecutionRegistrationError,
+    IssuerTrustDescriptor,
+    RegistrationPreparation,
     canonical_plan_digest,
     canonical_transition_digest,
     canonical_view_digest,
@@ -24,6 +44,7 @@ from market_agent.workflow_harness_contracts import (
     HarnessTransition,
     OutcomeKind,
     PinnedVersions,
+    ProgressVector,
     RiskClass,
     RunState,
     StageSpec,
@@ -31,7 +52,17 @@ from market_agent.workflow_harness_contracts import (
     TransitionAuthorityRecord,
     WorkerSpec,
 )
-from market_agent.workflow_loop_guard import LoopGuard, SeverityPolicy
+from market_agent.workflow_loop_guard import (
+    ActionObservationFingerprint,
+    LoopGuard,
+    LoopScope,
+    ObservationKind,
+    SemanticCheckpoint,
+    SeverityPolicy,
+    build_action_fingerprint,
+    build_result_fingerprint,
+    build_state_fingerprint,
+)
 from market_agent.workflow_plan_registry import (
     PlanCompiler,
     PlanTemplate,
@@ -45,6 +76,131 @@ from market_agent.workflow_worker_registry import WorkerRegistry
 HASH = "a" * 64
 SIGNATURE = "0" * 512
 NOW = datetime(2026, 8, 31, tzinfo=timezone.utc)
+
+
+class ConfidenceVerifier:
+    def verify(self, key_id: str, payload: bytes, signature: str) -> bool:
+        return key_id == "host-key" and signature == sha256(
+            b"host-secret" + payload
+        ).hexdigest()
+
+
+def _confidence_material(
+    plan: HarnessPlan,
+) -> tuple[ConfidenceGate, ConfidenceObservation, ConfidenceCalibratorArtifact]:
+    targets = ConfidenceTargetSnapshot(
+        required_dependency_ids=("collect",),
+        required_output_field_paths=("result.summary",),
+        required_evidence_slot_ids=("primary",),
+        required_source_ids=("official",),
+        known_conflict_slot_ids=("claim",),
+        risk_invariant_ids=("safe",),
+    )
+    values = {
+        "applicability_domain": "market",
+        "targets": targets,
+        "accepted_evidence": (
+            AcceptedEvidenceRecord(
+                evidence_id="evidence",
+                source_id="official",
+                required_slot_id="primary",
+                provenance_hash="b" * 64,
+                accepted_by_host=True,
+            ),
+        ),
+        "conflicts": (
+            ConflictRecord(
+                conflict_id="claim",
+                evidence_ids=("evidence",),
+                resolved=True,
+                provenance_hash="c" * 64,
+            ),
+        ),
+        "source_registry": (
+            SourceRegistryRecord(
+                source_id="official", registry_hash="d" * 64, enabled=True
+            ),
+        ),
+        "folded_state": ConfidenceFoldedState(
+            completed_dependency_ids=("collect",),
+            valid_output_field_paths=("result.summary",),
+            satisfied_risk_invariant_ids=("safe",),
+            event_fold_hash="e" * 64,
+        ),
+        "accepted_record_snapshot_hash": "f" * 64,
+        "provenance_snapshot_hash": "1" * 64,
+    }
+    raw = ConfidenceObservation.model_construct(**values)
+    accepted_hash, provenance_hash = confidence_snapshot_hashes(raw)
+    values.update(
+        accepted_record_snapshot_hash=accepted_hash,
+        provenance_snapshot_hash=provenance_hash,
+    )
+    observation = ConfidenceObservation(**values)
+    policy_hash = sha256(plan.pinned_versions.policy_version.encode()).hexdigest()
+    artifact_values = {
+        "artifact_id": "cal-v1",
+        "artifact_version": "v1",
+        "schema_hash": HASH,
+        "policy_hash": policy_hash,
+        "dataset_hash": "c" * 64,
+        "applicability_domains": ("market",),
+        "feature_specs": tuple(
+            ConfidenceFeatureSpec(feature_name=name, coefficient=Decimal(value))
+            for name, value in zip(FEATURE_ORDER, (".4", ".3", ".15"), strict=True)
+        ),
+        "intercept": Decimal("0"),
+        "issued_epoch": 10,
+        "expires_epoch": 20,
+        "key_id": "host-key",
+        "artifact_hash": "d" * 64,
+        "signature": "0" * 64,
+    }
+    unsigned = ConfidenceCalibratorArtifact.model_construct(**artifact_values)
+    artifact_values["signature"] = sha256(
+        b"host-secret" + artifact_payload(unsigned)
+    ).hexdigest()
+    artifact = ConfidenceCalibratorArtifact(**artifact_values)
+    policy = TrustedConfidencePolicy(
+        artifact_id=artifact.artifact_id,
+        artifact_version=artifact.artifact_version,
+        artifact_hash=artifact.artifact_hash,
+        schema_hash=artifact.schema_hash,
+        policy_hash=artifact.policy_hash,
+        dataset_hash=artifact.dataset_hash,
+        key_id=artifact.key_id,
+        applicability_domain="market",
+        accepted_record_snapshot_hash=accepted_hash,
+        provenance_snapshot_hash=provenance_hash,
+        issued_epoch=artifact.issued_epoch,
+        expires_epoch=artifact.expires_epoch,
+    )
+    context = TrustedRequestContext(
+        request_class="informational",
+        evaluation_epoch=15,
+        recovery_used=False,
+        hard_gates=HardGateSnapshot(
+            permission=True,
+            risk=True,
+            budget=True,
+            loop=True,
+            evidence=True,
+            audit_integrity=True,
+            run_id=plan.run_id,
+            trace_hash=sha256(plan.trace_id.encode()).hexdigest(),
+            plan_revision=plan.revision,
+            policy_hash=policy_hash,
+        ),
+    )
+    return (
+        ConfidenceGate(
+            trusted_policy=policy,
+            signature_verifier=ConfidenceVerifier(),
+            request_context=context,
+        ),
+        observation,
+        artifact,
+    )
 
 
 def _pinned() -> PinnedVersions:
@@ -160,6 +316,13 @@ class StoreBackedIssuer:
     def ready(self) -> bool:
         return True
 
+    def trust_descriptor(self) -> IssuerTrustDescriptor:
+        return IssuerTrustDescriptor(
+            trust_version="test-trust-v1",
+            trust_config_digest=HASH,
+            key_id="test-host",
+        )
+
     def _snapshot(self, plan: HarnessPlan, sequence: int | None = None) -> CommittedExecutionSnapshot:
         events = self.store.load(plan.run_id)
         if sequence is not None:
@@ -177,6 +340,7 @@ class StoreBackedIssuer:
             state_revision=view.state_revision,
             view_digest=canonical_view_digest(view),
             event_head_hash=view.last_event_hash,
+            folded_view=view,
             trust_key_id="test-host",
             signature=SIGNATURE,
         )
@@ -205,24 +369,61 @@ class RecordingBackend:
         self,
         *,
         fail_prepare: bool = False,
+        fail_commit: bool = False,
         fail_apply: bool = False,
         fail_resume_number: int | None = None,
     ) -> None:
         self.fail_prepare = fail_prepare
+        self.fail_commit = fail_commit
         self.fail_apply = fail_apply
         self.fail_resume_number = fail_resume_number
         self.resume_count = 0
         self.operations: list[str] = []
         self.last_receipt: CommittedTransitionReceipt | None = None
 
-    def prepare_registration(self, plan: HarnessPlan, provisional_view: object) -> object:
+    def prepare_registration(
+        self,
+        plan: HarnessPlan,
+        provisional_view: object,
+        issuer_trust_descriptor: IssuerTrustDescriptor,
+    ) -> RegistrationPreparation:
         self.operations.append("prepare")
         if self.fail_prepare:
             raise ExecutionRegistrationError("backend unavailable")
-        return (plan.run_id, "provisional")
+        return RegistrationPreparation(
+            token_id=HASH,
+            run_id=plan.run_id,
+            trace_id=plan.trace_id,
+            plan_id=plan.plan_id,
+            plan_digest=canonical_plan_digest(plan),
+            plan_revision=plan.revision,
+            provisional_view_digest=canonical_view_digest(provisional_view),
+            provisional_sequence=provisional_view.sequence,
+            provisional_state_revision=provisional_view.state_revision,
+            issuer=issuer_trust_descriptor,
+        )
 
-    def rollback_registration(self, token: object) -> None:
+    def rollback_registration(self, token: RegistrationPreparation) -> None:
         self.operations.append("rollback")
+
+    def commit_registration(
+        self,
+        token: RegistrationPreparation,
+        signed_committed_snapshot: CommittedExecutionSnapshot,
+    ) -> ExecutionHandle:
+        self.operations.append("commit")
+        if self.fail_commit:
+            raise ExecutionRegistrationError("commit unavailable")
+        assert signed_committed_snapshot.trust_key_id == token.issuer.key_id
+        return ExecutionHandle(
+            run_id=token.run_id,
+            trace_id=token.trace_id,
+            plan_id=token.plan_id,
+            plan_revision=token.plan_revision,
+            state_revision=signed_committed_snapshot.state_revision,
+            routed_state=signed_committed_snapshot.folded_view.run_state.value,
+            cancelled=False,
+        )
 
     @staticmethod
     def _handle(plan: HarnessPlan, view: object) -> ExecutionHandle:
@@ -287,6 +488,7 @@ def _kernel(
     *,
     backend: RecordingBackend | None = None,
     budget: WorkflowBudgetLedger | None = None,
+    confidence_gate_factory=None,
 ):
     store = SQLiteHarnessEventStore(tmp_path / "harness.sqlite", monotonic=lambda: 100.0)
     backend = backend or RecordingBackend()
@@ -299,7 +501,7 @@ def _kernel(
         loop_guard_factory=lambda: LoopGuard(
             severity_policy=SeverityPolicy(policy_version="policy-v1")
         ),
-        confidence_gate_factory=lambda plan: ConfidenceGate(),
+        confidence_gate_factory=confidence_gate_factory or (lambda plan: ConfidenceGate()),
         budget_factory=lambda mode: budget
         or WorkflowBudgetLedger(mode, clock=lambda: 100.0),
         execution_backend=backend,
@@ -370,6 +572,86 @@ def _append_waiting_reconciliation(store: SQLiteHarnessEventStore, run_id: str) 
     )
 
 
+def _append_waiting_approval(store: SQLiteHarnessEventStore, run_id: str) -> None:
+    view = store.snapshot(run_id)
+    transition = HarnessTransition(
+        run_id=run_id,
+        trace_id=view.trace_id,
+        entity_kind="run",
+        entity_id=run_id,
+        from_state=RunState.RUNNING.value,
+        to_state=RunState.WAITING_APPROVAL.value,
+        expected_state_revision=view.state_revision,
+        plan_revision=view.plan_revision,
+        reason_code="approval_required",
+        idempotency_key=f"approval-{view.state_revision}",
+    )
+    authority = TransitionAuthorityRecord(
+        **transition.model_dump(
+            mode="python", exclude={"schema_version", "lease_epoch", "fencing_token_digest"}
+        ),
+        dependency_versions=view.dependency_versions,
+    )
+    store.append(
+        HarnessEvent(
+            event_id="approval-authority",
+            trace_id=view.trace_id,
+            span_id="approval-span-1",
+            run_id=run_id,
+            event_type="transition_authorized",
+            occurred_at=NOW,
+            monotonic_offset=100.0,
+            actor="host-policy",
+            payload={"reason_code": "approval_required"},
+            transition_authority=authority,
+        ),
+        expected_sequence=view.sequence,
+        expected_state_revision=view.state_revision,
+    )
+    view = store.snapshot(run_id)
+    store.append(
+        HarnessEvent(
+            event_id="approval-transition",
+            trace_id=view.trace_id,
+            span_id="approval-span-2",
+            run_id=run_id,
+            event_type="transition_committed",
+            occurred_at=NOW,
+            monotonic_offset=100.0,
+            actor="harness-kernel",
+            payload={"reason_code": "approval_required"},
+            transition=transition,
+        ),
+        expected_sequence=view.sequence,
+        expected_state_revision=view.state_revision,
+    )
+
+
+def _action_observation(plan_revision: int) -> ActionObservationFingerprint:
+    action = build_action_fingerprint(
+        worker_id="information-worker",
+        worker_version="worker-v1",
+        action_kind="summarize",
+        canonical_arguments={"operation": "summarize"},
+        context_hash="1" * 64,
+        dependency_hash="2" * 64,
+        plan_revision=plan_revision,
+        prompt_hash="3" * 64,
+        tool_hash="4" * 64,
+        output_schema_hash="5" * 64,
+        model_route="luna",
+        correction_ordinal=0,
+    )
+    result = build_result_fingerprint(
+        outcome_kind="answer",
+        validated_output_hash="6" * 64,
+        normalized_error_class=None,
+        normalized_error_code=None,
+        result_schema_version="v1",
+    )
+    return ActionObservationFingerprint.from_parts(action, result, scope=LoopScope.RUN)
+
+
 def test_create_publishes_only_after_all_dependencies_are_ready(tmp_path):
     backend = RecordingBackend(fail_prepare=True)
     kernel, store, _, _ = _kernel(tmp_path, backend=backend)
@@ -390,9 +672,35 @@ def test_create_is_passive_and_returns_frozen_strict_handle(tmp_path):
     assert handle.backend_synchronized is True
     assert store.snapshot(handle.run_id).run_state is RunState.CREATED
     assert len(store.load(handle.run_id)) == 1
-    assert backend.operations == ["prepare", "register"]
+    assert backend.operations == ["prepare", "commit"]
     with pytest.raises(Exception):
         handle.run_id = "changed"
+
+
+def test_create_commit_failure_keeps_truth_but_rolls_back_and_does_not_return(tmp_path):
+    backend = RecordingBackend(fail_commit=True)
+    kernel, store, _, _ = _kernel(tmp_path, backend=backend)
+
+    with pytest.raises(ExecutionRegistrationError):
+        kernel.create(_request())
+
+    assert store.snapshot("run-1").run_state is RunState.CREATED
+    assert backend.operations == ["prepare", "commit", "rollback"]
+
+
+def test_public_output_copy_revalidates_all_scalars_and_cross_fields(tmp_path):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    decision = kernel.advance(handle.run_id, candidate={})
+
+    with pytest.raises(ValidationError):
+        handle.model_copy(update={"sequence": -1})
+    with pytest.raises(ValidationError):
+        handle.model_copy(update={"backend_synchronized": "false"})
+    with pytest.raises(ValidationError):
+        decision.model_copy(update={"retry_authorized": True, "run_state": RunState.SUCCEEDED})
+    with pytest.raises(ValidationError):
+        decision.model_copy(update={"backend_synchronized": "true"})
 
 
 def test_model_payload_cannot_change_control_state(tmp_path):
@@ -474,11 +782,35 @@ def test_authority_append_survives_backend_failure_and_is_reused_on_replay(tmp_p
     assert len(authority_view.transition_authorities) == 1
 
     backend.fail_resume_number = None
-    kernel.resume(handle.run_id)
-    decision = kernel.advance(handle.run_id, candidate={})
+    decision = kernel.advance(handle.run_id, candidate={"goto": "failed"})
 
     assert decision.run_state is RunState.ADMITTED
+    assert decision.reason_code == "request_admitted"
     assert len(store.snapshot(handle.run_id).transition_authorities) == 1
+
+
+def test_backend_apply_failure_replays_same_candidate_without_double_append(tmp_path):
+    backend = RecordingBackend(fail_apply=True)
+    kernel, store, _, _ = _kernel(tmp_path, backend=backend)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    plan = HarnessPlan.model_validate_json(store.load(handle.run_id)[0].payload["plan_json"])
+    observation = _action_observation(plan.revision)
+
+    first = kernel.advance(
+        handle.run_id, candidate={"action_observation": observation}
+    )
+    committed_sequence = store.snapshot(handle.run_id).sequence
+    backend.fail_apply = False
+    replayed = kernel.advance(
+        handle.run_id, candidate={"action_observation": observation}
+    )
+
+    assert first.backend_synchronized is False
+    assert replayed.run_state is first.run_state
+    assert replayed.reason_code == first.reason_code
+    assert replayed.backend_synchronized is True
+    assert store.snapshot(handle.run_id).sequence == committed_sequence
 
 
 def test_resume_and_snapshot_replay_only_the_authoritative_stream(tmp_path):
@@ -525,6 +857,34 @@ def test_cancel_unknown_order_records_intent_and_waits_for_reconciliation(tmp_pa
     assert store.snapshot(handle.run_id).run_state is RunState.WAITING_RECONCILIATION
     assert backend.operations[-1] != "cancel"
 
+    sequence = store.snapshot(handle.run_id).sequence
+    duplicate = kernel.cancel(handle.run_id, "user_requested")
+    assert duplicate.run_state is RunState.WAITING_RECONCILIATION
+    assert store.snapshot(handle.run_id).sequence == sequence
+    assert sum(event.event_type == "cancellation_requested" for event in store.load(handle.run_id)) == 1
+
+
+def test_cancel_waiting_approval_commits_legal_terminal_then_cancels_backend(tmp_path):
+    kernel, store, backend, issuer = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    _append_waiting_approval(store, handle.run_id)
+
+    decision = kernel.cancel(handle.run_id, "user_requested")
+
+    assert decision.run_state is RunState.CANCELLED
+    assert decision.reason_code == "cancellation_completed"
+    assert decision.transition is not None
+    assert issuer.receipts[-1].transition_digest == canonical_transition_digest(
+        decision.transition
+    )
+    assert backend.operations[-2:] == ["apply", "cancel"]
+    sequence = store.snapshot(handle.run_id).sequence
+    duplicate = kernel.cancel(handle.run_id, "user_requested")
+    assert duplicate.run_state is RunState.CANCELLED
+    assert store.snapshot(handle.run_id).sequence == sequence
+    assert backend.operations.count("cancel") == 1
+
 
 def test_unpinned_confidence_fails_closed_to_no_trade_degradation(tmp_path):
     kernel, _, _, _ = _kernel(tmp_path)
@@ -535,6 +895,64 @@ def test_unpinned_confidence_fails_closed_to_no_trade_degradation(tmp_path):
 
     assert decision.run_state is RunState.DEGRADING
     assert decision.retry_authorized is False
+    assert decision.no_trade is True
+
+
+def test_bound_confidence_success_finishes_succeeded_not_degraded(tmp_path):
+    material: dict[str, object] = {}
+
+    def gate_factory(plan: HarnessPlan) -> ConfidenceGate:
+        gate, observation, artifact = _confidence_material(plan)
+        material.update(observation=observation, artifact=artifact)
+        return gate
+
+    kernel, _, _, _ = _kernel(tmp_path, confidence_gate_factory=gate_factory)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+
+    summarizing = kernel.advance(
+        handle.run_id,
+        candidate={
+            "confidence_observation": material["observation"],
+            "confidence_artifact": material["artifact"],
+        },
+    )
+    terminal = kernel.advance(handle.run_id, candidate={})
+
+    assert summarizing.run_state is RunState.SUMMARIZING
+    assert summarizing.no_trade is False
+    assert terminal.run_state is RunState.SUCCEEDED
+    assert terminal.reason_code == "completed"
+    assert terminal.no_trade is False
+
+
+def test_gate_snapshot_mismatch_is_permanent_no_trade_for_run(tmp_path):
+    def wrong_gate(plan: HarnessPlan) -> ConfidenceGate:
+        gate, _, _ = _confidence_material(plan)
+        context = gate.trusted_context_snapshot()
+        policy = gate.trusted_policy_snapshot()
+        assert context is not None and policy is not None
+        wrong = context.model_copy(
+            update={
+                "hard_gates": context.hard_gates.model_copy(
+                    update={"trace_hash": "9" * 64}
+                )
+            }
+        )
+        return ConfidenceGate(
+            trusted_policy=policy,
+            signature_verifier=ConfidenceVerifier(),
+            request_context=wrong,
+        )
+
+    kernel, _, _, _ = _kernel(tmp_path, confidence_gate_factory=wrong_gate)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+
+    decision = kernel.advance(handle.run_id, candidate={})
+
+    assert decision.run_state is RunState.DEGRADING
+    assert decision.reason_code == "confidence_context_mismatch"
     assert decision.no_trade is True
 
 
@@ -560,6 +978,109 @@ def test_exhausted_budget_is_a_hard_no_trade_gate(tmp_path):
 
     assert decision.run_state is RunState.DEGRADING
     assert decision.reason_code == "budget_exhausted"
+    assert decision.no_trade is True
+
+
+def test_budget_reservation_is_settled_and_durably_projected(tmp_path):
+    budget = WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0)
+    calls: list[str] = []
+    reserve = budget.reserve
+    settle = budget.settle
+
+    def recording_reserve(**kwargs):
+        calls.append("reserve")
+        return reserve(**kwargs)
+
+    def recording_settle(reservation, usage):
+        calls.append("settle")
+        return settle(reservation, usage)
+
+    budget.reserve = recording_reserve
+    budget.settle = recording_settle
+    kernel, store, _, _ = _kernel(tmp_path, budget=budget)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+
+    kernel.advance(handle.run_id, candidate={})
+
+    assert calls == ["reserve", "settle"]
+    authority_events = [
+        event for event in store.load(handle.run_id) if event.event_type == "transition_authorized"
+    ]
+    assert authority_events[-1].payload["budget_remaining_attempts"] == 9
+
+
+def test_loop_action_result_history_is_replayed_before_policy_decision(tmp_path):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    plan = HarnessPlan.model_validate_json(store.load(handle.run_id)[0].payload["plan_json"])
+    observation = _action_observation(plan.revision)
+    for index in range(2):
+        view = store.snapshot(handle.run_id)
+        store.append(
+            HarnessEvent(
+                event_id=f"prior-action-{index}",
+                trace_id=plan.trace_id,
+                span_id=f"prior-action-span-{index}",
+                run_id=plan.run_id,
+                event_type="loop_observed",
+                occurred_at=NOW,
+                monotonic_offset=100.0,
+                actor="harness-kernel",
+                payload={
+                    "loop_action_json": observation.model_dump_json(),
+                    "loop_plan_revision": plan.revision,
+                    "loop_fingerprint_schema_version": (
+                        plan.pinned_versions.fingerprint_schema_version
+                    ),
+                    "loop_policy_version": plan.pinned_versions.policy_version,
+                },
+            ),
+            expected_sequence=view.sequence,
+            expected_state_revision=view.state_revision,
+        )
+
+    decision = kernel.advance(
+        handle.run_id, candidate={"action_observation": observation}
+    )
+
+    assert decision.run_state is RunState.DEGRADING
+    assert decision.reason_code == "loop_guard_stopped"
+    assert decision.no_trade is True
+
+
+def test_loop_checkpoint_must_bind_current_plan_and_schema(tmp_path):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    plan = HarnessPlan.model_validate_json(store.load(handle.run_id)[0].payload["plan_json"])
+    progress = ProgressVector()
+    checkpoint = SemanticCheckpoint(
+        scope=LoopScope.RUN,
+        observation_kind=ObservationKind.SEMANTIC_CHECKPOINT,
+        state_fingerprint=build_state_fingerprint(
+            run_state="running",
+            work_item_state="running",
+            attempt_state="streaming",
+            stage_id="information",
+            plan_revision=plan.revision + 1,
+            unresolved_work_ids=(),
+            dependency_versions=(),
+            progress=progress,
+            normalized_error_class=None,
+        ),
+        progress=progress,
+        plan_revision=plan.revision + 1,
+        fingerprint_schema_version=plan.pinned_versions.fingerprint_schema_version,
+    )
+
+    decision = kernel.advance(
+        handle.run_id, candidate={"loop_checkpoint": checkpoint}
+    )
+
+    assert decision.run_state is RunState.DEGRADING
+    assert decision.reason_code == "loop_checkpoint_binding_mismatch"
     assert decision.no_trade is True
 
 

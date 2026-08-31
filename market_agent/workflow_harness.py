@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
+from hashlib import sha256
+import json
 import math
-from typing import Callable, Protocol, cast
+from typing import Any, Callable, Protocol, cast
 
 from pydantic import StrictBool, model_validator
 
-from market_agent.workflow_budget import BudgetSnapshot, WorkflowBudgetLedger
+from market_agent.openai_usage import UsageTokens
+from market_agent.workflow_budget import (
+    BudgetExceededError,
+    BudgetSnapshot,
+    WorkflowBudgetLedger,
+)
 from market_agent.workflow_confidence_calibration import (
     ConfidenceCalibratorArtifact,
     ConfidenceGate,
     ConfidenceObservation,
+    TrustedConfidencePolicy,
+    TrustedRequestContext,
 )
 from market_agent.workflow_contracts import (
     ContractModel,
@@ -28,7 +38,8 @@ from market_agent.workflow_execution_backend import (
     ExecutionBackendError,
     ExecutionHandle,
     ExecutionRegistrationError,
-    LangGraphExecutionBackend,
+    IssuerTrustDescriptor,
+    RegistrationPreparation,
     canonical_plan_digest,
     canonical_transition_digest,
     canonical_view_digest,
@@ -41,7 +52,11 @@ from market_agent.workflow_harness_contracts import (
     RunState,
     TransitionAuthorityRecord,
 )
-from market_agent.workflow_loop_guard import LoopGuard, SemanticCheckpoint
+from market_agent.workflow_loop_guard import (
+    ActionObservationFingerprint,
+    LoopGuard,
+    SemanticCheckpoint,
+)
 from market_agent.workflow_plan_registry import PlanCompiler
 from market_agent.workflow_session import (
     HarnessEvent,
@@ -85,6 +100,8 @@ class ExecutionCommitReceiptIssuer(Protocol):
 
     def ready(self) -> bool: ...
 
+    def trust_descriptor(self) -> IssuerTrustDescriptor: ...
+
     def issue_snapshot(self, plan: HarnessPlan) -> CommittedExecutionSnapshot: ...
 
     def issue_transition_receipt(
@@ -96,7 +113,16 @@ class ExecutionCommitReceiptIssuer(Protocol):
     ) -> CommittedTransitionReceipt: ...
 
 
-class RunHandle(ContractModel):
+class _StrictOutput(ContractModel):
+    def model_copy(
+        self, *, update: dict[str, Any] | None = None, deep: bool = False
+    ) -> Any:
+        values = self.model_dump(mode="python", round_trip=True)
+        values.update(update or {})
+        return type(self).model_validate(values)
+
+
+class RunHandle(_StrictOutput):
     run_id: ShortText
     trace_id: ShortText
     plan_id: ShortText
@@ -107,7 +133,7 @@ class RunHandle(ContractModel):
     backend_synchronized: StrictBool
 
 
-class HarnessDecision(ContractModel):
+class HarnessDecision(_StrictOutput):
     run_id: ShortText
     trace_id: ShortText
     sequence: NonNegativeInt
@@ -126,6 +152,10 @@ class HarnessDecision(ContractModel):
             raise ValueError("Phase 1 Harness decisions cannot authorize retries")
         if self.reconciliation_required and self.run_state is not RunState.WAITING_RECONCILIATION:
             raise ValueError("reconciliation is required only while waiting reconciliation")
+        if self.run_state is RunState.SUCCEEDED and self.no_trade:
+            raise ValueError("successful informational decisions cannot be no-trade")
+        if self.run_state is RunState.CANCELLED and self.reason_code != "cancellation_completed":
+            raise ValueError("cancelled decisions require the cancellation terminal reason")
         if self.transition is not None and (
             self.transition.run_id != self.run_id
             or self.transition.trace_id != self.trace_id
@@ -140,14 +170,14 @@ class _AdvanceCandidate(ContractModel):
     confidence_observation: ConfidenceObservation | None = None
     confidence_artifact: ConfidenceCalibratorArtifact | None = None
     loop_checkpoint: SemanticCheckpoint | None = None
+    action_observation: ActionObservationFingerprint | None = None
 
 
 class _PreparedRegistration:
-    __slots__ = ("token", "rollback")
+    __slots__ = ("token",)
 
-    def __init__(self, token: object, rollback: Callable[[object], None] | None) -> None:
+    def __init__(self, token: RegistrationPreparation) -> None:
         self.token = token
-        self.rollback = rollback
 
 
 _INITIAL_TARGETS = {
@@ -169,7 +199,9 @@ def _fresh_contract(value: object, expected_type: type[ContractModel]) -> Contra
     if set(value.__dict__).difference(expected_type.model_fields):
         raise InvalidHarnessInputError("contract contains undeclared fields")
     try:
-        return expected_type.model_validate(value.__dict__)
+        return expected_type.model_validate(
+            value.model_dump(mode="python", round_trip=True)
+        )
     except Exception as error:
         raise InvalidHarnessInputError("contract failed strict revalidation") from error
 
@@ -217,6 +249,8 @@ class HarnessKernel:
         self._identifiers = identifiers
         self._budgets: dict[str, WorkflowBudgetLedger] = {}
         self._confidence_gates: dict[str, ConfidenceGate] = {}
+        self._confidence_binding_failed: set[str] = set()
+        self._backend_cancelled: set[str] = set()
 
     def create(self, request: WorkflowRequest) -> RunHandle:
         request = cast(WorkflowRequest, _fresh_contract(request, WorkflowRequest))
@@ -232,15 +266,11 @@ class HarnessKernel:
         ):
             raise HarnessDependencyError("current request did not compile to passive no-trade")
 
-        provisional = HarnessSessionView(
-            plan_revision=plan.revision,
-            run_id=plan.run_id,
-            trace_id=plan.trace_id,
-        )
+        provisional = HarnessSessionView(plan_revision=plan.revision)
         prepared = self._prepare_dependencies(plan, provisional)
-        published = False
+        committed_registration = False
         try:
-            view, transition, _ = self._commit_run_transition(
+            view, _, _ = self._commit_run_transition(
                 plan,
                 HarnessSessionView.empty(),
                 target=RunState.CREATED,
@@ -248,19 +278,13 @@ class HarnessKernel:
                 backend_handle=None,
                 event_payload={"plan_json": plan.model_dump_json()},
             )
-            published = True
-        except BaseException:
-            if not published and prepared.rollback is not None:
-                prepared.rollback(prepared.token)
-            raise
-
-        backend_synchronized = True
-        try:
             snapshot = self._issued_snapshot(plan, view)
-            self._execution.register(plan, view, snapshot)
-        except ExecutionBackendError:
-            backend_synchronized = False
-        return self._handle(plan, view, backend_synchronized)
+            self._execution.commit_registration(prepared.token, snapshot)
+            committed_registration = True
+            return self._handle(plan, view, True)
+        finally:
+            if not committed_registration:
+                self._execution.rollback_registration(prepared.token)
 
     def resume(
         self, run_id: str, *, disposable_checkpoint: object | None = None
@@ -294,6 +318,30 @@ class HarnessKernel:
     ) -> HarnessDecision:
         run_id = _strict_run_id(run_id)
         events, plan, view = self._load(run_id)
+
+        pending = self._pending_authority(events, view)
+        if pending is not None:
+            authority, payload = pending
+            self._ensure_runtime_dependencies(plan)
+            snapshot = self._issued_snapshot(plan, view)
+            handle = self._execution.resume(plan, view, snapshot)
+            post, transition, synchronized = self._commit_run_transition(
+                plan,
+                view,
+                target=RunState(authority.to_state),
+                reason_code=authority.reason_code,
+                backend_handle=handle,
+                event_payload=payload,
+            )
+            return self._decision(
+                plan,
+                post,
+                authority.reason_code,
+                transition=transition,
+                no_trade=self._strict_payload_bool(payload, "no_trade"),
+                backend_synchronized=synchronized,
+            )
+
         if expected_state_revision is not None and (
             type(expected_state_revision) is not int
             or expected_state_revision < 0
@@ -302,7 +350,7 @@ class HarnessKernel:
         if expected_state_revision is not None and expected_state_revision != view.state_revision:
             return self._decision(plan, view, "stale_revision", backend_synchronized=False)
 
-        parsed = self._candidate(candidate)
+        parsed, candidate_digest = self._candidate(candidate)
         if parsed is None:
             rejected = self._append_observation(
                 plan, view, "candidate_rejected", {"policy": "strict_candidate_schema"}
@@ -310,6 +358,21 @@ class HarnessKernel:
             return self._decision(
                 plan, rejected, "candidate_rejected", backend_synchronized=False
             )
+        if candidate_digest is not None:
+            replay = self._committed_candidate(events, candidate_digest)
+            if replay is not None:
+                transition, payload = replay
+                self._ensure_runtime_dependencies(plan)
+                snapshot = self._issued_snapshot(plan, view)
+                self._execution.resume(plan, view, snapshot)
+                return self._decision(
+                    plan,
+                    view,
+                    transition.reason_code,
+                    transition=transition,
+                    no_trade=self._strict_payload_bool(payload, "no_trade"),
+                    backend_synchronized=True,
+                )
         if view.run_state in _TERMINAL_STATES:
             return self._decision(plan, view, "terminal_state", backend_synchronized=True)
         if view.run_state is RunState.WAITING_RECONCILIATION:
@@ -327,6 +390,9 @@ class HarnessKernel:
         target, reason, no_trade, payload = self._policy_decision(
             events, plan, view, parsed
         )
+        payload["no_trade"] = no_trade
+        if candidate_digest is not None:
+            payload["candidate_digest"] = candidate_digest
         post, transition, backend_synchronized = self._commit_run_transition(
             plan,
             view,
@@ -348,13 +414,20 @@ class HarnessKernel:
         run_id = _strict_run_id(run_id)
         if type(reason) is not str or not reason or reason != reason.strip() or len(reason) > 256:
             raise InvalidHarnessInputError("cancellation reason must be canonical text")
-        _, plan, view = self._load(run_id)
-        recorded = self._append_observation(
-            plan,
-            view,
-            "cancellation_requested",
-            {"reason_code": reason, "policy": "task4_cancellation"},
+        events, plan, view = self._load(run_id)
+        existing_intents = tuple(
+            event for event in events if event.event_type == "cancellation_requested"
         )
+        if len(existing_intents) > 1:
+            raise HarnessDependencyError("run has duplicate cancellation intents")
+        recorded = view
+        if not existing_intents:
+            recorded = self._append_observation(
+                plan,
+                view,
+                "cancellation_requested",
+                {"reason_code": reason, "policy": "task4_cancellation"},
+            )
         if (
             recorded.run_state is RunState.WAITING_RECONCILIATION
             or recorded.external_side_effect_unknown
@@ -365,6 +438,47 @@ class HarnessKernel:
                 "cancellation_waits_for_reconciliation",
                 reconciliation_required=True,
                 backend_synchronized=False,
+            )
+        if recorded.run_state is RunState.CANCELLED:
+            if plan.run_id not in self._backend_cancelled:
+                self._ensure_runtime_dependencies(plan)
+                snapshot = self._issued_snapshot(plan, recorded)
+                try:
+                    self._execution.resume(plan, recorded, snapshot)
+                except ExecutionBackendError:
+                    pass
+                self._execution.cancel(plan.run_id)
+                self._backend_cancelled.add(plan.run_id)
+            return self._decision(
+                plan,
+                recorded,
+                "cancellation_completed",
+                backend_synchronized=True,
+            )
+        if recorded.run_state is RunState.WAITING_APPROVAL:
+            self._ensure_runtime_dependencies(plan)
+            snapshot = self._issued_snapshot(plan, recorded)
+            handle = self._execution.resume(plan, recorded, snapshot)
+            post, transition, synchronized = self._commit_run_transition(
+                plan,
+                recorded,
+                target=RunState.CANCELLED,
+                reason_code="cancellation_completed",
+                backend_handle=handle,
+                event_payload={
+                    "policy": "task4_cancellation",
+                    "no_trade": False,
+                },
+            )
+            if synchronized:
+                self._execution.cancel(plan.run_id)
+                self._backend_cancelled.add(plan.run_id)
+            return self._decision(
+                plan,
+                post,
+                "cancellation_completed",
+                transition=transition,
+                backend_synchronized=synchronized,
             )
         return self._decision(
             plan, recorded, "cancellation_intent_recorded", backend_synchronized=False
@@ -381,16 +495,35 @@ class HarnessKernel:
         if type(ready) is not bool or not ready:
             raise HarnessDependencyError("receipt issuer is not ready")
 
-        prepare = getattr(self._execution, "prepare_registration", None)
-        rollback = getattr(self._execution, "rollback_registration", None)
-        if callable(prepare):
-            token = prepare(plan, provisional)
-            return _PreparedRegistration(token, rollback if callable(rollback) else None)
-        if type(self._execution) is LangGraphExecutionBackend:
-            return _PreparedRegistration(None, None)
-        raise ExecutionRegistrationError(
-            "backend requires explicit provisional registration readiness"
-        )
+        try:
+            descriptor = cast(
+                IssuerTrustDescriptor,
+                _fresh_contract(
+                    self._receipt_issuer.trust_descriptor(),
+                    IssuerTrustDescriptor,
+                ),
+            )
+            token = self._execution.prepare_registration(
+                plan, provisional, descriptor
+            )
+            token = cast(
+                RegistrationPreparation,
+                _fresh_contract(token, RegistrationPreparation),
+            )
+        except ExecutionBackendError:
+            raise
+        except Exception as error:
+            raise HarnessDependencyError(
+                "registration preparation failed"
+            ) from error
+        if token.issuer != descriptor:
+            try:
+                self._execution.rollback_registration(token)
+            finally:
+                raise HarnessDependencyError(
+                    "registration token changed issuer trust binding"
+                )
+        return _PreparedRegistration(token)
 
     def _ensure_runtime_dependencies(self, plan: HarnessPlan) -> None:
         if plan.pinned_versions != self._pinned_versions:
@@ -406,22 +539,92 @@ class HarnessKernel:
             raise HarnessDependencyError("confidence gate factory returned an invalid policy")
         if type(budget) is not WorkflowBudgetLedger:
             raise HarnessDependencyError("budget factory returned an invalid ledger")
+        if plan.run_id not in self._budgets:
+            self._restore_budget_from_events(plan, budget)
         snapshot = budget.snapshot()
         if type(snapshot) is not BudgetSnapshot or snapshot.mode is not plan.mode:
             raise HarnessDependencyError("budget snapshot does not match the run")
         self._budgets[plan.run_id] = budget
         self._confidence_gates[plan.run_id] = confidence_gate
+        if not self._confidence_gate_matches_plan(plan, confidence_gate):
+            self._confidence_binding_failed.add(plan.run_id)
 
     @staticmethod
-    def _candidate(candidate: object) -> _AdvanceCandidate | None:
-        if candidate is None:
-            return _AdvanceCandidate()
-        if type(candidate) is not dict:
-            return None
+    def _confidence_gate_matches_plan(
+        plan: HarnessPlan, gate: ConfidenceGate
+    ) -> bool:
         try:
-            return _AdvanceCandidate.model_validate(candidate)
+            context = gate.trusted_context_snapshot()
+            policy = gate.trusted_policy_snapshot()
+            if type(context) is not TrustedRequestContext or type(policy) is not TrustedConfidencePolicy:
+                return False
+            context = cast(
+                TrustedRequestContext,
+                _fresh_contract(context, TrustedRequestContext),
+            )
+            policy = cast(
+                TrustedConfidencePolicy,
+                _fresh_contract(policy, TrustedConfidencePolicy),
+            )
         except Exception:
-            return None
+            return False
+        expected_policy_hash = sha256(
+            plan.pinned_versions.policy_version.encode("utf-8")
+        ).hexdigest()
+        gates = context.hard_gates
+        return (
+            context.request_class == "informational"
+            and gates.run_id == plan.run_id
+            and gates.trace_hash
+            == sha256(plan.trace_id.encode("utf-8")).hexdigest()
+            and gates.plan_revision == plan.revision
+            and gates.policy_hash == expected_policy_hash
+            and policy.policy_hash == expected_policy_hash
+            and policy.policy_hash == gates.policy_hash
+        )
+
+    def _restore_budget_from_events(
+        self, plan: HarnessPlan, budget: WorkflowBudgetLedger
+    ) -> None:
+        events = self.event_store.load(plan.run_id)
+        for event in events:
+            if (
+                event.event_type != "transition_authorized"
+                or "budget_remaining_attempts" not in event.payload
+            ):
+                continue
+            try:
+                reservation = budget.reserve(
+                    node_name="event_filter",
+                    model="gpt-5.6-luna",
+                    band="short",
+                    usage=UsageTokens(),
+                )
+                budget.settle(reservation, UsageTokens())
+            except Exception as error:
+                raise HarnessDependencyError(
+                    "committed budget usage cannot be restored"
+                ) from error
+
+    @staticmethod
+    def _candidate(candidate: object) -> tuple[_AdvanceCandidate | None, str | None]:
+        if candidate is None:
+            return _AdvanceCandidate(), None
+        if type(candidate) is not dict:
+            return None, None
+        try:
+            parsed = _AdvanceCandidate.model_validate(candidate)
+        except Exception:
+            return None, None
+        if not candidate:
+            return parsed, None
+        canonical = json.dumps(
+            parsed.model_dump(mode="json", exclude_none=True),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        return parsed, sha256(canonical.encode("utf-8")).hexdigest()
 
     def _policy_decision(
         self,
@@ -435,31 +638,81 @@ class HarnessKernel:
             return initial[0], initial[1], False, {"policy": "state_machine"}
         if view.run_state is RunState.DEGRADING:
             return RunState.SUMMARIZING, "safe_no_trade_summary", True, {
-                "policy": "degradation"
+                "policy": "degradation",
+                "summary_source": "degradation",
             }
         if view.run_state is RunState.SUMMARIZING:
+            source = self._summary_source(events, view)
+            if source == "confidence_success":
+                return RunState.SUCCEEDED, "completed", False, {
+                    "policy": "terminal_success",
+                    "summary_source": source,
+                }
             return RunState.DEGRADED, "safe_no_trade_due_to_degradation", True, {
-                "policy": "terminal_degradation"
+                "policy": "terminal_degradation",
+                "summary_source": "degradation",
             }
         if view.run_state is not RunState.RUNNING:
             raise HarnessKernelError("run has no deterministic advance policy")
 
         payload: dict[str, object] = {"policy": "confidence_gate"}
-        budget = self._budgets[plan.run_id].snapshot()
+        ledger = self._budgets[plan.run_id]
+        budget = ledger.snapshot()
         if type(budget) is not BudgetSnapshot or budget.mode is not plan.mode:
             raise HarnessDependencyError("budget snapshot does not match the run")
-        if budget.exhausted or budget.overdrawn:
+        if self._budget_closed(events, budget):
             return RunState.DEGRADING, "budget_exhausted", True, {
                 "policy": "budget"
             }
+        try:
+            reservation = ledger.reserve(
+                node_name="event_filter",
+                model="gpt-5.6-luna",
+                band="short",
+                usage=UsageTokens(),
+            )
+            ledger.settle(reservation, UsageTokens())
+        except BudgetExceededError:
+            return RunState.DEGRADING, "budget_exhausted", True, {
+                "policy": "budget"
+            }
+        budget = ledger.snapshot()
+        payload.update(self._budget_payload(events, budget))
+        if self._budget_closed(events, budget):
+            return RunState.DEGRADING, "budget_exhausted", True, payload
+
+        guard: LoopGuard | None = None
+        if candidate.action_observation is not None:
+            guard = self._replayed_loop_guard(events, plan)
+            loop_decision = guard.observe_action_result(candidate.action_observation)
+            payload["loop_action_json"] = candidate.action_observation.model_dump_json()
+            payload.update(self._loop_binding_payload(plan))
+            payload["loop_reason"] = loop_decision.stop_reason or "allowed"
+            if not loop_decision.allowed:
+                return RunState.DEGRADING, "loop_guard_stopped", True, payload
         if candidate.loop_checkpoint is not None:
-            guard = self._replayed_loop_guard(events)
+            if (
+                candidate.loop_checkpoint.plan_revision != plan.revision
+                or candidate.loop_checkpoint.fingerprint_schema_version
+                != plan.pinned_versions.fingerprint_schema_version
+            ):
+                return RunState.DEGRADING, "loop_checkpoint_binding_mismatch", True, {
+                    **payload,
+                    "policy": "loop_guard",
+                }
+            guard = guard or self._replayed_loop_guard(events, plan)
             loop_decision = guard.observe_checkpoint(candidate.loop_checkpoint)
             payload["loop_checkpoint_json"] = candidate.loop_checkpoint.model_dump_json()
+            payload.update(self._loop_binding_payload(plan))
             payload["loop_reason"] = loop_decision.stop_reason or "allowed"
             if not loop_decision.allowed:
                 return RunState.DEGRADING, "loop_guard_stopped", True, payload
 
+        if plan.run_id in self._confidence_binding_failed:
+            return RunState.DEGRADING, "confidence_context_mismatch", True, {
+                **payload,
+                "policy": "confidence_binding",
+            }
         gate = self._confidence_gates[plan.run_id]
         confidence = gate.evaluate(
             candidate.confidence_observation, candidate.confidence_artifact
@@ -467,25 +720,218 @@ class HarnessKernel:
         payload["confidence_action"] = confidence.next_action
         payload["confidence_reason"] = confidence.reason_code
         if confidence.may_succeed:
+            payload["summary_source"] = "confidence_success"
             return RunState.SUMMARIZING, "confidence_sufficient", False, payload
         return RunState.DEGRADING, "confidence_fail_closed", True, payload
 
-    def _replayed_loop_guard(self, events: tuple[HarnessEvent, ...]) -> LoopGuard:
+    def _replayed_loop_guard(
+        self, events: tuple[HarnessEvent, ...], plan: HarnessPlan
+    ) -> LoopGuard:
         guard = self._loop_guard_factory()
         if type(guard) is not LoopGuard:
             raise HarnessDependencyError("loop guard factory returned an invalid policy")
         for event in events:
-            value = event.payload.get("loop_checkpoint_json")
-            if value is None:
-                continue
-            if type(value) is not str:
-                raise HarnessDependencyError("committed loop checkpoint is invalid")
-            try:
-                checkpoint = SemanticCheckpoint.model_validate_json(value)
-            except Exception as error:
-                raise HarnessDependencyError("committed loop checkpoint is invalid") from error
-            guard.observe_checkpoint(checkpoint)
+            action_value = event.payload.get("loop_action_json")
+            checkpoint_value = event.payload.get("loop_checkpoint_json")
+            if action_value is not None or checkpoint_value is not None:
+                if (
+                    event.payload.get("loop_plan_revision") != plan.revision
+                    or event.payload.get("loop_fingerprint_schema_version")
+                    != plan.pinned_versions.fingerprint_schema_version
+                    or event.payload.get("loop_policy_version")
+                    != plan.pinned_versions.policy_version
+                ):
+                    raise HarnessDependencyError(
+                        "committed loop observation pins do not match the plan"
+                    )
+            if action_value is not None:
+                if type(action_value) is not str:
+                    raise HarnessDependencyError("committed loop action is invalid")
+                try:
+                    action = ActionObservationFingerprint.model_validate_json(
+                        action_value
+                    )
+                except Exception as error:
+                    raise HarnessDependencyError("committed loop action is invalid") from error
+                guard.observe_action_result(action)
+            if checkpoint_value is not None:
+                if type(checkpoint_value) is not str:
+                    raise HarnessDependencyError("committed loop checkpoint is invalid")
+                try:
+                    checkpoint = SemanticCheckpoint.model_validate_json(checkpoint_value)
+                except Exception as error:
+                    raise HarnessDependencyError("committed loop checkpoint is invalid") from error
+                guard.observe_checkpoint(checkpoint)
         return guard
+
+    @staticmethod
+    def _loop_binding_payload(plan: HarnessPlan) -> dict[str, object]:
+        return {
+            "loop_plan_revision": plan.revision,
+            "loop_fingerprint_schema_version": (
+                plan.pinned_versions.fingerprint_schema_version
+            ),
+            "loop_policy_version": plan.pinned_versions.policy_version,
+        }
+
+    @staticmethod
+    def _strict_payload_bool(payload: dict[str, object], name: str) -> bool:
+        value = payload.get(name, False)
+        if type(value) is not bool:
+            raise HarnessDependencyError(f"committed {name} decision is invalid")
+        return value
+
+    @staticmethod
+    def _pending_authority(
+        events: tuple[HarnessEvent, ...], view: HarnessSessionView
+    ) -> tuple[TransitionAuthorityRecord, dict[str, object]] | None:
+        pending = tuple(
+            authority
+            for authority in view.transition_authorities
+            if authority.idempotency_key not in view.applied_idempotency_keys
+            and authority.expected_state_revision == view.state_revision
+        )
+        if not pending:
+            return None
+        if len(pending) != 1:
+            raise HarnessDependencyError("run has ambiguous pending transition authority")
+        authority = pending[0]
+        matching = tuple(
+            event
+            for event in events
+            if event.transition_authority == authority
+        )
+        if len(matching) != 1:
+            raise HarnessDependencyError("pending authority has no unique policy event")
+        current = view.run_state.value if view.run_state is not None else "none"
+        try:
+            RunState(authority.to_state)
+        except ValueError as error:
+            raise HarnessDependencyError("pending authority targets an invalid state") from error
+        if (
+            authority.entity_kind != "run"
+            or authority.entity_id != view.run_id
+            or authority.from_state != current
+        ):
+            raise HarnessDependencyError("pending authority does not bind current run")
+        return authority, dict(matching[0].payload)
+
+    @staticmethod
+    def _committed_candidate(
+        events: tuple[HarnessEvent, ...], candidate_digest: str
+    ) -> tuple[HarnessTransition, dict[str, object]] | None:
+        applied = {
+            event.transition.idempotency_key: event.transition
+            for event in events
+            if event.transition is not None
+        }
+        matches: list[tuple[HarnessTransition, dict[str, object]]] = []
+        for event in events:
+            authority = event.transition_authority
+            if (
+                authority is None
+                or event.payload.get("candidate_digest") != candidate_digest
+                or authority.idempotency_key not in applied
+            ):
+                continue
+            matches.append((applied[authority.idempotency_key], dict(event.payload)))
+        if len(matches) > 1:
+            raise HarnessDependencyError("candidate digest identifies multiple decisions")
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _summary_source(
+        events: tuple[HarnessEvent, ...], view: HarnessSessionView
+    ) -> str:
+        for event in reversed(events):
+            transition = event.transition
+            if (
+                transition is not None
+                and transition.entity_kind == "run"
+                and transition.to_state == RunState.SUMMARIZING.value
+                and transition.expected_state_revision + 1 == view.state_revision
+            ):
+                source = event.payload.get("summary_source")
+                if source in {"confidence_success", "degradation"}:
+                    return cast(str, source)
+                raise HarnessDependencyError("summarizing transition has no valid source")
+        raise HarnessDependencyError("summarizing state has no source transition")
+
+    @staticmethod
+    def _budget_payload(
+        events: tuple[HarnessEvent, ...], snapshot: BudgetSnapshot
+    ) -> dict[str, object]:
+        attempts = snapshot.remaining_attempts
+        seconds = snapshot.remaining_seconds
+        cost = snapshot.remaining_cost
+        for event in reversed(events):
+            if "budget_remaining_attempts" not in event.payload:
+                continue
+            prior_attempts = event.payload.get("budget_remaining_attempts")
+            prior_seconds = event.payload.get("budget_remaining_seconds")
+            prior_cost = event.payload.get("budget_remaining_cost")
+            if (
+                type(prior_attempts) is not int
+                or type(prior_seconds) is not float
+                or type(prior_cost) is not str
+            ):
+                raise HarnessDependencyError("committed budget projection is invalid")
+            attempts = min(attempts, prior_attempts)
+            seconds = min(seconds, prior_seconds)
+            try:
+                cost = min(cost, Decimal(prior_cost))
+            except Exception as error:
+                raise HarnessDependencyError("committed budget projection is invalid") from error
+            break
+        return {
+            "budget_remaining_attempts": attempts,
+            "budget_remaining_seconds": seconds,
+            "budget_remaining_cost": format(cost, "f"),
+        }
+
+    @staticmethod
+    def _budget_closed(
+        events: tuple[HarnessEvent, ...], snapshot: BudgetSnapshot
+    ) -> bool:
+        attempts = snapshot.remaining_attempts
+        seconds = snapshot.remaining_seconds
+        cost = snapshot.remaining_cost
+        for event in reversed(events):
+            if "budget_remaining_attempts" not in event.payload:
+                continue
+            prior_attempts = event.payload.get("budget_remaining_attempts")
+            prior_seconds = event.payload.get("budget_remaining_seconds")
+            prior_cost = event.payload.get("budget_remaining_cost")
+            if (
+                type(prior_attempts) is not int
+                or type(prior_seconds) is not float
+                or type(prior_cost) is not str
+            ):
+                raise HarnessDependencyError("committed budget projection is invalid")
+            try:
+                parsed_cost = Decimal(prior_cost)
+            except Exception as error:
+                raise HarnessDependencyError("committed budget projection is invalid") from error
+            attempts = min(attempts, prior_attempts)
+            seconds = min(seconds, prior_seconds)
+            cost = min(cost, parsed_cost)
+            break
+        node_closed = any(
+            node.exhausted
+            or node.overdrawn
+            or node.remaining_attempts <= 0
+            or node.remaining_seconds <= 0
+            or node.remaining_cost <= 0
+            for node in snapshot.nodes
+        )
+        return (
+            snapshot.exhausted
+            or snapshot.overdrawn
+            or attempts <= 0
+            or seconds <= 0
+            or cost <= 0
+            or node_closed
+        )
 
     def _commit_run_transition(
         self,
@@ -590,7 +1036,7 @@ class HarnessKernel:
         transition_event = self._event(
             plan,
             "transition_committed",
-            payload={"reason_code": reason_code, "policy": event_payload.get("policy", "create")},
+            payload={**event_payload, "reason_code": reason_code},
             transition=transition,
         )
         self.event_store.append(
@@ -729,6 +1175,7 @@ class HarnessKernel:
             or snapshot.state_revision != view.state_revision
             or snapshot.view_digest != canonical_view_digest(view)
             or snapshot.event_head_hash != view.last_event_hash
+            or snapshot.folded_view != view
         ):
             raise HarnessDependencyError("host snapshot does not bind committed truth")
         return snapshot
@@ -775,6 +1222,7 @@ class HarnessKernel:
             or snapshot.state_revision != view.state_revision
             or snapshot.view_digest != canonical_view_digest(view)
             or snapshot.event_head_hash != view.last_event_hash
+            or snapshot.folded_view != view
         ):
             raise HarnessDependencyError("receipt endpoint does not bind committed truth")
 
