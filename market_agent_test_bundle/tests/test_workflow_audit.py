@@ -534,6 +534,26 @@ def test_pre_metadata_current_row_with_one_semantic_corruption_is_not_legacy(
         AuditStore(database_path)
 
 
+def test_three_current_semantic_typos_do_not_form_a_legacy_signature(tmp_path):
+    database_path = tmp_path / "three-current-semantic-typos.sqlite3"
+    payload = json.dumps({"kind": "transition", "subject_ids": ["task-1"]})
+    row = list(
+        _legacy_row(
+            "event-current",
+            1,
+            payload,
+            input_hash="a" * 64,
+            schema_version="v1",
+        )
+    )
+    row[7:10] = ["coordinator_typo", "task_dispatched_typo", "accepted_typo"]
+    row[17:20] = ["gpt-5.6-terra", "prompt-v1", "AgentTask"]
+    _create_legacy_database(database_path, [tuple(row)], schema_version=True)
+
+    with pytest.raises(ValidationError):
+        AuditStore(database_path)
+
+
 def test_unknown_storage_schema_version_fails_without_transformation(tmp_path):
     database_path = tmp_path / "unknown-version.sqlite3"
     payload = json.dumps({"kind": "transition", "subject_ids": ["task-1"]})

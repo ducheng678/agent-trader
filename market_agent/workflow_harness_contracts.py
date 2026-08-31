@@ -344,7 +344,21 @@ class HarnessTransition(ContractModel):
     plan_revision: NonNegativeInt
     reason_code: ShortText
     idempotency_key: ShortText
-    fencing_token: ShortText | None = None
+    lease_epoch: PositiveInt | None = None
+    fencing_token_digest: Digest | None = None
+
+    @model_validator(mode="after")
+    def validate_lease_evidence(self) -> HarnessTransition:
+        has_evidence = (
+            self.lease_epoch is not None and self.fencing_token_digest is not None
+        )
+        if self.entity_kind == "run" and (
+            self.lease_epoch is not None or self.fencing_token_digest is not None
+        ):
+            raise ValueError("run transitions cannot carry lease evidence")
+        if self.entity_kind != "run" and not has_evidence:
+            raise ValueError("work-item and attempt transitions require lease evidence")
+        return self
 
 
 class ProgressVector(ContractModel):

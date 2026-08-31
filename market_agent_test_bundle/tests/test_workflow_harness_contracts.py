@@ -9,6 +9,7 @@ from market_agent.workflow_harness_contracts import (
     HarnessOutcome,
     HarnessPlan,
     HarnessSessionView,
+    HarnessTransition,
     LeaseToken,
     OutcomeKind,
     PinnedVersions,
@@ -446,6 +447,50 @@ def test_lease_token_rejects_nonpositive_epochs_and_is_frozen():
     )
     with pytest.raises(ValidationError):
         lease.lease_epoch = 2
+
+
+def test_non_run_transition_requires_durable_lease_epoch_and_token_digest():
+    values = {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "entity_kind": "work_item",
+        "entity_id": "work-1",
+        "from_state": "ready",
+        "to_state": "leased",
+        "expected_state_revision": 1,
+        "plan_revision": 0,
+        "reason_code": "lease_acquired",
+        "idempotency_key": "lease-1",
+    }
+
+    with pytest.raises(ValidationError):
+        HarnessTransition(**values)
+
+    transition = HarnessTransition(
+        **values, lease_epoch=1, fencing_token_digest=HASH
+    )
+
+    assert (transition.lease_epoch, transition.fencing_token_digest) == (1, HASH)
+
+
+def test_run_transition_rejects_lease_evidence_and_raw_fencing_token():
+    values = {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "entity_kind": "run",
+        "entity_id": "run-1",
+        "from_state": "none",
+        "to_state": "created",
+        "expected_state_revision": 0,
+        "plan_revision": 0,
+        "reason_code": "run_created",
+        "idempotency_key": "create-1",
+    }
+
+    with pytest.raises(ValidationError):
+        HarnessTransition(**values, lease_epoch=1, fencing_token_digest=HASH)
+    with pytest.raises(ValidationError):
+        HarnessTransition(**values, fencing_token="fence-live-secret")
 
 
 def test_empty_session_view_has_replay_identity_and_no_run_state():

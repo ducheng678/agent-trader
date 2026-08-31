@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 import sqlite3
 
 import pytest
@@ -13,6 +15,7 @@ from market_agent.workflow_session import (
     LeaseConflictError,
     OptimisticConcurrencyError,
     SQLiteHarnessEventStore,
+    canonical_event_hash,
     fold_events,
 )
 
@@ -25,7 +28,10 @@ def run_event(
     *,
     run_id: str = "run-1",
     trace_id: str = "trace-1",
+    from_state: str = "none",
     to_state: str = "created",
+    expected_state_revision: int = 0,
+    plan_revision: int = 0,
 ) -> HarnessEvent:
     return HarnessEvent(
         event_id=event_id,
@@ -42,10 +48,10 @@ def run_event(
             trace_id=trace_id,
             entity_kind="run",
             entity_id=run_id,
-            from_state="none",
+            from_state=from_state,
             to_state=to_state,
-            expected_state_revision=0,
-            plan_revision=0,
+            expected_state_revision=expected_state_revision,
+            plan_revision=plan_revision,
             reason_code="run_created",
             idempotency_key=f"idempotency-{event_id}",
         ),
@@ -71,9 +77,56 @@ def audit_event(
     )
 
 
+def lease_digest(fencing_token: str) -> str:
+    return sha256(fencing_token.encode("utf-8")).hexdigest()
+
+
+def work_event(event_id: str, lease, *, payload=None) -> HarnessEvent:
+    return HarnessEvent(
+        event_id=event_id,
+        trace_id="trace-1",
+        span_id=f"span-{event_id}",
+        run_id="run-1",
+        work_item_id=lease.work_item_id,
+        attempt_id=lease.attempt_id,
+        event_type="work_item_transitioned",
+        occurred_at=NOW,
+        monotonic_offset=3.0,
+        actor="harness",
+        payload=payload or {"lease_epoch": lease.lease_epoch},
+        transition=HarnessTransition(
+            run_id="run-1",
+            trace_id="trace-1",
+            entity_kind="work_item",
+            entity_id=lease.work_item_id,
+            from_state="none",
+            to_state="leased",
+            expected_state_revision=1,
+            plan_revision=0,
+            reason_code="lease_acquired",
+            idempotency_key=f"idempotency-{event_id}",
+            lease_epoch=lease.lease_epoch,
+            fencing_token_digest=lease_digest(lease.fencing_token),
+        ),
+    )
+
+
+def rehash(event: HarnessEvent) -> HarnessEvent:
+    unsigned = event.model_copy(update={"event_hash": None})
+    return unsigned.model_copy(
+        update={
+            "event_hash": canonical_event_hash(
+                unsigned.model_dump(mode="json", exclude={"event_hash"})
+            )
+        }
+    )
+
+
 @pytest.fixture
 def store(tmp_path):
-    return SQLiteHarnessEventStore(tmp_path / "session.sqlite3")
+    return SQLiteHarnessEventStore(
+        tmp_path / "session.sqlite3", monotonic=lambda: 5.0
+    )
 
 
 def test_sequence_advances_for_every_event_but_revision_only_for_transitions(store):
@@ -191,6 +244,70 @@ def test_replay_rejects_hash_chain_corruption(store):
         fold_events((corrupted,))
 
 
+def test_transition_plan_revision_must_equal_fixed_active_revision(store):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    committed = store.append(
+        run_event(
+            "run-admitted",
+            from_state="created",
+            to_state="admitted",
+            expected_state_revision=1,
+            plan_revision=0,
+        ),
+        expected_sequence=1,
+        expected_state_revision=1,
+    )
+
+    assert committed.transition.plan_revision == 0
+    assert store.snapshot("run-1").plan_revision == 0
+
+
+def test_append_rejects_jumping_plan_revision(store):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+
+    with pytest.raises(EventIntegrityError, match="plan revision"):
+        store.append(
+            run_event(
+                "run-admitted",
+                from_state="created",
+                to_state="admitted",
+                expected_state_revision=1,
+                plan_revision=1,
+            ),
+            expected_sequence=1,
+            expected_state_revision=1,
+        )
+
+
+def test_replay_rejects_changed_plan_revision_with_valid_event_hash(store):
+    created = store.append(
+        run_event("run-created"), expected_sequence=0, expected_state_revision=0
+    )
+    admitted = store.append(
+        run_event(
+            "run-admitted",
+            from_state="created",
+            to_state="admitted",
+            expected_state_revision=1,
+            plan_revision=0,
+        ),
+        expected_sequence=1,
+        expected_state_revision=1,
+    )
+    corrupted = rehash(
+        admitted.model_copy(
+            update={
+                "transition": admitted.transition.model_copy(
+                    update={"plan_revision": 1}
+                )
+            }
+        )
+    )
+
+    with pytest.raises(EventIntegrityError, match="plan revision"):
+        fold_events((created, corrupted))
+
+
 def test_reopen_replays_the_same_snapshot(tmp_path):
     database_path = tmp_path / "session.sqlite3"
     first_store = SQLiteHarnessEventStore(database_path)
@@ -208,6 +325,38 @@ def test_reopen_replays_the_same_snapshot(tmp_path):
 
     assert reopened.snapshot("run-1") == before
     assert reopened.snapshot("run-1").run_state is RunState.CREATED
+
+
+def test_load_rejects_canonical_json_for_another_run_stored_under_requested_run(
+    store, tmp_path
+):
+    committed = store.append(
+        run_event("run-created"), expected_sequence=0, expected_state_revision=0
+    )
+    other_run = rehash(
+        committed.model_copy(
+            update={
+                "run_id": "run-2",
+                "transition": committed.transition.model_copy(
+                    update={"run_id": "run-2", "entity_id": "run-2"}
+                ),
+            }
+        )
+    )
+    rendered = json.dumps(
+        other_run.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with sqlite3.connect(tmp_path / "session.sqlite3") as connection:
+        connection.execute("DROP TRIGGER harness_events_no_update")
+        connection.execute(
+            "UPDATE harness_events SET event_json = ? WHERE event_id = ?",
+            (rendered, committed.event_id),
+        )
+
+    with pytest.raises(EventIntegrityError, match="row membership"):
+        store.load("run-1")
 
 
 def test_event_rows_are_append_only_even_via_replace(store, tmp_path):
@@ -271,50 +420,22 @@ def test_newer_lease_fences_a_stale_work_item_transition(store):
         expires_at_monotonic=20.0,
         expected_lease_epoch=1,
     )
-    stale_event = HarnessEvent(
-        event_id="work-leased-stale",
-        trace_id="trace-1",
-        span_id="span-work-stale",
-        run_id="run-1",
-        work_item_id="work-1",
-        attempt_id="attempt-1",
-        event_type="work_item_transitioned",
-        occurred_at=NOW,
-        monotonic_offset=3.0,
-        actor="harness",
-        payload={"lease_epoch": stale.lease_epoch},
-        transition=HarnessTransition(
-            run_id="run-1",
-            trace_id="trace-1",
-            entity_kind="work_item",
-            entity_id="work-1",
-            from_state="none",
-            to_state="leased",
-            expected_state_revision=1,
-            plan_revision=0,
-            reason_code="lease_acquired",
-            idempotency_key="lease-stale",
-            fencing_token=stale.fencing_token,
-        ),
-    )
+    stale_event = work_event("work-leased-stale", stale)
 
     with pytest.raises(LeaseConflictError, match="fencing"):
-        store.append(stale_event, expected_sequence=1, expected_state_revision=1)
+        store.append(
+            stale_event,
+            expected_sequence=1,
+            expected_state_revision=1,
+            lease=stale,
+        )
 
-    fresh_event = stale_event.model_copy(
-        update={
-            "event_id": "work-leased-current",
-            "attempt_id": "attempt-2",
-            "transition": stale_event.transition.model_copy(
-                update={
-                    "idempotency_key": "lease-current",
-                    "fencing_token": current.fencing_token,
-                }
-            ),
-        }
-    )
+    fresh_event = work_event("work-leased-current", current)
     committed = store.append(
-        fresh_event, expected_sequence=1, expected_state_revision=1
+        fresh_event,
+        expected_sequence=1,
+        expected_state_revision=1,
+        lease=current,
     )
 
     assert (committed.sequence, committed.state_revision) == (2, 2)
@@ -341,3 +462,149 @@ def test_lease_epoch_is_optimistically_fenced(store):
             expires_at_monotonic=20.0,
             expected_lease_epoch=0,
         )
+
+
+def test_work_item_transition_cannot_omit_out_of_band_lease_proof(store):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    lease = store.acquire_lease(
+        "run-1",
+        "work-1",
+        "attempt-1",
+        "worker-a",
+        expires_at_monotonic=10.0,
+        expected_lease_epoch=0,
+    )
+
+    with pytest.raises(LeaseConflictError, match="lease proof"):
+        store.append(
+            work_event("work-no-proof", lease),
+            expected_sequence=1,
+            expected_state_revision=1,
+        )
+
+
+def test_expired_lease_cannot_authorize_transition(tmp_path):
+    store = SQLiteHarnessEventStore(
+        tmp_path / "expired.sqlite3", monotonic=lambda: 11.0
+    )
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    lease = store.acquire_lease(
+        "run-1",
+        "work-1",
+        "attempt-1",
+        "worker-a",
+        expires_at_monotonic=10.0,
+        expected_lease_epoch=0,
+    )
+
+    with pytest.raises(LeaseConflictError, match="expired"):
+        store.append(
+            work_event("work-expired", lease),
+            expected_sequence=1,
+            expected_state_revision=1,
+            lease=lease,
+        )
+
+
+@pytest.mark.parametrize(
+    "proof_update",
+    [
+        {"run_id": "run-2"},
+        {"work_item_id": "work-2"},
+        {"attempt_id": "attempt-2"},
+        {"lease_epoch": 2},
+        {"lease_epoch": True},
+        {"fencing_token": "fence-1-wrong-live-secret"},
+    ],
+)
+def test_lease_proof_must_match_current_identity_epoch_and_token(
+    store, proof_update
+):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    lease = store.acquire_lease(
+        "run-1",
+        "work-1",
+        "attempt-1",
+        "worker-a",
+        expires_at_monotonic=10.0,
+        expected_lease_epoch=0,
+    )
+    proof = lease.model_copy(update=proof_update)
+
+    with pytest.raises(LeaseConflictError):
+        store.append(
+            work_event("work-bad-proof", lease),
+            expected_sequence=1,
+            expected_state_revision=1,
+            lease=proof,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"nested": {"fencing_token": "not-even-a-live-token"}},
+        {"nested": {"clientSecret": "opaque"}},
+        {"nested": [{"proof": "fence-1-live-secret"}]},
+        {"nested": [{"proof": "password=opaque"}]},
+        {"authorization": "opaque"},
+    ],
+)
+def test_event_payload_recursively_rejects_sensitive_keys_and_values(payload):
+    with pytest.raises(ValueError, match="sensitive"):
+        audit_event("sensitive-payload").model_copy(update={"payload": payload})
+        HarnessEvent.model_validate(
+            audit_event("sensitive-payload").model_copy(
+                update={"payload": payload}
+            ).model_dump(mode="python")
+        )
+
+
+def test_transition_metadata_cannot_duplicate_live_fencing_credential():
+    candidate = run_event("sensitive-transition").model_copy(
+        update={
+            "transition": run_event("sensitive-transition").transition.model_copy(
+                update={"reason_code": "fence-1-live-secret"}
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="sensitive"):
+        HarnessEvent.model_validate(candidate.model_dump(mode="python"))
+
+
+def test_live_fencing_token_is_absent_from_event_and_outbox_json(store, tmp_path):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    lease = store.acquire_lease(
+        "run-1",
+        "work-1",
+        "attempt-1",
+        "worker-a",
+        expires_at_monotonic=10.0,
+        expected_lease_epoch=0,
+    )
+    committed = store.append(
+        work_event("work-leased", lease),
+        expected_sequence=1,
+        expected_state_revision=1,
+        lease=lease,
+    )
+
+    with sqlite3.connect(tmp_path / "session.sqlite3") as connection:
+        event_json = connection.execute(
+            "SELECT event_json FROM harness_events WHERE event_id = ?",
+            (committed.event_id,),
+        ).fetchone()[0]
+        outbox_json = connection.execute(
+            "SELECT event_json FROM harness_outbox WHERE event_id = ?",
+            (committed.event_id,),
+        ).fetchone()[0]
+        lease_row = connection.execute(
+            "SELECT * FROM harness_leases WHERE run_id = 'run-1'"
+        ).fetchone()
+    assert lease.fencing_token not in event_json
+    assert lease.fencing_token not in outbox_json
+    assert lease.fencing_token not in repr(lease_row)
+    assert lease_digest(lease.fencing_token) in event_json
+    assert lease_digest(lease.fencing_token) in lease_row
+    assert json.loads(event_json)["transition"]["lease_epoch"] == lease.lease_epoch

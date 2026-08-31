@@ -25,6 +25,7 @@ _PROMPT_VERSION = re.compile(r"^(?:(?:prompt|release)-v[0-9]+(?:\.[0-9]+){0,2}(?
 _SCHEMA_NAME = re.compile(r"^(?:[A-Z][A-Za-z0-9]{0,63}|[a-z][a-z0-9]*(?:_[a-z0-9]+){1,15}|legacy_identifier)$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _LEGACY_HASH_POLICY = "null_noncanonical_v1"
+_LEGACY_SEMANTIC_NAMESPACES = ("c96_", "old_")
 
 
 class AuditUnavailableError(RuntimeError):
@@ -457,10 +458,9 @@ def _has_legacy_semantic_signature(row: list[object]) -> bool:
                 _require_code(value)
     except ValueError:
         return False
-    return (
-        row[7] not in _ACTORS
-        and row[8] not in _EVENT_TYPES
-        and row[9] not in _STATUSES
+    return any(
+        all(value is None or str(value).startswith(namespace) for value in values)
+        for namespace in _LEGACY_SEMANTIC_NAMESPACES
     )
 
 

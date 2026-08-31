@@ -3,10 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from hashlib import sha256
 import json
+import math
 from pathlib import Path
+import re
 import secrets
 import sqlite3
-from typing import Iterable, Mapping, Protocol
+import time
+from typing import Callable, Iterable, Mapping, Protocol
 
 from pydantic import field_validator, model_validator
 
@@ -40,6 +43,52 @@ class LeaseConflictError(RuntimeError):
     """A lease epoch or fencing token is stale."""
 
 
+_SENSITIVE_KEY_MARKERS = (
+    "authorization",
+    "cookie",
+    "credential",
+    "fencingtoken",
+    "password",
+    "privatekey",
+    "secret",
+    "apikey",
+    "accesstoken",
+    "refreshtoken",
+)
+_SENSITIVE_VALUE = re.compile(
+    r"(?:\bbearer\s+|(?:^|[^a-z0-9])sk[-_]|fence-[0-9]+-|"
+    r"(?:password|secret|credential|api[ _-]?key|authorization)\s*[:=]|"
+    r"https?://\S+[?&](?:token|key|secret|signature)=|"
+    r"-----BEGIN[^\n]*PRIVATE KEY-----)",
+    re.IGNORECASE,
+)
+
+
+def _reject_sensitive_payload(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            compact_key = re.sub(r"[^a-z0-9]+", "", str(key).casefold())
+            if any(marker in compact_key for marker in _SENSITIVE_KEY_MARKERS):
+                raise ValueError("harness event payload contains a sensitive key")
+            _reject_sensitive_payload(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_sensitive_payload(item)
+    elif isinstance(value, str) and _SENSITIVE_VALUE.search(value):
+        raise ValueError("harness event payload contains a sensitive value")
+
+
+def _reject_sensitive_values(value: object) -> None:
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _reject_sensitive_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_sensitive_values(item)
+    elif isinstance(value, str) and _SENSITIVE_VALUE.search(value):
+        raise ValueError("harness event contains a sensitive value")
+
+
 class HarnessEvent(ContractModel):
     event_id: ShortText
     trace_id: ShortText
@@ -68,6 +117,22 @@ class HarnessEvent(ContractModel):
 
     @model_validator(mode="after")
     def validate_transition_identity(self) -> HarnessEvent:
+        _reject_sensitive_payload(self.payload)
+        if self.transition is not None:
+            _reject_sensitive_values(self.transition.model_dump(mode="python"))
+        for value in (
+            self.event_id,
+            self.trace_id,
+            self.span_id,
+            self.parent_span_id,
+            self.run_id,
+            self.work_item_id,
+            self.attempt_id,
+            self.event_type,
+            self.actor,
+        ):
+            if value is not None and _SENSITIVE_VALUE.search(value):
+                raise ValueError("harness event contains a sensitive value")
         if self.transition is None:
             return self
         if (
@@ -93,6 +158,7 @@ class HarnessEventStore(Protocol):
         *,
         expected_sequence: int,
         expected_state_revision: int,
+        lease: LeaseToken | None = None,
     ) -> HarnessEvent: ...
 
     def load(self, run_id: str) -> tuple[HarnessEvent, ...]: ...
@@ -166,6 +232,8 @@ def _apply_committed_event(
         raise EventIntegrityError("transition expected state revision is stale")
     if event.state_revision != view.state_revision + 1:
         raise EventIntegrityError("transition did not advance state revision")
+    if transition.plan_revision != view.plan_revision:
+        raise EventIntegrityError("transition plan revision differs from active plan revision")
     if transition.run_id != run_id or transition.trace_id != trace_id:
         raise EventIntegrityError("transition identity changed during replay")
 
@@ -253,8 +321,14 @@ def fold_events(events: Iterable[HarnessEvent]) -> HarnessSessionView:
 
 
 class SQLiteHarnessEventStore:
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._database_path = str(database_path)
+        self._monotonic = monotonic
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -298,7 +372,7 @@ class SQLiteHarnessEventStore:
                     "CREATE TABLE IF NOT EXISTS harness_leases ("
                     "run_id TEXT NOT NULL, work_item_id TEXT NOT NULL, "
                     "attempt_id TEXT NOT NULL, lease_epoch INTEGER NOT NULL, "
-                    "fencing_token TEXT NOT NULL, holder_id TEXT NOT NULL, "
+                    "fencing_token_digest TEXT NOT NULL, holder_id TEXT NOT NULL, "
                     "expires_at_monotonic REAL NOT NULL, "
                     "PRIMARY KEY(run_id, work_item_id), "
                     "FOREIGN KEY(run_id) REFERENCES harness_runs(run_id))"
@@ -342,13 +416,29 @@ class SQLiteHarnessEventStore:
         connection: sqlite3.Connection, run_id: str
     ) -> tuple[HarnessEvent, ...]:
         rows = connection.execute(
-            "SELECT event_json FROM harness_events "
+            "SELECT event_id, run_id, trace_id, sequence, state_revision, "
+            "event_hash, previous_event_hash, event_json FROM harness_events "
             "WHERE run_id = ? ORDER BY sequence", (run_id,)
         ).fetchall()
         try:
-            return tuple(HarnessEvent.model_validate_json(row[0]) for row in rows)
+            events = tuple(HarnessEvent.model_validate_json(row[7]) for row in rows)
         except Exception as error:
             raise EventIntegrityError("persisted harness event is invalid") from error
+        for row, event in zip(rows, events, strict=True):
+            if (
+                row[1] != run_id
+                or event.event_id != row[0]
+                or event.run_id != row[1]
+                or event.trace_id != row[2]
+                or event.sequence != row[3]
+                or event.state_revision != row[4]
+                or event.event_hash != row[5]
+                or event.previous_event_hash != row[6]
+            ):
+                raise EventIntegrityError(
+                    "persisted event JSON does not match row membership"
+                )
+        return events
 
     def append(
         self,
@@ -356,6 +446,7 @@ class SQLiteHarnessEventStore:
         *,
         expected_sequence: int,
         expected_state_revision: int,
+        lease: LeaseToken | None = None,
     ) -> HarnessEvent:
         event = _validated_event(event)
         if (
@@ -414,9 +505,9 @@ class SQLiteHarnessEventStore:
                         "transition expected state revision changed"
                     )
                 next_revision = state_revision + 1
-                self._validate_fencing(connection, event)
             else:
                 next_revision = state_revision
+            self._validate_lease_authorization(connection, event, lease)
             next_sequence = sequence + 1
             committed = event.model_copy(
                 update={
@@ -482,26 +573,68 @@ class SQLiteHarnessEventStore:
         finally:
             connection.close()
 
-    @staticmethod
-    def _validate_fencing(
-        connection: sqlite3.Connection, event: HarnessEvent
+    def _validate_lease_authorization(
+        self,
+        connection: sqlite3.Connection,
+        event: HarnessEvent,
+        lease: LeaseToken | None,
     ) -> None:
         transition = event.transition
-        if transition is None or transition.fencing_token is None:
+        if transition is None:
+            if lease is not None:
+                raise LeaseConflictError("non-transition cannot carry lease proof")
             return
-        if event.work_item_id is None:
-            raise LeaseConflictError("fencing token requires a work item")
+        if transition.entity_kind == "run":
+            if lease is not None:
+                raise LeaseConflictError("run transition cannot carry lease proof")
+            return
+        if lease is None:
+            raise LeaseConflictError("work transition requires out-of-band lease proof")
+        try:
+            lease = LeaseToken.model_validate(lease.model_dump(mode="python"))
+        except Exception as error:
+            raise LeaseConflictError("lease proof violates its strict contract") from error
+        if event.work_item_id is None or event.attempt_id is None:
+            raise LeaseConflictError("lease proof requires work and attempt identity")
+        if (
+            lease.run_id != event.run_id
+            or lease.work_item_id != event.work_item_id
+            or lease.attempt_id != event.attempt_id
+        ):
+            raise LeaseConflictError("lease proof identity does not match event")
+        if (
+            transition.lease_epoch != lease.lease_epoch
+            or transition.fencing_token_digest
+            != sha256(lease.fencing_token.encode("utf-8")).hexdigest()
+        ):
+            raise LeaseConflictError("lease proof does not match durable evidence")
         row = connection.execute(
-            "SELECT attempt_id, fencing_token FROM harness_leases "
+            "SELECT attempt_id, lease_epoch, fencing_token_digest, holder_id, "
+            "expires_at_monotonic FROM harness_leases "
             "WHERE run_id = ? AND work_item_id = ?",
             (event.run_id, event.work_item_id),
         ).fetchone()
         if (
             row is None
-            or row[1] != transition.fencing_token
-            or event.attempt_id != row[0]
+            or row[0] != lease.attempt_id
+            or row[1] != lease.lease_epoch
+            or not secrets.compare_digest(
+                str(row[2]), sha256(lease.fencing_token.encode("utf-8")).hexdigest()
+            )
+            or row[3] != lease.holder_id
+            or row[4] != lease.expires_at_monotonic
         ):
-            raise LeaseConflictError("stale lease fencing token")
+            raise LeaseConflictError("stale lease identity, epoch, or fencing token")
+        now = self._monotonic()
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(now)
+            or now < 0.0
+        ):
+            raise LeaseConflictError("monotonic clock returned an invalid point")
+        if now >= lease.expires_at_monotonic:
+            raise LeaseConflictError("lease proof is expired")
 
     def load(self, run_id: str) -> tuple[HarnessEvent, ...]:
         connection = self._connect()
@@ -556,12 +689,12 @@ class SQLiteHarnessEventStore:
             )
             connection.execute(
                 "INSERT INTO harness_leases "
-                "(run_id, work_item_id, attempt_id, lease_epoch, fencing_token, "
+                "(run_id, work_item_id, attempt_id, lease_epoch, fencing_token_digest, "
                 "holder_id, expires_at_monotonic) VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id, work_item_id) DO UPDATE SET "
                 "attempt_id = excluded.attempt_id, "
                 "lease_epoch = excluded.lease_epoch, "
-                "fencing_token = excluded.fencing_token, "
+                "fencing_token_digest = excluded.fencing_token_digest, "
                 "holder_id = excluded.holder_id, "
                 "expires_at_monotonic = excluded.expires_at_monotonic",
                 (
@@ -569,7 +702,7 @@ class SQLiteHarnessEventStore:
                     lease.work_item_id,
                     lease.attempt_id,
                     lease.lease_epoch,
-                    lease.fencing_token,
+                    sha256(lease.fencing_token.encode("utf-8")).hexdigest(),
                     lease.holder_id,
                     lease.expires_at_monotonic,
                 ),
