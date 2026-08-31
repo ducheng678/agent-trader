@@ -592,3 +592,75 @@ def test_failure_oscillation_rejects_missing_identity_but_stops_valid_a_b_a(loop
     assert loop_guard.observe_checkpoint(
         checkpoint("three", worker_id="worker-a", failure="source_failure")
     ).stop_reason == "cross_worker_failure_oscillation"
+
+
+class LyingList(list[str]):
+    calls = 0
+
+    def __len__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("subclass length must not be called")
+
+    def __iter__(self):
+        type(self).calls += 1
+        raise AssertionError("subclass iteration must not be called")
+
+
+class LyingTuple(tuple[str, ...]):
+    calls = 0
+
+    def __len__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("subclass length must not be called")
+
+    def __iter__(self):
+        type(self).calls += 1
+        raise AssertionError("subclass iteration must not be called")
+
+
+@pytest.mark.parametrize("sequence", [LyingList(["evidence-1"]), LyingTuple(("evidence-1",))])
+def test_sequence_subclasses_are_rejected_without_calling_attacker_methods(sequence):
+    type(sequence).calls = 0
+    with pytest.raises(ValueError, match="invalid result fingerprint input"):
+        build_result_fingerprint(
+            outcome_kind="answer", validated_output_hash=digest({"out": 1}),
+            normalized_error_class=None, normalized_error_code=None,
+            accepted_evidence_ids=sequence, tool_result_hashes=(), result_schema_version="v1",
+        )
+    assert type(sequence).calls == 0
+
+
+def test_precise_secret_checks_accept_legitimate_token_and_dotted_codes():
+    accepted = action_input(
+        {"event_type": "token_unlock", "symbol": "btc"},
+        worker_version="v1.2.3", model_route="route.v1.2",
+    )
+    assert accepted == action_input(
+        {"symbol": "BTC", "event_type": "token_unlock"},
+        worker_version="v1.2.3", model_route="route.v1.2",
+    )
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "aaaaaaaa.bbbbbbbb.cccccccc", "ghp_abcdefghijklmnopqrstuvwxyz123456",
+        "AKIAABCDEFGHIJKLMNOP", "sk-live-abcdefghijklmnopqrstuvwxyz",
+        "Bearer abcdefghijklmnop", "-----BEGIN PRIVATE KEY-----", "a" * 48,
+    ],
+)
+def test_precise_secret_checks_reject_credentials_without_echoing(secret):
+    with pytest.raises(ValueError) as error:
+        action_input({"label": secret})
+    assert secret not in str(error.value)
+
+
+def test_worker_ids_are_lowercase_ascii_and_shared_by_actions_and_failures():
+    with pytest.raises(ValueError):
+        action_input({"label": "one"}, worker_id="Worker-A")
+    with pytest.raises(ValueError):
+        action_input({"label": "one"}, worker_id="worker-а")
+    with pytest.raises(ValidationError):
+        checkpoint("one", worker_id="Worker-A", failure="source_failure")
+    with pytest.raises(ValidationError):
+        checkpoint("one", worker_id="worker-а", failure="source_failure")

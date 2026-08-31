@@ -68,6 +68,8 @@ SemanticScalar = StrictInt | ShortText
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _CODE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SYMBOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,15}$")
+_WORKER_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_JWT_RE = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$")
 
 
 def _digest(value: object) -> str:
@@ -263,6 +265,8 @@ class SemanticCheckpoint(_PublicContract):
             raise ValueError("failure metadata requires a normalized failure")
         if self.normalized_failure is not None and (self.worker_id is None or any(item is None for item in fields)):
             raise ValueError("normalized failure requires complete semantic route metadata")
+        if self.worker_id is not None and not _WORKER_ID_RE.fullmatch(self.worker_id):
+            raise ValueError("worker identifier must be canonical lowercase ASCII")
         return self
 
 
@@ -344,15 +348,23 @@ def _validate_argument_value(name: SemanticArgumentName, value: object) -> None:
 
 def _looks_sensitive(value: str) -> bool:
     lower = value.lower()
-    return any(marker in lower for marker in ("sk-", "ghp_", "akia", "secret", "password", "credential", "api_key", "token", "bearer", "private reasoning", "-----begin")) or lower.count(".") == 2
+    return bool(
+        _JWT_RE.fullmatch(value)
+        or re.fullmatch(r"ghp_[A-Za-z0-9]{20,}", value)
+        or re.fullmatch(r"AKIA[A-Z0-9]{16}", value)
+        or re.fullmatch(r"sk-live-[A-Za-z0-9-]+", value)
+        or re.match(r"(?i)^bearer\s+[A-Za-z0-9._-]{12,}$", value)
+        or value.startswith("-----BEGIN ")
+        or bool(re.search(r"(^|[_-])(secret|password|credential)([_-]|$)", lower))
+    )
 
 
 def _safe_code(value: str) -> bool:
-    return len(value) <= 64 and not _looks_sensitive(value)
+    return len(value) <= 32 and not _looks_sensitive(value)
 
 
 def _bounded_sequence(value: object, limit: int, message: str) -> tuple[object, ...]:
-    if not isinstance(value, (tuple, list)) or len(value) > limit:
+    if type(value) not in (tuple, list) or len(value) > limit:
         raise ValueError(message)
     return tuple(value)
 
@@ -384,7 +396,7 @@ def build_action_fingerprint(*, worker_id: str, worker_version: str, action_kind
     """Hash only the fixed semantic action schema; reject all undeclared inputs."""
     try:
         _reject_extra(extra, "invalid action fingerprint input")
-        if not all(_IDENTIFIER_RE.fullmatch(value) and _safe_code(value) for value in (worker_id, worker_version, action_kind, model_route)):
+        if not _WORKER_ID_RE.fullmatch(worker_id) or not all(_IDENTIFIER_RE.fullmatch(value) and _safe_code(value) for value in (worker_version, action_kind, model_route)):
             raise ValueError("invalid action fingerprint input")
         values = _ActionFingerprintInput(worker_id=worker_id, worker_version=worker_version, action_kind=action_kind, canonical_arguments=_arguments(canonical_arguments), context_hash=context_hash, dependency_hash=dependency_hash, plan_revision=plan_revision, prompt_hash=prompt_hash, tool_hash=tool_hash, output_schema_hash=output_schema_hash, model_route=model_route, correction_ordinal=correction_ordinal)
     except Exception:
