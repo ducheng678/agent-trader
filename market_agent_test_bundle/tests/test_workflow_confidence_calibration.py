@@ -60,3 +60,28 @@ def test_invalid_context_creates_sealed_no_trade_gate():
 def test_decision_direct_construction_enforces_cross_field_invariants():
     from pydantic import ValidationError
     with pytest.raises(ValidationError): ConfidenceDecision(score=Decimal("2"),may_succeed=False,next_action="succeed",reason_code="calibrated")
+
+@pytest.mark.parametrize("override",[
+ {"source_registry":(SourceRegistryRecord(source_id="official",registry_hash="d"*64,enabled=True),SourceRegistryRecord(source_id="official",registry_hash="9"*64,enabled=False))},
+ {"conflicts":(ConflictRecord(conflict_id="claim",evidence_ids=("e",),resolved=True,provenance_hash="c"*64),ConflictRecord(conflict_id="claim",evidence_ids=("e",),resolved=True,provenance_hash="9"*64))},
+ {"source_registry":(SourceRegistryRecord(source_id="extra",registry_hash="d"*64,enabled=True),)},
+])
+def test_canonical_snapshot_rejects_duplicate_or_exact_set_violations(override):
+    a=art(); assert not gate(a).evaluate(obs(**override),a).may_succeed
+
+
+def test_decimal_precision_cannot_round_invalid_artifact_into_range():
+    old=getcontext().prec
+    try:
+        getcontext().prec=2
+        with pytest.raises(Exception): art(feature_specs=tuple(ConfidenceFeatureSpec(feature_name=n,coefficient=Decimal(".334")) for n in FEATURE_ORDER),intercept=Decimal(".002"))
+        with pytest.raises(Exception): ConfidenceFeatureSpec(feature_name="required_evidence_coverage",coefficient=Decimal("1e-45"))
+    finally: getcontext().prec=old
+
+def test_decision_calibrated_payload_and_model_copy_require_bound_vector_hash():
+    from pydantic import ValidationError
+    a=art(); v=ConfidenceFeatureVector(artifact_hash=a.artifact_hash,features=tuple(ConfidenceFeatureValue(feature_name=n,value=Decimal(1)) for n in FEATURE_ORDER))
+    with pytest.raises(ValidationError): ConfidenceDecision(score=Decimal(".45"),may_succeed=False,next_action="one_recovery",reason_code="calibrated")
+    good=ConfidenceDecision(score=Decimal(".45"),feature_vector=v,artifact_hash=a.artifact_hash,may_succeed=False,next_action="one_recovery",reason_code="calibrated")
+    with pytest.raises(ValidationError): good.model_copy(update={"artifact_hash":"0"*64})
+    with pytest.raises(ValidationError): good.model_copy(update={"reason_code":"calibration_unavailable"})
