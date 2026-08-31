@@ -1,17 +1,19 @@
-"""Pure, deterministic validation and application of Harness transitions.
-
-This module deliberately has no event-store dependency.  It validates a
-candidate against a folded :class:`HarnessSessionView` and returns the next
-view only after the candidate is legal; persistence and live lease-token
-authorization remain the event store's responsibility.
-"""
+"""Pure, fail-closed validation and application of Harness transitions."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Annotated, Literal, Mapping
 
+from pydantic import Field, model_validator
+
+from market_agent.workflow_contracts import (
+    ContractModel,
+    Digest,
+    NonNegativeInt,
+    PositiveInt,
+    ShortText,
+)
 from market_agent.workflow_harness_contracts import (
     AttemptState,
     HarnessSessionView,
@@ -20,6 +22,10 @@ from market_agent.workflow_harness_contracts import (
     WorkItemState,
 )
 
+
+DependencyVersions = Annotated[
+    tuple[tuple[ShortText, NonNegativeInt], ...], Field(max_length=64)
+]
 
 RUN_TERMINAL_STATES = frozenset(
     {RunState.SUCCEEDED, RunState.DEGRADED, RunState.FAILED, RunState.CANCELLED}
@@ -42,7 +48,6 @@ ATTEMPT_TERMINAL_STATES = frozenset(
         AttemptState.CANCELLED,
     }
 )
-
 
 RUN_EDGES: Mapping[RunState | None, frozenset[RunState]] = MappingProxyType(
     {
@@ -88,7 +93,6 @@ RUN_EDGES: Mapping[RunState | None, frozenset[RunState]] = MappingProxyType(
         ),
     }
 )
-
 WORK_ITEM_EDGES: Mapping[WorkItemState | None, frozenset[WorkItemState]] = (
     MappingProxyType(
         {
@@ -108,7 +112,6 @@ WORK_ITEM_EDGES: Mapping[WorkItemState | None, frozenset[WorkItemState]] = (
         }
     )
 )
-
 ATTEMPT_EDGES: Mapping[AttemptState | None, frozenset[AttemptState]] = (
     MappingProxyType(
         {
@@ -130,7 +133,7 @@ class StateMachineError(RuntimeError):
 
 
 class InvalidTransitionError(StateMachineError):
-    """A source, target, or terminal-state guard is not legal."""
+    """A source, target, terminal, or required proof is not legal."""
 
 
 class StaleTransitionError(StateMachineError):
@@ -138,7 +141,7 @@ class StaleTransitionError(StateMachineError):
 
 
 class IdentityMismatchError(StateMachineError):
-    """A candidate does not belong to the folded run and trace."""
+    """A candidate or its evidence does not belong to the folded run."""
 
 
 class IdempotencyConflictError(StateMachineError):
@@ -146,7 +149,7 @@ class IdempotencyConflictError(StateMachineError):
 
 
 class DependencyVersionError(StateMachineError):
-    """A candidate's pinned dependency versions no longer match the fold."""
+    """Pinned dependency versions no longer match the folded view."""
 
 
 class LeaseEvidenceError(StateMachineError):
@@ -154,136 +157,142 @@ class LeaseEvidenceError(StateMachineError):
 
 
 class SideEffectReconciliationRequiredError(InvalidTransitionError):
-    """Unknown external effects must reconcile before failure or cancellation."""
+    """Unknown external effects require durable broker reconciliation."""
 
 
-@dataclass(frozen=True, slots=True)
-class TransitionValidation:
+class TransitionValidation(ContractModel):
     allowed: bool
-    reason: str | None = None
+    reason: ShortText | None = None
+
+    def __init__(
+        self, allowed: bool, reason: str | None = None, **values: object
+    ) -> None:
+        super().__init__(allowed=allowed, reason=reason, **values)
 
 
-@dataclass(frozen=True, slots=True)
-class PermanentFailureDecision:
-    """Trusted policy decision that seals a nonterminal run as failed.
+class _TransitionEvidence(ContractModel):
+    run_id: ShortText
+    trace_id: ShortText
+    entity_id: ShortText
+    expected_state_revision: NonNegativeInt
+    plan_revision: NonNegativeInt
+    dependency_versions: DependencyVersions
 
-    This is intentionally typed rather than an untrusted reason string passed
-    through a generic transition API.  The event store still atomically appends
-    the resulting transition and is the only persistence authority.
-    """
+    @model_validator(mode="after")
+    def validate_dependency_identifiers(self) -> _TransitionEvidence:
+        identifiers = tuple(identifier for identifier, _ in self.dependency_versions)
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("dependency versions must have unique identifiers")
+        return self
 
-    reason_code: str
-    idempotency_key: str
 
-    def transition(self, view: HarnessSessionView) -> HarnessTransition:
-        if view.run_id is None or view.trace_id is None or view.run_state is None:
-            raise InvalidTransitionError("permanent failure requires an active run")
-        if view.run_state in RUN_TERMINAL_STATES:
-            raise InvalidTransitionError("terminal run state is absorbing")
-        return HarnessTransition(
-            run_id=view.run_id,
-            trace_id=view.trace_id,
-            entity_kind="run",
-            entity_id=view.run_id,
-            from_state=view.run_state.value,
-            to_state=RunState.FAILED.value,
-            expected_state_revision=view.state_revision,
-            plan_revision=view.plan_revision,
-            reason_code=self.reason_code,
-            idempotency_key=self.idempotency_key,
-        )
+class RunTransitionEvidence(_TransitionEvidence):
+    """Strict folded evidence required for every ordinary run transition."""
+
+
+class _LeasedTransitionAuthorization(_TransitionEvidence):
+    reservation_id: ShortText
+    grant_id: ShortText
+    lease_epoch: PositiveInt
+    fencing_token_digest: Digest
+
+
+class WorkItemTransitionAuthorization(_LeasedTransitionAuthorization):
+    """Strict reservation, grant, and durable lease evidence for work items."""
+
+
+class AttemptTransitionAuthorization(_LeasedTransitionAuthorization):
+    """Strict reservation, grant, and durable lease evidence for attempts."""
+
+
+class ReconciliationResolution(ContractModel):
+    """A durable broker observation that resolves an unknown side effect."""
+
+    run_id: ShortText
+    trace_id: ShortText
+    entity_id: ShortText
+    expected_state_revision: NonNegativeInt
+    plan_revision: NonNegativeInt
+    reconciliation_id: ShortText
+    broker_observation_digest: Digest
+    side_effect_resolved: Literal[True]
+
+
+class StaleAttemptRetryAuthorization(ContractModel):
+    """Binds a stale attempt to its nonterminal owner's retry transition."""
+
+    run_id: ShortText
+    trace_id: ShortText
+    work_item_id: ShortText
+    attempt_id: ShortText
+    expected_state_revision: NonNegativeInt
+    plan_revision: NonNegativeInt
+    lease_epoch: PositiveInt
+    fencing_token_digest: Digest
+
+
+class PermanentFailureDecision(ContractModel):
+    """Trusted policy authority for failure outside declared ordinary edges."""
+
+    run_id: ShortText
+    trace_id: ShortText
+    expected_state_revision: NonNegativeInt
+    plan_revision: NonNegativeInt
+    from_state: RunState
+    reason_code: ShortText
+    idempotency_key: ShortText
+
+
+Candidate = HarnessTransition | PermanentFailureDecision
+Authorization = (
+    RunTransitionEvidence
+    | WorkItemTransitionAuthorization
+    | AttemptTransitionAuthorization
+)
 
 
 class GlobalTaskStateMachine:
-    """Validates and folds transitions without reading or persisting live secrets."""
+    """Applies only legal, evidence-bound transitions to a folded view."""
 
     def validate(
         self,
-        transition: HarnessTransition,
+        candidate: Candidate,
         view: HarnessSessionView,
         *,
-        dependency_versions: Mapping[str, int] | None = None,
-        reservation_granted: bool = True,
-        grant_granted: bool = True,
-        lease_epoch: int | None = None,
-        fencing_token_digest: str | None = None,
+        authorization: Authorization | None = None,
+        retry_authorization: StaleAttemptRetryAuthorization | None = None,
+        reconciliation_resolution: ReconciliationResolution | None = None,
     ) -> TransitionValidation:
-        """Return a deterministic decision for a transition against ``view``.
-
-        ``lease_epoch`` and ``fencing_token_digest`` are durable values only.
-        The raw fencing token is deliberately absent from this API: it is an
-        out-of-band credential checked solely by event-store append authority.
-        """
-        if not reservation_granted:
-            return TransitionValidation(False, "reservation was not granted")
-        if not grant_granted:
-            return TransitionValidation(False, "grant was not granted")
-        if transition.expected_state_revision != view.state_revision:
-            return TransitionValidation(False, "stale state revision")
-        if transition.plan_revision != view.plan_revision:
-            return TransitionValidation(False, "stale plan revision")
-        if transition.idempotency_key in view.applied_idempotency_keys:
+        if isinstance(candidate, PermanentFailureDecision):
+            return self._validate_permanent_failure(candidate, view)
+        rejected = self._validate_evidence(candidate, view, authorization)
+        if rejected is not None:
+            return rejected
+        if candidate.idempotency_key in view.applied_idempotency_keys:
             return TransitionValidation(False, "duplicate idempotency key")
-        if (
-            dependency_versions is not None
-            and tuple(sorted(dependency_versions.items()))
-            != view.dependency_versions
-        ):
-            return TransitionValidation(
-                False, "dependency versions do not match folded view"
-            )
-        if view.run_id is not None and transition.run_id != view.run_id:
-            return TransitionValidation(False, "run identity does not match folded view")
-        if view.trace_id is not None and transition.trace_id != view.trace_id:
-            return TransitionValidation(False, "trace identity does not match folded view")
-        if view.run_id is None and transition.entity_kind != "run":
-            return TransitionValidation(
-                False, "work and attempt transitions require an active run"
-            )
-        if transition.entity_kind != "run":
-            if lease_epoch is not None and transition.lease_epoch != lease_epoch:
-                return TransitionValidation(
-                    False, "lease epoch does not match durable evidence"
-                )
-            if (
-                fencing_token_digest is not None
-                and transition.fencing_token_digest != fencing_token_digest
-            ):
-                return TransitionValidation(
-                    False, "fencing digest does not match durable evidence"
-                )
-        return self._validate_edge(transition, view)
+        return self._validate_edge(
+            candidate, view, retry_authorization, reconciliation_resolution
+        )
 
     def apply(
         self,
-        candidate: HarnessTransition | PermanentFailureDecision,
+        candidate: Candidate,
         view: HarnessSessionView,
         *,
-        dependency_versions: Mapping[str, int] | None = None,
-        reservation_granted: bool = True,
-        grant_granted: bool = True,
-        lease_epoch: int | None = None,
-        fencing_token_digest: str | None = None,
-        external_side_effect_unknown: bool | None = None,
+        authorization: Authorization | None = None,
+        retry_authorization: StaleAttemptRetryAuthorization | None = None,
+        reconciliation_resolution: ReconciliationResolution | None = None,
     ) -> HarnessSessionView:
-        """Return the next folded view, or raise a typed error without mutation."""
-        transition = (
-            candidate.transition(view)
-            if isinstance(candidate, PermanentFailureDecision)
-            else candidate
-        )
         decision = self.validate(
-            transition,
+            candidate,
             view,
-            dependency_versions=dependency_versions,
-            reservation_granted=reservation_granted,
-            grant_granted=grant_granted,
-            lease_epoch=lease_epoch,
-            fencing_token_digest=fencing_token_digest,
+            authorization=authorization,
+            retry_authorization=retry_authorization,
+            reconciliation_resolution=reconciliation_resolution,
         )
         if not decision.allowed:
             raise _error_for(decision.reason)
-
+        transition = self._transition(candidate)
         changes: dict[str, object] = {
             "sequence": view.sequence + 1,
             "state_revision": view.state_revision + 1,
@@ -296,19 +305,9 @@ class GlobalTaskStateMachine:
             ),
         }
         if transition.entity_kind == "run":
-            target = RunState(transition.to_state)
-            changes["run_state"] = target
-            if external_side_effect_unknown is None:
-                # Leaving a folded unknown-effect wait is necessarily preceded
-                # by a broker observation; model that resolved observation in
-                # the resulting view without persisting a raw broker credential.
-                changes["external_side_effect_unknown"] = (
-                    view.external_side_effect_unknown
-                    if target is RunState.WAITING_RECONCILIATION
-                    else False
-                )
-            else:
-                changes["external_side_effect_unknown"] = external_side_effect_unknown
+            changes["run_state"] = RunState(transition.to_state)
+            if reconciliation_resolution is not None:
+                changes["external_side_effect_unknown"] = False
         elif transition.entity_kind == "work_item":
             changes["work_item_states"] = _replace_state(
                 view.work_item_states,
@@ -325,51 +324,104 @@ class GlobalTaskStateMachine:
             view.model_copy(update=changes).model_dump(mode="python")
         )
 
+    def _validate_evidence(
+        self,
+        transition: HarnessTransition,
+        view: HarnessSessionView,
+        authorization: Authorization | None,
+    ) -> TransitionValidation | None:
+        expected_type: type[Authorization]
+        if transition.entity_kind == "run":
+            expected_type = RunTransitionEvidence
+        elif transition.entity_kind == "work_item":
+            expected_type = WorkItemTransitionAuthorization
+        else:
+            expected_type = AttemptTransitionAuthorization
+        if authorization is None:
+            return TransitionValidation(False, "required transition evidence is missing")
+        if type(authorization) is not expected_type:
+            return TransitionValidation(False, "transition evidence type is incompatible")
+        if authorization.run_id != transition.run_id or (
+            view.run_id is not None and authorization.run_id != view.run_id
+        ):
+            return TransitionValidation(False, "evidence run identity does not match")
+        if (
+            authorization.trace_id != transition.trace_id
+            or (view.trace_id is not None and authorization.trace_id != view.trace_id)
+            or authorization.entity_id != transition.entity_id
+        ):
+            return TransitionValidation(False, "evidence identity does not match")
+        if (
+            authorization.expected_state_revision != transition.expected_state_revision
+            or authorization.expected_state_revision != view.state_revision
+        ):
+            return TransitionValidation(False, "evidence state revision is stale")
+        if (
+            authorization.plan_revision != transition.plan_revision
+            or authorization.plan_revision != view.plan_revision
+        ):
+            return TransitionValidation(False, "evidence plan revision is stale")
+        if authorization.dependency_versions != view.dependency_versions:
+            return TransitionValidation(False, "evidence dependency versions do not match")
+        if isinstance(authorization, _LeasedTransitionAuthorization) and (
+            authorization.lease_epoch != transition.lease_epoch
+            or authorization.fencing_token_digest != transition.fencing_token_digest
+        ):
+            return TransitionValidation(False, "durable lease evidence does not match")
+        return None
+
     def _validate_edge(
-        self, transition: HarnessTransition, view: HarnessSessionView
+        self,
+        transition: HarnessTransition,
+        view: HarnessSessionView,
+        retry_authorization: StaleAttemptRetryAuthorization | None,
+        reconciliation_resolution: ReconciliationResolution | None,
     ) -> TransitionValidation:
         if transition.entity_kind == "run":
-            return self._validate_run(transition, view)
+            return self._validate_run(transition, view, reconciliation_resolution)
+        if reconciliation_resolution is not None:
+            return TransitionValidation(False, "reconciliation proof requires run transition")
         if transition.entity_kind == "work_item":
-            return self._validate_work_item(transition, view)
+            return self._validate_work_item(transition, view, retry_authorization)
+        if retry_authorization is not None:
+            return TransitionValidation(False, "retry proof requires work-item transition")
         return self._validate_attempt(transition, view)
 
     @staticmethod
     def _validate_run(
-        transition: HarnessTransition, view: HarnessSessionView
+        transition: HarnessTransition,
+        view: HarnessSessionView,
+        resolution: ReconciliationResolution | None,
     ) -> TransitionValidation:
         if transition.entity_id != transition.run_id:
-            return TransitionValidation(
-                False, "run entity identity does not match run"
-            )
+            return TransitionValidation(False, "run entity identity does not match")
         try:
             target = RunState(transition.to_state)
         except ValueError:
             return TransitionValidation(False, "unknown run target state")
         source = view.run_state
         if transition.from_state != (source.value if source is not None else "none"):
-            return TransitionValidation(
-                False, "run source state does not match folded view"
-            )
+            return TransitionValidation(False, "run source state does not match")
         if source in RUN_TERMINAL_STATES:
             return TransitionValidation(False, "terminal run state is absorbing")
-        if view.external_side_effect_unknown and target in {
-            RunState.FAILED,
-            RunState.CANCELLED,
-        }:
-            return TransitionValidation(
-                False, "unknown external effects require reconciliation"
-            )
-        allowed = set(RUN_EDGES.get(source, frozenset()))
-        if source not in RUN_TERMINAL_STATES:
-            allowed.update({RunState.FAILED, RunState.CANCELLED})
-        if target not in allowed:
+        if view.external_side_effect_unknown:
+            if not _resolution_matches(resolution, transition, view):
+                return TransitionValidation(
+                    False, "unknown external effects require reconciliation"
+                )
+            if source is not RunState.WAITING_RECONCILIATION or target is not RunState.RECONCILING:
+                return TransitionValidation(False, "reconciliation proof has invalid edge")
+        elif resolution is not None:
+            return TransitionValidation(False, "reconciliation proof is not applicable")
+        if target not in RUN_EDGES.get(source, frozenset()):
             return TransitionValidation(False, "illegal run transition")
-        return TransitionValidation(True)
+        return TransitionValidation(allowed=True)
 
     @staticmethod
     def _validate_work_item(
-        transition: HarnessTransition, view: HarnessSessionView
+        transition: HarnessTransition,
+        view: HarnessSessionView,
+        retry: StaleAttemptRetryAuthorization | None,
     ) -> TransitionValidation:
         try:
             target = WorkItemState(transition.to_state)
@@ -377,23 +429,21 @@ class GlobalTaskStateMachine:
             return TransitionValidation(False, "unknown work-item target state")
         source = dict(view.work_item_states).get(transition.entity_id)
         if transition.from_state != (source.value if source is not None else "none"):
-            return TransitionValidation(
-                False, "work-item source state does not match folded view"
-            )
+            return TransitionValidation(False, "work-item source state does not match")
         if source in WORK_ITEM_TERMINAL_STATES:
             return TransitionValidation(False, "terminal work-item state is absorbing")
+        if target is WorkItemState.RETRY_WAIT:
+            return _validate_retry_authorization(retry, transition, view, source)
+        if retry is not None:
+            return TransitionValidation(False, "retry proof is only valid for retry wait")
         allowed = set(WORK_ITEM_EDGES.get(source, frozenset()))
         if source is not None:
             allowed.update(
-                {
-                    WorkItemState.BLOCKED,
-                    WorkItemState.FAILED,
-                    WorkItemState.CANCELLED,
-                }
+                {WorkItemState.BLOCKED, WorkItemState.FAILED, WorkItemState.CANCELLED}
             )
         if target not in allowed:
             return TransitionValidation(False, "illegal work-item transition")
-        return TransitionValidation(True)
+        return TransitionValidation(allowed=True)
 
     @staticmethod
     def _validate_attempt(
@@ -405,9 +455,7 @@ class GlobalTaskStateMachine:
             return TransitionValidation(False, "unknown attempt target state")
         source = dict(view.attempt_states).get(transition.entity_id)
         if transition.from_state != (source.value if source is not None else "none"):
-            return TransitionValidation(
-                False, "attempt source state does not match folded view"
-            )
+            return TransitionValidation(False, "attempt source state does not match")
         if source in ATTEMPT_TERMINAL_STATES:
             return TransitionValidation(False, "terminal attempt state is absorbing")
         allowed = set(ATTEMPT_EDGES.get(source, frozenset()))
@@ -423,7 +471,95 @@ class GlobalTaskStateMachine:
             )
         if target not in allowed:
             return TransitionValidation(False, "illegal attempt transition")
-        return TransitionValidation(True)
+        return TransitionValidation(allowed=True)
+
+    @staticmethod
+    def _validate_permanent_failure(
+        decision: PermanentFailureDecision, view: HarnessSessionView
+    ) -> TransitionValidation:
+        if view.run_id is None or view.trace_id is None or view.run_state is None:
+            return TransitionValidation(False, "permanent failure requires active run")
+        if view.run_state in RUN_TERMINAL_STATES:
+            return TransitionValidation(False, "terminal run state is absorbing")
+        if view.external_side_effect_unknown:
+            return TransitionValidation(
+                False, "unknown external effects require reconciliation"
+            )
+        if decision.run_id != view.run_id or decision.trace_id != view.trace_id:
+            return TransitionValidation(False, "permanent failure identity does not match")
+        if decision.from_state is not view.run_state:
+            return TransitionValidation(False, "permanent failure source state does not match")
+        if decision.expected_state_revision != view.state_revision:
+            return TransitionValidation(False, "permanent failure state revision is stale")
+        if decision.plan_revision != view.plan_revision:
+            return TransitionValidation(False, "permanent failure plan revision is stale")
+        if decision.idempotency_key in view.applied_idempotency_keys:
+            return TransitionValidation(False, "duplicate idempotency key")
+        return TransitionValidation(allowed=True)
+
+    @staticmethod
+    def _transition(candidate: Candidate) -> HarnessTransition:
+        if isinstance(candidate, HarnessTransition):
+            return candidate
+        return HarnessTransition(
+            run_id=candidate.run_id,
+            trace_id=candidate.trace_id,
+            entity_kind="run",
+            entity_id=candidate.run_id,
+            from_state=candidate.from_state.value,
+            to_state=RunState.FAILED.value,
+            expected_state_revision=candidate.expected_state_revision,
+            plan_revision=candidate.plan_revision,
+            reason_code=candidate.reason_code,
+            idempotency_key=candidate.idempotency_key,
+        )
+
+
+def _resolution_matches(
+    resolution: ReconciliationResolution | None,
+    transition: HarnessTransition,
+    view: HarnessSessionView,
+) -> bool:
+    return resolution is not None and (
+        resolution.run_id == transition.run_id == view.run_id
+        and resolution.trace_id == transition.trace_id == view.trace_id
+        and resolution.entity_id == transition.entity_id
+        and resolution.expected_state_revision
+        == transition.expected_state_revision
+        == view.state_revision
+        and resolution.plan_revision == transition.plan_revision == view.plan_revision
+    )
+
+
+def _validate_retry_authorization(
+    retry: StaleAttemptRetryAuthorization | None,
+    transition: HarnessTransition,
+    view: HarnessSessionView,
+    source: WorkItemState | None,
+) -> TransitionValidation:
+    if source not in {
+        WorkItemState.LEASED,
+        WorkItemState.RUNNING,
+        WorkItemState.VALIDATING,
+    }:
+        return TransitionValidation(False, "retry wait source is not retryable")
+    if retry is None:
+        return TransitionValidation(False, "stale attempt retry proof is missing")
+    if (
+        retry.run_id != transition.run_id == view.run_id
+        or retry.trace_id != transition.trace_id == view.trace_id
+        or retry.work_item_id != transition.entity_id
+        or retry.expected_state_revision != transition.expected_state_revision
+        or retry.expected_state_revision != view.state_revision
+        or retry.plan_revision != transition.plan_revision
+        or retry.plan_revision != view.plan_revision
+        or retry.lease_epoch != transition.lease_epoch
+        or retry.fencing_token_digest != transition.fencing_token_digest
+    ):
+        return TransitionValidation(False, "stale attempt retry proof does not match")
+    if dict(view.attempt_states).get(retry.attempt_id) is not AttemptState.STALE:
+        return TransitionValidation(False, "retry attempt is not stale")
+    return TransitionValidation(allowed=True)
 
 
 def _replace_state(
@@ -436,7 +572,7 @@ def _replace_state(
 
 def _error_for(reason: str | None) -> StateMachineError:
     message = reason or "state-machine validation failed"
-    if message.startswith("stale"):
+    if "stale" in message and "attempt" not in message:
         return StaleTransitionError(message)
     if "identity" in message:
         return IdentityMismatchError(message)
@@ -444,7 +580,7 @@ def _error_for(reason: str | None) -> StateMachineError:
         return IdempotencyConflictError(message)
     if "dependency" in message:
         return DependencyVersionError(message)
-    if "lease" in message or "fencing" in message:
+    if "lease" in message:
         return LeaseEvidenceError(message)
     if "unknown external effects" in message:
         return SideEffectReconciliationRequiredError(message)
