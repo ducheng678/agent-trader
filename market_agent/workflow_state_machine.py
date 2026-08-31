@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from types import MappingProxyType
-from typing import Annotated, Literal, Mapping
+from typing import Annotated, Literal, Mapping, cast
 
 from pydantic import Field, model_validator
 
@@ -252,6 +253,99 @@ Authorization = (
     | WorkItemTransitionAuthorization
     | AttemptTransitionAuthorization
 )
+_ValidatedInputs = tuple[
+    Candidate,
+    HarnessSessionView,
+    Authorization | None,
+    StaleAttemptRetryAuthorization | None,
+    ReconciliationResolution | None,
+]
+
+_SENSITIVE_VALUE = re.compile(
+    r"(?:\bbearer\s+|(?:^|[^a-z0-9])sk[-_]|fence-[0-9]+-|"
+    r"(?:password|secret|credential|api[ _-]?key|authorization)\s*[:=]|"
+    r"https?://\S+[?&](?:token|key|secret|signature)=|"
+    r"-----BEGIN[^\n]*PRIVATE KEY-----)",
+    re.IGNORECASE,
+)
+_INVALID_PUBLIC_INPUT = "invalid state-machine input"
+
+
+def _reject_undeclared_model_fields(value: object) -> None:
+    if isinstance(value, ContractModel):
+        declared_fields = type(value).model_fields
+        if set(value.__dict__).difference(declared_fields):
+            raise ValueError("contract model contains undeclared fields")
+        for item in value.__dict__.values():
+            _reject_undeclared_model_fields(item)
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            _reject_undeclared_model_fields(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_undeclared_model_fields(item)
+
+
+def _reject_sensitive_values(value: object) -> None:
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _reject_sensitive_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_sensitive_values(item)
+    elif isinstance(value, str) and _SENSITIVE_VALUE.search(value):
+        raise ValueError("state-machine input contains a sensitive value")
+
+
+def _fresh_contract(
+    value: object, allowed_types: tuple[type[ContractModel], ...]
+) -> ContractModel:
+    if not isinstance(value, ContractModel) or type(value) not in allowed_types:
+        raise TypeError("state-machine input has an incompatible contract type")
+    _reject_undeclared_model_fields(value)
+    values = value.model_dump(mode="python", exclude_unset=True)
+    _reject_sensitive_values(values)
+    return type(value).model_validate(values)
+
+
+def _fresh_optional_contract(
+    value: object | None, allowed_types: tuple[type[ContractModel], ...]
+) -> ContractModel | None:
+    if value is None:
+        return None
+    return _fresh_contract(value, allowed_types)
+
+
+def _revalidate_public_inputs(
+    candidate: Candidate,
+    view: HarnessSessionView,
+    authorization: Authorization | None,
+    retry_authorization: StaleAttemptRetryAuthorization | None,
+    reconciliation_resolution: ReconciliationResolution | None,
+) -> _ValidatedInputs:
+    return cast(
+        _ValidatedInputs,
+        (
+            _fresh_contract(
+                candidate, (HarnessTransition, PermanentFailureDecision)
+            ),
+            _fresh_contract(view, (HarnessSessionView,)),
+            _fresh_optional_contract(
+                authorization,
+                (
+                    RunTransitionEvidence,
+                    WorkItemTransitionAuthorization,
+                    AttemptTransitionAuthorization,
+                ),
+            ),
+            _fresh_optional_contract(
+                retry_authorization, (StaleAttemptRetryAuthorization,)
+            ),
+            _fresh_optional_contract(
+                reconciliation_resolution, (ReconciliationResolution,)
+            ),
+        ),
+    )
 
 
 class GlobalTaskStateMachine:
@@ -265,6 +359,26 @@ class GlobalTaskStateMachine:
         authorization: Authorization | None = None,
         retry_authorization: StaleAttemptRetryAuthorization | None = None,
         reconciliation_resolution: ReconciliationResolution | None = None,
+    ) -> TransitionValidation:
+        try:
+            validated = _revalidate_public_inputs(
+                candidate,
+                view,
+                authorization,
+                retry_authorization,
+                reconciliation_resolution,
+            )
+        except Exception:
+            return TransitionValidation(False, _INVALID_PUBLIC_INPUT)
+        return self._validate_revalidated(*validated)
+
+    def _validate_revalidated(
+        self,
+        candidate: Candidate,
+        view: HarnessSessionView,
+        authorization: Authorization | None,
+        retry_authorization: StaleAttemptRetryAuthorization | None,
+        reconciliation_resolution: ReconciliationResolution | None,
     ) -> TransitionValidation:
         if isinstance(candidate, PermanentFailureDecision):
             return self._validate_permanent_failure(candidate, view)
@@ -286,13 +400,24 @@ class GlobalTaskStateMachine:
         retry_authorization: StaleAttemptRetryAuthorization | None = None,
         reconciliation_resolution: ReconciliationResolution | None = None,
     ) -> HarnessSessionView:
-        decision = self.validate(
+        try:
+            validated = _revalidate_public_inputs(
+                candidate,
+                view,
+                authorization,
+                retry_authorization,
+                reconciliation_resolution,
+            )
+        except Exception as error:
+            raise InvalidTransitionError(_INVALID_PUBLIC_INPUT) from error
+        (
             candidate,
             view,
-            authorization=authorization,
-            retry_authorization=retry_authorization,
-            reconciliation_resolution=reconciliation_resolution,
-        )
+            authorization,
+            retry_authorization,
+            reconciliation_resolution,
+        ) = validated
+        decision = self._validate_revalidated(*validated)
         if not decision.allowed:
             raise _error_for(decision.reason)
         transition = self._transition(candidate)

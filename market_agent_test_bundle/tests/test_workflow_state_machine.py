@@ -896,3 +896,262 @@ def test_reconciliation_rejects_competing_record_in_the_same_semantic_scope(mach
         authorization=evidence,
         reconciliation_resolution=resolution,
     ).allowed
+
+
+def _assert_public_boundary_rejects(
+    machine: GlobalTaskStateMachine,
+    candidate: HarnessTransition | PermanentFailureDecision,
+    view: HarnessSessionView,
+    **kwargs: object,
+) -> None:
+    assert not machine.validate(candidate, view, **kwargs).allowed
+    with pytest.raises(InvalidTransitionError):
+        machine.apply(candidate, view, **kwargs)
+
+
+def test_public_boundary_revalidates_conflicting_transition_authorities(machine):
+    view = run_view(RunState.RUNNING)
+    candidate = run_transition(RunState.RUNNING, RunState.SUMMARIZING)
+    evidence = authorization_for(candidate, view)
+    authoritative = folded_authority_view(view, candidate, evidence)
+    competing = authoritative.transition_authorities[0].model_copy(
+        update={"reason_code": "competing_authority"}
+    )
+    bypassed = authoritative.model_copy(
+        update={
+            "transition_authorities": (
+                *authoritative.transition_authorities,
+                competing,
+            )
+        }
+    )
+
+    _assert_public_boundary_rejects(
+        machine, candidate, bypassed, authorization=evidence
+    )
+
+
+def test_public_boundary_revalidates_conflicting_attempt_ownership(machine):
+    view = HarnessSessionView(
+        run_id="run-1",
+        trace_id="trace-1",
+        run_state=RunState.RUNNING,
+        work_item_states=(("work-1", WorkItemState.RUNNING),),
+        attempt_states=(("attempt-1", AttemptState.STALE),),
+        state_revision=3,
+        plan_revision=2,
+    )
+    candidate = work_transition(WorkItemState.RUNNING, WorkItemState.RETRY_WAIT)
+    evidence = authorization_for(candidate, view)
+    retry = StaleAttemptRetryAuthorization(
+        run_id="run-1",
+        trace_id="trace-1",
+        work_item_id="work-1",
+        attempt_id="attempt-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        lease_epoch=4,
+        fencing_token_digest=HASH,
+    )
+    authoritative = folded_authority_view(
+        view, candidate, evidence, retry_authorization=retry
+    )
+    competing = authoritative.attempt_work_item_owners[0].model_copy(
+        update={"work_item_id": "work-2"}
+    )
+    bypassed = authoritative.model_copy(
+        update={
+            "attempt_work_item_owners": (
+                *authoritative.attempt_work_item_owners,
+                competing,
+            )
+        }
+    )
+
+    _assert_public_boundary_rejects(
+        machine,
+        candidate,
+        bypassed,
+        authorization=evidence,
+        retry_authorization=retry,
+    )
+
+
+def test_public_boundary_revalidates_conflicting_reconciliation_resolutions(machine):
+    resolution = ReconciliationResolutionRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        reconciliation_id="broker-observation-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        broker_observation_digest=HASH,
+        side_effect_resolved=True,
+    )
+    authoritative = run_view(
+        RunState.ADMITTED, reconciliation_resolutions=(resolution,)
+    )
+    competing = resolution.model_copy(
+        update={
+            "reconciliation_id": "broker-observation-2",
+            "broker_observation_digest": "b" * 64,
+        }
+    )
+    bypassed = authoritative.model_copy(
+        update={"reconciliation_resolutions": (resolution, competing)}
+    )
+    decision = PermanentFailureDecision(
+        run_id="run-1",
+        trace_id="trace-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        from_state=RunState.ADMITTED,
+        reason_code="configuration_failure",
+        idempotency_key="failure-invalid-resolution-view",
+    )
+
+    _assert_public_boundary_rejects(machine, decision, bypassed)
+
+
+@pytest.mark.parametrize(
+    "payload_kind",
+    [
+        "transition_cross_field",
+        "transition_sensitive_value",
+        "authorization_strict_value",
+        "authorization_sensitive_value",
+        "retry_strict_value",
+        "resolution_cross_field",
+        "decision_strict_value",
+        "decision_sensitive_value",
+        "decision_extra_field",
+    ],
+)
+def test_public_boundary_revalidates_every_model_copy_crafted_payload(
+    machine, payload_kind
+):
+    if payload_kind.startswith("transition"):
+        view = run_view(RunState.RUNNING)
+        candidate = run_transition(RunState.RUNNING, RunState.SUMMARIZING)
+        if payload_kind == "transition_cross_field":
+            forged_candidate = candidate.model_copy(
+                update={"lease_epoch": 4, "fencing_token_digest": HASH}
+            )
+        else:
+            forged_candidate = candidate.model_copy(
+                update={"reason_code": "sk-live-secret"}
+            )
+        evidence = authorization_for(forged_candidate, view)
+        authoritative = folded_authority_view(view, forged_candidate, evidence)
+        inputs = (forged_candidate, authoritative, {"authorization": evidence})
+    elif payload_kind.startswith("authorization"):
+        view = work_view(WorkItemState.READY)
+        candidate = work_transition(
+            WorkItemState.READY, WorkItemState.LEASED, lease_epoch=1
+        )
+        evidence = authorization_for(candidate, view)
+        update = (
+            {"lease_epoch": True}
+            if payload_kind == "authorization_strict_value"
+            else {"grant_id": "sk-live-secret"}
+        )
+        forged_evidence = evidence.model_copy(update=update)
+        authoritative = folded_authority_view(view, candidate, evidence)
+        if payload_kind == "authorization_sensitive_value":
+            sensitive_record = authoritative.transition_authorities[0].model_copy(
+                update=update
+            )
+            authoritative = authoritative.model_copy(
+                update={"transition_authorities": (sensitive_record,)}
+            )
+        inputs = (candidate, authoritative, {"authorization": forged_evidence})
+    elif payload_kind == "retry_strict_value":
+        view = work_view(
+            WorkItemState.RUNNING,
+            attempt_states=(("attempt-1", AttemptState.STALE),),
+        )
+        candidate = work_transition(
+            WorkItemState.RUNNING, WorkItemState.RETRY_WAIT, lease_epoch=1
+        )
+        evidence = authorization_for(candidate, view)
+        retry = StaleAttemptRetryAuthorization(
+            run_id="run-1",
+            trace_id="trace-1",
+            work_item_id="work-1",
+            attempt_id="attempt-1",
+            expected_state_revision=3,
+            plan_revision=2,
+            lease_epoch=1,
+            fencing_token_digest=HASH,
+        )
+        authoritative = folded_authority_view(
+            view, candidate, evidence, retry_authorization=retry
+        )
+        inputs = (
+            candidate,
+            authoritative,
+            {
+                "authorization": evidence,
+                "retry_authorization": retry.model_copy(
+                    update={"lease_epoch": True}
+                ),
+            },
+        )
+    elif payload_kind == "resolution_cross_field":
+        view = run_view(
+            RunState.WAITING_RECONCILIATION,
+            external_side_effect_unknown=True,
+        )
+        candidate = run_transition(
+            RunState.WAITING_RECONCILIATION, RunState.RECONCILING
+        )
+        evidence = authorization_for(candidate, view)
+        resolution = ReconciliationResolution(
+            run_id="run-1",
+            trace_id="trace-1",
+            entity_id="run-1",
+            expected_state_revision=3,
+            plan_revision=2,
+            reconciliation_id="broker-observation-1",
+            broker_observation_digest=HASH,
+            side_effect_resolved=True,
+        )
+        authoritative = folded_authority_view(
+            view,
+            candidate,
+            evidence,
+            reconciliation_resolution=resolution,
+        )
+        inputs = (
+            candidate,
+            authoritative,
+            {
+                "authorization": evidence,
+                "reconciliation_resolution": resolution.model_copy(
+                    update={"side_effect_resolved": False}
+                ),
+            },
+        )
+    else:
+        view = run_view(RunState.ADMITTED, state_revision=1)
+        decision = PermanentFailureDecision(
+            run_id="run-1",
+            trace_id="trace-1",
+            expected_state_revision=1,
+            plan_revision=2,
+            from_state=RunState.ADMITTED,
+            reason_code="configuration_failure",
+            idempotency_key="failure-model-copy-boundary",
+        )
+        if payload_kind == "decision_strict_value":
+            forged_decision = decision.model_copy(
+                update={"expected_state_revision": True}
+            )
+        elif payload_kind == "decision_sensitive_value":
+            forged_decision = decision.model_copy(
+                update={"reason_code": "password=live-secret"}
+            )
+        else:
+            forged_decision = decision.model_copy(update={"unexpected": True})
+        inputs = (forged_decision, view, {})
+
+    _assert_public_boundary_rejects(machine, inputs[0], inputs[1], **inputs[2])
