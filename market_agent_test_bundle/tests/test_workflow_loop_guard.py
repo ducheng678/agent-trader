@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+import hashlib
+import json
+
+import pytest
+from pydantic import ValidationError
+
+from market_agent.workflow_harness_contracts import ProgressVector
+from market_agent.workflow_loop_guard import (
+    ActionFingerprint,
+    ActionObservationFingerprint,
+    CycleSignature,
+    LoopGuard,
+    ResultFingerprint,
+    SemanticCheckpoint,
+    SeverityPolicy,
+    build_action_fingerprint,
+    build_result_fingerprint,
+    build_state_fingerprint,
+    compare_progress,
+)
+
+
+def digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def progress(**overrides: object) -> ProgressVector:
+    values: dict[str, object] = {
+        "completed_dependency_count": 0,
+        "valid_required_field_count": 0,
+        "filled_required_evidence_slot_count": 0,
+        "fresh_authoritative_source_coverage": 0.0,
+        "missing_evidence_count": 1,
+        "validation_error_count": 0,
+        "unresolved_conflict_count": 0,
+        "risk_invariant_failure_count": 0,
+    }
+    values.update(overrides)
+    return ProgressVector(**values)
+
+
+def severity_policy() -> SeverityPolicy:
+    return SeverityPolicy(
+        policy_version="severity-v1",
+        critical_positive_regressions=(
+            "filled_required_evidence_slot_count",
+            "fresh_authoritative_source_coverage",
+        ),
+        critical_negative_regressions=(
+            "validation_error_count",
+            "risk_invariant_failure_count",
+        ),
+    )
+
+
+def action(label: str, *, worker_id: str = "worker-a") -> ActionFingerprint:
+    return build_action_fingerprint(
+        worker_id=worker_id,
+        worker_version="v1",
+        action_kind="inspect",
+        canonical_arguments={"label": label},
+        context_hash=digest({"context": "fixed"}),
+        dependency_hash=digest({"dependency": "fixed"}),
+        plan_revision=1,
+        prompt_hash=digest({"prompt": "v1"}),
+        tool_hash=digest({"tool": "v1"}),
+        output_schema_hash=digest({"schema": "v1"}),
+        model_route="fixed-route",
+        correction_ordinal=0,
+    )
+
+
+def result(label: str, *, error_code: str | None = None) -> ResultFingerprint:
+    return build_result_fingerprint(
+        outcome_kind="failed" if error_code else "answer",
+        validated_output_hash=digest({"output": label}),
+        normalized_error_class="source_failure" if error_code else None,
+        normalized_error_code=error_code,
+        accepted_evidence_ids=("evidence-1",),
+        tool_result_hashes=(digest({"tool-result": label}),),
+        result_schema_version="result-v1",
+    )
+
+
+def action_observation(
+    action_label: str, result_label: str, *, worker_id: str = "worker-a"
+) -> ActionObservationFingerprint:
+    return ActionObservationFingerprint.from_parts(
+        action(action_label, worker_id=worker_id), result(result_label)
+    )
+
+
+def checkpoint(
+    label: str,
+    *,
+    current_progress: ProgressVector | None = None,
+    semantic: bool = True,
+    scope: str = "attempt",
+    worker_id: str = "worker-a",
+    failure: str | None = None,
+) -> SemanticCheckpoint:
+    return SemanticCheckpoint(
+        scope=scope,
+        state_fingerprint=build_state_fingerprint(
+            run_state="running",
+            work_item_state="running",
+            attempt_state="validating",
+            stage_id="analysis",
+            plan_revision=1,
+            unresolved_work_ids=(label,),
+            dependency_versions=(("input", 1),),
+            progress=current_progress or progress(),
+            normalized_error_class=failure,
+        ),
+        progress=current_progress or progress(),
+        plan_revision=1,
+        fingerprint_schema_version="v1",
+        semantic=semantic,
+        worker_id=worker_id,
+        normalized_failure=failure,
+        failure_context_hash=digest({"context": "fixed"}) if failure else None,
+        failure_dependency_hash=digest({"dependency": "fixed"}) if failure else None,
+        correction_ordinal=0,
+        model_route="fixed-route" if failure else None,
+    )
+
+
+@pytest.fixture
+def loop_guard() -> LoopGuard:
+    return LoopGuard(severity_policy=severity_policy())
+
+
+def test_third_identical_action_result_stops_work(loop_guard: LoopGuard):
+    observation = action_observation("same-action", "same-result")
+    assert loop_guard.observe_action_result(observation).allowed
+    assert loop_guard.observe_action_result(observation).allowed
+    assert (
+        loop_guard.observe_action_result(observation).stop_reason
+        == "repeated_action_result"
+    )
+
+
+def test_three_same_actions_in_latest_five_stop_even_when_results_differ(
+    loop_guard: LoopGuard,
+):
+    assert loop_guard.observe_action_result(action_observation("same", "one")).allowed
+    assert loop_guard.observe_action_result(action_observation("other", "two")).allowed
+    assert loop_guard.observe_action_result(action_observation("same", "three")).allowed
+    assert (
+        loop_guard.observe_action_result(action_observation("same", "four")).stop_reason
+        == "repeated_action"
+    )
+
+
+@pytest.mark.parametrize(
+    "states", [("a", "b", "a", "b"), ("a", "b", "c", "a", "b", "c")],
+)
+def test_shortest_repeating_cycle_is_canonical(loop_guard: LoopGuard, states: tuple[str, ...]):
+    decision = None
+    for state in states:
+        decision = loop_guard.observe_checkpoint(checkpoint(state))
+    assert decision is not None and decision.stop_reason == "state_cycle"
+
+
+def test_cycle_signature_is_rotation_normalized(loop_guard: LoopGuard):
+    first = None
+    for state in ("a", "b", "c", "a", "b", "c"):
+        first = loop_guard.observe_checkpoint(checkpoint(state))
+    second_guard = LoopGuard(severity_policy=severity_policy())
+    second = None
+    for state in ("b", "c", "a", "b", "c", "a"):
+        second = second_guard.observe_checkpoint(checkpoint(state))
+    assert first is not None and second is not None
+    assert first.cycle_signature is not None
+    assert first.cycle_signature == second.cycle_signature
+
+
+def test_duplicate_state_without_progress_stops_attempt(loop_guard: LoopGuard):
+    assert loop_guard.observe_checkpoint(checkpoint("same")).allowed
+    assert (
+        loop_guard.observe_checkpoint(checkpoint("same")).stop_reason
+        == "duplicate_state_no_progress"
+    )
+
+
+def test_heartbeats_do_not_enter_semantic_windows_or_advance_no_progress(
+    loop_guard: LoopGuard,
+):
+    assert loop_guard.observe_checkpoint(checkpoint("same")).allowed
+    for _ in range(10):
+        assert not loop_guard.observe_checkpoint(checkpoint("same", semantic=False)).allowed
+    assert (
+        loop_guard.observe_checkpoint(checkpoint("same")).stop_reason
+        == "duplicate_state_no_progress"
+    )
+
+
+def test_two_no_progress_semantic_checkpoints_stop_work(loop_guard: LoopGuard):
+    assert loop_guard.observe_checkpoint(checkpoint("first")).allowed
+    assert loop_guard.observe_checkpoint(checkpoint("second")).allowed
+    assert (
+        loop_guard.observe_checkpoint(checkpoint("third")).stop_reason
+        == "no_progress"
+    )
+
+
+def test_cross_worker_same_failure_oscillation_stops_rescheduling(loop_guard: LoopGuard):
+    assert loop_guard.observe_checkpoint(
+        checkpoint("first", worker_id="worker-a", failure="source_failure")
+    ).allowed
+    assert loop_guard.observe_checkpoint(
+        checkpoint("second", worker_id="worker-b", failure="source_failure")
+    ).allowed
+    assert (
+        loop_guard.observe_checkpoint(
+            checkpoint("third", worker_id="worker-a", failure="source_failure")
+        ).stop_reason
+        == "cross_worker_failure_oscillation"
+    )
+
+
+def test_changed_failure_context_cannot_be_misclassified_as_cross_worker_oscillation(
+    loop_guard: LoopGuard,
+):
+    assert loop_guard.observe_checkpoint(
+        checkpoint("first", worker_id="worker-a", failure="source_failure")
+    ).allowed
+    assert loop_guard.observe_checkpoint(
+        checkpoint("second", worker_id="worker-b", failure="source_failure")
+    ).allowed
+    changed = checkpoint("third", worker_id="worker-a", failure="source_failure").model_copy(
+        update={"failure_context_hash": digest({"context": "changed"})}
+    )
+    assert loop_guard.observe_checkpoint(changed).stop_reason != "cross_worker_failure_oscillation"
+
+
+def test_unrelated_evidence_is_not_progress():
+    before = progress(filled_required_evidence_slot_count=1)
+    after = before.model_copy()
+    assert not compare_progress(before, after, severity_policy()).advanced
+
+
+def test_critical_regression_fails_closed_despite_positive_improvement():
+    before = progress(valid_required_field_count=1, validation_error_count=0)
+    after = progress(valid_required_field_count=2, validation_error_count=1)
+    decision = compare_progress(before, after, severity_policy())
+    assert not decision.advanced
+    assert decision.critical_regression
+
+
+def test_progress_requires_oriented_monotonic_strict_improvement():
+    decision = compare_progress(
+        progress(missing_evidence_count=2),
+        progress(missing_evidence_count=1),
+        severity_policy(),
+    )
+    assert decision.advanced
+
+
+def test_fingerprint_builders_are_canonical_and_ignore_ephemeral_inputs():
+    first = build_action_fingerprint(
+        worker_id="worker-a",
+        worker_version="v1",
+        action_kind="inspect",
+        canonical_arguments={"b": 2, "a": 1},
+        context_hash=digest({"context": 1}),
+        dependency_hash=digest({"dependency": 1}),
+        plan_revision=1,
+        prompt_hash=digest({"prompt": 1}),
+        tool_hash=digest({"tool": 1}),
+        output_schema_hash=digest({"schema": 1}),
+        model_route="route",
+        correction_ordinal=0,
+        event_id="event-1",
+        trace_id="trace-1",
+        raw_content="secret prose",
+    )
+    second = build_action_fingerprint(
+        worker_id="worker-a",
+        worker_version="v1",
+        action_kind="inspect",
+        canonical_arguments={"a": 1, "b": 2},
+        context_hash=digest({"context": 1}),
+        dependency_hash=digest({"dependency": 1}),
+        plan_revision=1,
+        prompt_hash=digest({"prompt": 1}),
+        tool_hash=digest({"tool": 1}),
+        output_schema_hash=digest({"schema": 1}),
+        model_route="route",
+        correction_ordinal=0,
+        event_id="event-2",
+        trace_id="trace-2",
+        raw_content="different secret prose",
+    )
+    assert first == second
+
+
+def test_fingerprints_exclude_nested_raw_content_and_secret_values():
+    common = {
+        "worker_id": "worker-a",
+        "worker_version": "v1",
+        "action_kind": "inspect",
+        "context_hash": digest({"context": 1}),
+        "dependency_hash": digest({"dependency": 1}),
+        "plan_revision": 1,
+        "prompt_hash": digest({"prompt": 1}),
+        "tool_hash": digest({"tool": 1}),
+        "output_schema_hash": digest({"schema": 1}),
+        "model_route": "route",
+        "correction_ordinal": 0,
+    }
+    first = build_action_fingerprint(
+        **common,
+        canonical_arguments={"symbol": "BTC", "raw_content": "private prose", "auth_secret": "one"},
+    )
+    second = build_action_fingerprint(
+        **common,
+        canonical_arguments={"symbol": "BTC", "raw_content": "other prose", "auth_secret": "two"},
+    )
+    assert first == second
+
+
+def test_fingerprint_contracts_are_frozen_strict_and_revalidate_model_copy():
+    fingerprint = action("one")
+    with pytest.raises(ValidationError):
+        fingerprint.model_copy(update={"digest": "not-a-digest"})
+    with pytest.raises(ValidationError):
+        ActionFingerprint(digest=digest({"x": 1}), unexpected=True)
+
+
+def test_one_recovery_is_authorized_per_cycle_signature(loop_guard: LoopGuard):
+    decision = None
+    for state in ("a", "b", "a", "b"):
+        decision = loop_guard.observe_checkpoint(checkpoint(state))
+    assert decision is not None and decision.cycle_signature is not None
+    signature = decision.cycle_signature
+    assert loop_guard.authorize_recovery(signature).allowed
+    assert loop_guard.authorize_recovery(signature).stop_reason == "recovery_exhausted"
+
+
+def test_returning_to_recovered_cycle_terminates(loop_guard: LoopGuard):
+    first = None
+    for state in ("a", "b", "a", "b"):
+        first = loop_guard.observe_checkpoint(checkpoint(state))
+    assert first is not None and first.cycle_signature is not None
+    assert loop_guard.authorize_recovery(first.cycle_signature).allowed
+    for state in ("a", "b", "a", "b"):
+        decision = loop_guard.observe_checkpoint(checkpoint(state))
+    assert decision.stop_reason == "recovered_cycle_returned"
+
+
+def test_public_cycle_signature_rejects_noncanonical_periods():
+    with pytest.raises(ValidationError):
+        CycleSignature(
+            digest=digest({"cycle": "bad"}),
+            scope="attempt",
+            plan_revision=1,
+            fingerprint_schema_version="v1",
+            period=("b" * 64, "a" * 64),
+        )
