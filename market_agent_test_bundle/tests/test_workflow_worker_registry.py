@@ -5,6 +5,7 @@ import pytest
 from market_agent.workflow_harness_contracts import OutcomeKind, TaskKind, WorkerSpec
 from market_agent.workflow_worker_registry import (
     DuplicateWorkerError,
+    InvalidWorkerError,
     UnknownWorkerError,
     WorkerRegistry,
 )
@@ -51,7 +52,7 @@ def test_registry_preserves_immutable_worker_specs_in_declaration_order():
     registry = WorkerRegistry((first, second))
 
     assert registry.all() == (first, second)
-    assert registry.get("first-worker") is first
+    assert registry.get("first-worker") is not first
     with pytest.raises(TypeError):
         registry._specs["third-worker"] = first
 
@@ -66,3 +67,21 @@ def test_registry_rejects_unknown_worker_identifier_with_typed_error():
 
     with pytest.raises(UnknownWorkerError, match="unknown worker identifier: missing-worker"):
         registry.get("missing-worker")
+
+
+@pytest.mark.parametrize(
+    "forged_update",
+    (
+        {"analysis_phases": ("only",)},
+        {"maximum_cost": -1.0},
+        {"input_schema_hash": "not-a-digest"},
+        {"untrusted_capability": "trade.execute"},
+    ),
+)
+def test_registry_revalidates_model_copy_bypasses_with_a_typed_error(
+    forged_update: dict[str, object],
+):
+    forged = worker_spec().model_copy(update=forged_update)
+
+    with pytest.raises(InvalidWorkerError, match="invalid worker specification"):
+        WorkerRegistry((forged,))

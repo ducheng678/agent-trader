@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Iterable
 from types import MappingProxyType
 from typing import Annotated
@@ -36,9 +35,6 @@ TargetIds = Annotated[tuple[ShortText, ...], Field(max_length=64)]
 Stages = Annotated[tuple[StageSpec, ...], Field(min_length=1, max_length=64)]
 WorkerIds = Annotated[tuple[ShortText, ...], Field(min_length=1, max_length=64)]
 CoverageWeights = Annotated[tuple[SourceCoverageWeight, ...], Field(max_length=64)]
-_SYMBOL = re.compile(r"^[A-Z0-9]{2,32}(?:-[A-Z0-9]{2,16})?$")
-
-
 class PlanRegistryError(ValueError):
     """Base error for invalid immutable plan-template registry operations."""
 
@@ -100,14 +96,7 @@ class PlanTemplateRegistry:
     """A fixed, uniquely selectable set of fully declared plan templates."""
 
     def __init__(self, templates: Iterable[PlanTemplate]) -> None:
-        materialized = tuple(templates)
-        try:
-            materialized = tuple(
-                PlanTemplate.model_validate(template.model_dump())
-                for template in materialized
-            )
-        except ValidationError as error:
-            raise InconsistentTemplateError(str(error)) from error
+        materialized = tuple(_revalidate_template(template) for template in templates)
         by_id = {template.template_id: template for template in materialized}
         if len(by_id) != len(materialized):
             raise DuplicateTemplateError("template identifiers must be unique")
@@ -149,6 +138,8 @@ class PlanCompiler:
     def __init__(self, templates: PlanTemplateRegistry, workers: WorkerRegistry) -> None:
         self._templates = templates
         self._workers = workers
+        for template in self._templates.all():
+            self._validate_template_workers(template, self._resolve_workers(template))
 
     def compile(
         self, request: WorkflowRequest, pinned_versions: PinnedVersions
@@ -210,28 +201,51 @@ class PlanCompiler:
 
 
 def _admit(request: WorkflowRequest) -> tuple[WorkflowMode, TaskKind, RiskClass]:
-    """Return the sole admission based on typed request fields, never user prose."""
+    """Fail closed until ingress carries independently trusted typed intent."""
 
-    if _has_unambiguous_live_symbol(request):
-        return WorkflowMode.ACTIVE, TaskKind.DECISION_PLANNER, RiskClass.TRADING
     return WorkflowMode.PASSIVE, TaskKind.INFORMATIONAL, RiskClass.INFORMATIONAL
 
 
-def _has_unambiguous_live_symbol(request: WorkflowRequest) -> bool:
-    """Admit active analysis only for matching typed live-position symbol evidence."""
+def _revalidate_template(template: PlanTemplate) -> PlanTemplate:
+    try:
+        validated = PlanTemplate.model_validate(template.__dict__)
+    except (AttributeError, ValidationError) as error:
+        raise InconsistentTemplateError(str(error)) from error
+    _validate_template_graph(validated)
+    return validated
 
-    if request.has_live_position is not True or request.active_symbol is None:
-        return False
-    active_symbol = request.active_symbol.strip().upper()
-    if not _SYMBOL.fullmatch(active_symbol):
-        return False
-    context = request.trade_symbol_context
-    if context is None:
-        return False
-    context_symbol = context.get("execution_symbol")
-    if not isinstance(context_symbol, str):
-        return False
-    return context_symbol.strip().upper() == active_symbol and bool(_SYMBOL.fullmatch(context_symbol.strip().upper()))
+
+def _validate_template_graph(template: PlanTemplate) -> None:
+    stage_dependencies = {stage.stage_id: stage.dependencies for stage in template.stages}
+    declared_stage_ids = frozenset(stage_dependencies)
+    if any(
+        dependency not in declared_stage_ids
+        for dependencies in stage_dependencies.values()
+        for dependency in dependencies
+    ):
+        raise InconsistentTemplateError(
+            "stage dependencies must reference declared identifiers"
+        )
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(stage_id: str) -> None:
+        if stage_id in visiting:
+            raise InconsistentTemplateError("stage dependencies must be acyclic")
+        if stage_id in visited:
+            return
+        visiting.add(stage_id)
+        for dependency in stage_dependencies[stage_id]:
+            visit(dependency)
+        visiting.remove(stage_id)
+        visited.add(stage_id)
+
+    for stage_id in stage_dependencies:
+        visit(stage_id)
+
+    if template.work_item_dependencies:
+        raise InconsistentTemplateError("work item dependencies must be empty")
 
 
 def _plan_id(run_id: str, template_id: str) -> str:
