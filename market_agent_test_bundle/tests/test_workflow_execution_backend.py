@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
+from market_agent import workflow_execution_backend as execution_backend_module
 from market_agent.llm_workflow import LLMWorkflow
 from market_agent.workflow_contracts import WorkflowMode
 from market_agent.workflow_execution_backend import (
@@ -19,6 +20,7 @@ from market_agent.workflow_execution_backend import (
     ExecutionHandleMismatchError,
     ExecutionIdentityError,
     ExecutionPlanMismatchError,
+    ExecutionReceiptVerifier,
     InvalidExecutionInputError,
     InvalidCommittedTransitionError,
     LangGraphExecutionBackend,
@@ -32,6 +34,8 @@ from market_agent.workflow_execution_backend import (
     route_committed_transition,
 )
 from market_agent.workflow_harness_contracts import (
+    AttemptState,
+    AttemptWorkItemOwnershipRecord,
     HarnessPlan,
     HarnessSessionView,
     HarnessTransition,
@@ -62,21 +66,22 @@ NOW = datetime(2026, 8, 31, tzinfo=timezone.utc)
 
 class TrustedReceiptVerifier:
     def __init__(self) -> None:
-        self._approved: set[str] = set()
+        self._approved: set[bytes] = set()
+        self.capability = ExecutionReceiptVerifier(self._verify)
 
     @staticmethod
-    def _key(value: object) -> str:
+    def _key(value: object) -> bytes:
         return json.dumps(
             value.model_dump(mode="json"),
             sort_keys=True,
             separators=(",", ":"),
-        )
+        ).encode("utf-8")
 
     def approve(self, value: object) -> None:
         self._approved.add(self._key(value))
 
-    def __call__(self, value: object) -> bool:
-        return self._key(value) in self._approved
+    def _verify(self, payload: bytes) -> bool:
+        return payload in self._approved
 
 
 def plan(**overrides: object) -> HarnessPlan:
@@ -204,7 +209,7 @@ _BACKEND_VERIFIERS: dict[LangGraphExecutionBackend, TrustedReceiptVerifier] = {}
 
 @pytest.fixture
 def backend(verifier: TrustedReceiptVerifier) -> LangGraphExecutionBackend:
-    value = LangGraphExecutionBackend(authority_verifier=verifier)
+    value = LangGraphExecutionBackend(authority_verifier=verifier.capability)
     _BACKEND_VERIFIERS[value] = verifier
     return value
 
@@ -328,6 +333,10 @@ def post_view_for(
         states = dict(pre_view.work_item_states)
         states[candidate.entity_id] = WorkItemState(candidate.to_state)
         changes["work_item_states"] = tuple(sorted(states.items()))
+    else:
+        states = dict(pre_view.attempt_states)
+        states[candidate.entity_id] = AttemptState(candidate.to_state)
+        changes["attempt_states"] = tuple(sorted(states.items()))
     changes.update(overrides)
     return HarnessSessionView.model_validate(
         pre_view.model_copy(update=changes).model_dump(mode="python")
@@ -1013,4 +1022,307 @@ def test_langgraph_router_rejects_transition_even_when_exact_type():
     with pytest.raises(UncommittedTransitionError):
         route_committed_transition(
             cast(object, {"committed_transition": transition()})
+        )
+
+
+def test_same_revision_authority_event_resume_then_legal_apply(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    candidate = transition()
+    initial = view()
+    handle = backend.register(
+        plan_value,
+        initial,
+        committed_snapshot(verifier, plan_value, initial),
+    )
+    authorized = view(
+        sequence=initial.sequence + 1,
+        transition_authorities=(authority_for(candidate),),
+        last_event_hash="d" * 64,
+    )
+    handle = backend.resume(
+        plan_value,
+        authorized,
+        committed_snapshot(verifier, plan_value, authorized),
+    )
+    committed = post_view_for(authorized, candidate)
+
+    advanced = backend.apply_committed_transition(
+        handle,
+        candidate,
+        authorized,
+        committed,
+        committed_receipt(
+            verifier, candidate, authorized, committed, plan_value=plan_value
+        ),
+    )
+
+    assert advanced.state_revision == initial.state_revision + 1
+    assert advanced.routed_state == RunState.SUMMARIZING.value
+
+
+@pytest.mark.parametrize("drift", ("delete", "modify", "sequence", "head", "state"))
+def test_same_revision_authority_extension_rejects_non_append_drift(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+    drift: str,
+):
+    plan_value = plan()
+    candidate = transition()
+    old_authority = authority_for(candidate)
+    additional = HarnessTransition(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="work_item",
+        entity_id="information-work",
+        from_state="none",
+        to_state=WorkItemState.PENDING.value,
+        expected_state_revision=4,
+        plan_revision=0,
+        reason_code="pending",
+        idempotency_key="transition-2",
+        lease_epoch=1,
+        fencing_token_digest=HASH,
+    )
+    initial = view(transition_authorities=(old_authority,))
+    backend.register(
+        plan_value,
+        initial,
+        committed_snapshot(verifier, plan_value, initial),
+    )
+    changes: dict[str, object] = {
+        "sequence": initial.sequence + 1,
+        "last_event_hash": "d" * 64,
+        "transition_authorities": (
+            old_authority,
+            authority_for(additional),
+        ),
+    }
+    if drift == "delete":
+        changes["transition_authorities"] = ()
+    elif drift == "modify":
+        changes["transition_authorities"] = (
+            authority_for(transition(reason_code="modified")),
+        )
+    elif drift == "sequence":
+        changes["sequence"] = initial.sequence
+    elif drift == "head":
+        changes["last_event_hash"] = initial.last_event_hash
+    elif drift == "state":
+        changes["run_state"] = RunState.RECONCILING
+    altered = HarnessSessionView.model_validate(
+        initial.model_copy(update=changes).model_dump(mode="python")
+    )
+
+    with pytest.raises(StaleExecutionSnapshotError):
+        backend.resume(
+            plan_value,
+            altered,
+            committed_snapshot(verifier, plan_value, altered),
+        )
+
+
+def test_route_set_is_complete_programmatic_enum_union():
+    expected = {
+        *(state.value for state in RunState),
+        *(state.value for state in WorkItemState),
+        *(state.value for state in AttemptState),
+    }
+    assert set(execution_backend_module._ALL_ROUTES) == expected
+
+
+@pytest.mark.parametrize(
+    ("candidate", "pre_view", "expected_route"),
+    (
+        (
+            transition(to_state=RunState.WAITING_APPROVAL.value),
+            view(),
+            RunState.WAITING_APPROVAL.value,
+        ),
+        (
+            HarnessTransition(
+                run_id="run-1",
+                trace_id="trace-1",
+                entity_kind="work_item",
+                entity_id="information-work",
+                from_state=WorkItemState.READY.value,
+                to_state=WorkItemState.LEASED.value,
+                expected_state_revision=4,
+                plan_revision=0,
+                reason_code="leased",
+                idempotency_key="work-leased",
+                lease_epoch=1,
+                fencing_token_digest=HASH,
+            ),
+            view(work_item_states=(("information-work", WorkItemState.READY),)),
+            WorkItemState.LEASED.value,
+        ),
+        (
+            HarnessTransition(
+                run_id="run-1",
+                trace_id="trace-1",
+                entity_kind="attempt",
+                entity_id="attempt-1",
+                from_state=AttemptState.VALIDATING.value,
+                to_state=AttemptState.SETTLING.value,
+                expected_state_revision=4,
+                plan_revision=0,
+                reason_code="settling",
+                idempotency_key="attempt-settling",
+                lease_epoch=1,
+                fencing_token_digest=HASH,
+            ),
+            view(
+                attempt_states=(("attempt-1", AttemptState.VALIDATING),),
+                attempt_work_item_owners=(
+                    AttemptWorkItemOwnershipRecord(
+                        run_id="run-1",
+                        trace_id="trace-1",
+                        attempt_id="attempt-1",
+                        work_item_id="information-work",
+                        plan_revision=0,
+                    ),
+                ),
+            ),
+            AttemptState.SETTLING.value,
+        ),
+    ),
+)
+def test_legal_routes_include_previously_omitted_enum_states(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+    candidate: HarnessTransition,
+    pre_view: HarnessSessionView,
+    expected_route: str,
+):
+    plan_value = plan()
+    pre_view = HarnessSessionView.model_validate(
+        pre_view.model_copy(
+            update={"transition_authorities": (authority_for(candidate),)}
+        ).model_dump(mode="python")
+    )
+    post_view = post_view_for(pre_view, candidate)
+    handle = backend.register(
+        plan_value,
+        pre_view,
+        committed_snapshot(verifier, plan_value, pre_view),
+    )
+
+    advanced = backend.apply_committed_transition(
+        handle,
+        candidate,
+        pre_view,
+        post_view,
+        committed_receipt(
+            verifier, candidate, pre_view, post_view, plan_value=plan_value
+        ),
+    )
+
+    assert advanced.routed_state == expected_route
+
+
+def test_backend_rejects_arbitrary_callable_as_receipt_verifier():
+    with pytest.raises(InvalidExecutionInputError):
+        LangGraphExecutionBackend(authority_verifier=lambda _: True)
+
+
+def test_verifier_side_mutation_cannot_change_stored_snapshot():
+    plan_value = plan()
+    view_value = view()
+    original = CommittedExecutionSnapshot(
+        run_id=plan_value.run_id,
+        trace_id=plan_value.trace_id,
+        plan_id=plan_value.plan_id,
+        plan_digest=canonical_plan_digest(plan_value),
+        plan_revision=plan_value.revision,
+        sequence=view_value.sequence,
+        state_revision=view_value.state_revision,
+        view_digest=canonical_view_digest(view_value),
+        event_head_hash=view_value.last_event_hash,
+    )
+    mutated = False
+
+    def mutate_caller_object(_: bytes) -> bool:
+        nonlocal mutated
+        if not mutated:
+            object.__setattr__(original, "state_revision", 99)
+            mutated = True
+        return True
+
+    backend = LangGraphExecutionBackend(
+        authority_verifier=ExecutionReceiptVerifier(mutate_caller_object)
+    )
+    first = backend.register(plan_value, view_value, original)
+    clean = CommittedExecutionSnapshot(
+        run_id=plan_value.run_id,
+        trace_id=plan_value.trace_id,
+        plan_id=plan_value.plan_id,
+        plan_digest=canonical_plan_digest(plan_value),
+        plan_revision=plan_value.revision,
+        sequence=view_value.sequence,
+        state_revision=view_value.state_revision,
+        view_digest=canonical_view_digest(view_value),
+        event_head_hash=view_value.last_event_hash,
+    )
+
+    assert original.state_revision == 99
+    assert backend.register(plan_value, view_value, clean) == first
+
+
+@pytest.mark.parametrize("invalid_kind", ("mapping", "subclass", "forged"))
+def test_receipt_rejects_non_exact_nested_snapshot_before_verification(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+    invalid_kind: str,
+):
+    class SnapshotSubclass(CommittedExecutionSnapshot):
+        pass
+
+    plan_value = plan()
+    candidate = transition()
+    pre_view = view(transition_authorities=(authority_for(candidate),))
+    post_view = post_view_for(pre_view, candidate)
+    handle = backend.register(
+        plan_value,
+        pre_view,
+        committed_snapshot(verifier, plan_value, pre_view),
+    )
+    receipt = committed_receipt(
+        verifier, candidate, pre_view, post_view, plan_value=plan_value
+    )
+    if invalid_kind == "mapping":
+        invalid: object = receipt.pre.model_dump(mode="python")
+    elif invalid_kind == "subclass":
+        invalid = SnapshotSubclass.model_validate(receipt.pre.model_dump(mode="python"))
+    else:
+        invalid = receipt.pre.model_copy()
+        object.__setattr__(invalid, "worker_candidate", {"goto": "succeeded"})
+    forged = receipt.model_copy()
+    object.__setattr__(forged, "pre", invalid)
+
+    with pytest.raises(UnverifiedExecutionReceiptError):
+        backend.apply_committed_transition(
+            handle, candidate, pre_view, post_view, forged
+        )
+
+
+def test_plan_rejects_nested_contract_subclass_before_snapshot_verification(
+    backend: LangGraphExecutionBackend,
+):
+    class WorkerSubclass(WorkerSpec):
+        pass
+
+    original = plan()
+    nested = WorkerSubclass.model_validate(
+        original.workers[0].model_dump(mode="python")
+    )
+    forged = original.model_copy(update={"workers": (nested,)})
+
+    with pytest.raises(InvalidExecutionInputError):
+        backend.register(
+            forged,
+            view(),
+            cast(CommittedExecutionSnapshot, None),
         )

@@ -6,17 +6,20 @@ from collections.abc import Callable, Mapping
 import hashlib
 import json
 from threading import RLock
-from typing import Protocol, TypedDict, cast, runtime_checkable
+from typing import Protocol, TypedDict, cast, final, runtime_checkable
 
 from pydantic import StrictBool, model_validator
 
 from market_agent.workflow_contracts import ContractModel, Digest, NonNegativeInt, PositiveInt, ShortText
 from market_agent.workflow_harness_contracts import (
+    AttemptState,
     AttemptWorkItemOwnershipRecord,
     HarnessPlan,
     HarnessSessionView,
     HarnessTransition,
+    RunState,
     TransitionAuthorityRecord,
+    WorkItemState,
 )
 from market_agent.workflow_state_machine import (
     AttemptTransitionAuthorization,
@@ -140,7 +143,26 @@ class CommittedTransitionReceipt(ContractModel):
         return self
 
 
-AuthorityVerifier = Callable[[object], bool]
+@final
+class ExecutionReceiptVerifier:
+    """Frozen host capability that verifies immutable canonical receipt bytes."""
+
+    __slots__ = ("_verify_bytes",)
+
+    def __init__(self, verify_bytes: Callable[[bytes], bool]) -> None:
+        if not callable(verify_bytes) or isinstance(verify_bytes, Mapping):
+            raise InvalidExecutionInputError("receipt verifier function must be callable")
+        object.__setattr__(self, "_verify_bytes", verify_bytes)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("receipt verifier is immutable")
+
+    def verify(self, payload: bytes) -> bool:
+        if type(payload) is not bytes:
+            raise TypeError("receipt verifier input must be immutable bytes")
+        return self._verify_bytes(payload)
+
+
 _ROUTE_CAPABILITY = object()
 
 
@@ -181,12 +203,40 @@ def _reject_undeclared_model_fields(value: object) -> None:
             _reject_undeclared_model_fields(item)
 
 
+def _require_same_contract_tree(original: object, fresh: object) -> None:
+    if isinstance(original, ContractModel) or isinstance(fresh, ContractModel):
+        if type(original) is not type(fresh):
+            raise TypeError("nested contract runtime type changed during validation")
+        for field in type(fresh).model_fields:
+            _require_same_contract_tree(
+                getattr(original, field), getattr(fresh, field)
+            )
+        return
+    if isinstance(original, Mapping) or isinstance(fresh, Mapping):
+        if not isinstance(original, Mapping) or not isinstance(fresh, Mapping):
+            raise TypeError("nested contract mapping shape changed")
+        if original.keys() != fresh.keys():
+            raise TypeError("nested contract mapping keys changed")
+        for key in original:
+            _require_same_contract_tree(original[key], fresh[key])
+        return
+    if isinstance(original, (list, tuple)) or isinstance(fresh, (list, tuple)):
+        if type(original) is not type(fresh) or len(original) != len(fresh):
+            raise TypeError("nested contract sequence shape changed")
+        for original_item, fresh_item in zip(original, fresh, strict=True):
+            _require_same_contract_tree(original_item, fresh_item)
+
+
 def _fresh_contract(value: object, expected_type: type[ContractModel], error_type: type[ExecutionBackendError], message: str) -> ContractModel:
     if type(value) is not expected_type:
         raise error_type(message)
     try:
         _reject_undeclared_model_fields(value)
-        return expected_type.model_validate(value.model_dump(mode="python", exclude_unset=True))
+        fresh = expected_type.model_validate(
+            value.model_dump(mode="python", exclude_unset=True)
+        )
+        _require_same_contract_tree(value, fresh)
+        return fresh
     except ExecutionBackendError:
         raise
     except Exception as error:
@@ -214,12 +264,27 @@ def _fresh_snapshot(value: object) -> CommittedExecutionSnapshot:
 
 
 def _fresh_receipt(value: object) -> CommittedTransitionReceipt:
+    if type(value) is not CommittedTransitionReceipt or (
+        type(value.pre) is not CommittedExecutionSnapshot
+        or type(value.post) is not CommittedExecutionSnapshot
+    ):
+        raise UnverifiedExecutionReceiptError(
+            "receipt endpoints must be exact committed snapshots"
+        )
     return cast(CommittedTransitionReceipt, _fresh_contract(value, CommittedTransitionReceipt, UnverifiedExecutionReceiptError, "transition requires an exact committed receipt"))
 
 
+def _canonical_bytes(value: ContractModel) -> bytes:
+    return json.dumps(
+        value.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
 def _canonical_digest(value: ContractModel) -> str:
-    encoded = json.dumps(value.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
 def canonical_plan_digest(plan: HarnessPlan) -> str:
@@ -260,7 +325,15 @@ def _project_route(target: str):
     return project
 
 
-_ALL_ROUTES = ("admitted", "cancelled", "completed", "created", "failed", "pending", "planned", "ready", "reconciling", "retryable", "running", "skipped", "stale", "succeeded", "summarizing", "waiting_reconciliation")
+_ALL_ROUTES = tuple(
+    sorted(
+        {
+            *(state.value for state in RunState),
+            *(state.value for state in WorkItemState),
+            *(state.value for state in AttemptState),
+        }
+    )
+)
 
 
 def _build_projection_graph():
@@ -298,12 +371,43 @@ def _handle_from_view(plan: HarnessPlan, view: HarnessSessionView) -> ExecutionH
     return ExecutionHandle(run_id=plan.run_id, trace_id=plan.trace_id, plan_id=plan.plan_id, plan_revision=plan.revision, state_revision=view.state_revision, routed_state=view.run_state.value if view.run_state is not None else None, cancelled=False)
 
 
+_APPEND_ONLY_AUTHORITY_FIELDS = (
+    "transition_authorities",
+    "attempt_work_item_owners",
+    "reconciliation_resolutions",
+)
+
+
+def _is_same_revision_authority_extension(
+    current: HarnessSessionView, incoming: HarnessSessionView
+) -> bool:
+    if (
+        incoming.state_revision != current.state_revision
+        or incoming.sequence <= current.sequence
+        or incoming.last_event_hash == current.last_event_hash
+    ):
+        return False
+    ignored = {"sequence", "last_event_hash", *_APPEND_ONLY_AUTHORITY_FIELDS}
+    if current.model_dump(exclude=ignored) != incoming.model_dump(exclude=ignored):
+        return False
+    appended = False
+    for field in _APPEND_ONLY_AUTHORITY_FIELDS:
+        previous = getattr(current, field)
+        extended = getattr(incoming, field)
+        if extended[: len(previous)] != previous:
+            return False
+        appended = appended or len(extended) > len(previous)
+    return appended
+
+
 class LangGraphExecutionBackend:
     """Disposable projection driven only by verified committed Harness state."""
 
-    def __init__(self, *, authority_verifier: AuthorityVerifier) -> None:
-        if not callable(authority_verifier) or isinstance(authority_verifier, Mapping):
-            raise InvalidExecutionInputError("authority verifier must be callable")
+    def __init__(self, *, authority_verifier: ExecutionReceiptVerifier) -> None:
+        if type(authority_verifier) is not ExecutionReceiptVerifier:
+            raise InvalidExecutionInputError(
+                "authority verifier must be an exact ExecutionReceiptVerifier"
+            )
         self._authority_verifier = authority_verifier
         self._graph = _build_projection_graph()
         self._state_machine = GlobalTaskStateMachine()
@@ -315,13 +419,31 @@ class LangGraphExecutionBackend:
         self._applied_idempotency_keys: dict[str, set[str]] = {}
         self._cancelled_run_ids: set[str] = set()
 
-    def _verify_authority(self, value: ContractModel) -> None:
+    def _verify_authority(self, value: ContractModel) -> ContractModel:
+        fresh_before = _fresh_contract(
+            value,
+            type(value),
+            UnverifiedExecutionReceiptError,
+            "commit authority contract is invalid",
+        )
+        payload = _canonical_bytes(fresh_before)
         try:
-            verified = self._authority_verifier(value)
+            verified = self._authority_verifier.verify(payload)
         except Exception as error:
             raise UnverifiedExecutionReceiptError("commit authority verification failed") from error
         if type(verified) is not bool or not verified:
             raise UnverifiedExecutionReceiptError("commit authority was not verified")
+        fresh_after = _fresh_contract(
+            fresh_before,
+            type(fresh_before),
+            UnverifiedExecutionReceiptError,
+            "commit authority changed during verification",
+        )
+        if _canonical_bytes(fresh_after) != payload:
+            raise UnverifiedExecutionReceiptError(
+                "commit authority changed during verification"
+            )
+        return fresh_after
 
     def _validated_snapshot(self, plan: HarnessPlan, view: HarnessSessionView, snapshot: CommittedExecutionSnapshot) -> tuple[HarnessPlan, HarnessSessionView, CommittedExecutionSnapshot]:
         plan, view = _validate_plan_view(plan, view)
@@ -339,7 +461,7 @@ class LangGraphExecutionBackend:
         )
         if not matches:
             raise UnverifiedExecutionReceiptError("snapshot does not bind the plan and folded view")
-        self._verify_authority(snapshot)
+        snapshot = cast(CommittedExecutionSnapshot, self._verify_authority(snapshot))
         return plan, view, snapshot
 
     def register(self, plan: HarnessPlan, view: HarnessSessionView, committed_snapshot: CommittedExecutionSnapshot) -> ExecutionHandle:
@@ -443,7 +565,7 @@ class LangGraphExecutionBackend:
             receipt = _fresh_receipt(receipt)
             _, pre_view, pre_snapshot = self._validated_snapshot(plan, pre_view, receipt.pre)
             _, post_view, post_snapshot = self._validated_snapshot(plan, post_view, receipt.post)
-            self._verify_authority(receipt)
+            receipt = cast(CommittedTransitionReceipt, self._verify_authority(receipt))
             if canonical_transition_digest(transition) != receipt.transition_digest:
                 raise InvalidCommittedTransitionError("receipt identifies another transition")
             if self._views[handle.run_id] != pre_view or self._snapshots[handle.run_id] != pre_snapshot or pre_snapshot.state_revision != handle.state_revision:
@@ -508,8 +630,20 @@ class LangGraphExecutionBackend:
             if folded_view.state_revision < current_view.state_revision:
                 raise StaleExecutionSnapshotError("resume snapshot is older than authority")
             if folded_view.state_revision == current_view.state_revision:
-                if folded_view != current_view or committed_snapshot != current_snapshot or incoming_keys != current_keys:
-                    raise StaleExecutionSnapshotError("same-revision snapshot diverges from authority")
+                if (
+                    folded_view == current_view
+                    and committed_snapshot == current_snapshot
+                    and incoming_keys == current_keys
+                ):
+                    return current
+                if not _is_same_revision_authority_extension(
+                    current_view, folded_view
+                ):
+                    raise StaleExecutionSnapshotError(
+                        "same-revision snapshot is not an append-only authority extension"
+                    )
+                self._views[plan.run_id] = folded_view
+                self._snapshots[plan.run_id] = committed_snapshot
                 return current
             if folded_view.sequence <= current_view.sequence or committed_snapshot.event_head_hash == current_snapshot.event_head_hash or not current_keys.issubset(incoming_keys):
                 raise StaleExecutionSnapshotError("new snapshot is not a monotonic extension")
