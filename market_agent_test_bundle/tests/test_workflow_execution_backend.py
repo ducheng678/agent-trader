@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 from typing import cast
 
 import pytest
@@ -9,6 +11,8 @@ from market_agent.llm_workflow import LLMWorkflow
 from market_agent.workflow_contracts import WorkflowMode
 from market_agent.workflow_execution_backend import (
     CancelledExecutionError,
+    CommittedExecutionSnapshot,
+    CommittedTransitionReceipt,
     DuplicateExecutionTransitionError,
     ExecutionBackend,
     ExecutionHandle,
@@ -16,9 +20,15 @@ from market_agent.workflow_execution_backend import (
     ExecutionIdentityError,
     ExecutionPlanMismatchError,
     InvalidExecutionInputError,
+    InvalidCommittedTransitionError,
     LangGraphExecutionBackend,
+    StaleExecutionSnapshotError,
     StaleExecutionTransitionError,
+    UnverifiedExecutionReceiptError,
     UncommittedTransitionError,
+    canonical_plan_digest,
+    canonical_transition_digest,
+    canonical_view_digest,
     route_committed_transition,
 )
 from market_agent.workflow_harness_contracts import (
@@ -34,8 +44,10 @@ from market_agent.workflow_harness_contracts import (
     TaskKind,
     TransitionAuthorityRecord,
     WorkerSpec,
+    WorkItemState,
     WorkItemSpec,
 )
+from market_agent.workflow_session import HarnessEvent, SQLiteHarnessEventStore
 from market_agent.workflow_state_machine import (
     GlobalTaskStateMachine,
     RunTransitionEvidence,
@@ -43,6 +55,28 @@ from market_agent.workflow_state_machine import (
 
 
 HASH = "a" * 64
+VIEW_HASH = "b" * 64
+POST_HASH = "c" * 64
+NOW = datetime(2026, 8, 31, tzinfo=timezone.utc)
+
+
+class TrustedReceiptVerifier:
+    def __init__(self) -> None:
+        self._approved: set[str] = set()
+
+    @staticmethod
+    def _key(value: object) -> str:
+        return json.dumps(
+            value.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def approve(self, value: object) -> None:
+        self._approved.add(self._key(value))
+
+    def __call__(self, value: object) -> bool:
+        return self._key(value) in self._approved
 
 
 def plan(**overrides: object) -> HarnessPlan:
@@ -137,6 +171,7 @@ def view(**overrides: object) -> HarnessSessionView:
         "run_id": "run-1",
         "trace_id": "trace-1",
         "run_state": RunState.RUNNING,
+        "last_event_hash": VIEW_HASH,
     }
     values.update(overrides)
     return HarnessSessionView(**values)
@@ -160,8 +195,252 @@ def transition(**overrides: object) -> HarnessTransition:
 
 
 @pytest.fixture
-def backend() -> LangGraphExecutionBackend:
-    return LangGraphExecutionBackend()
+def verifier() -> TrustedReceiptVerifier:
+    return TrustedReceiptVerifier()
+
+
+_BACKEND_VERIFIERS: dict[LangGraphExecutionBackend, TrustedReceiptVerifier] = {}
+
+
+@pytest.fixture
+def backend(verifier: TrustedReceiptVerifier) -> LangGraphExecutionBackend:
+    value = LangGraphExecutionBackend(authority_verifier=verifier)
+    _BACKEND_VERIFIERS[value] = verifier
+    return value
+
+
+def committed_snapshot(
+    verifier: TrustedReceiptVerifier,
+    plan_value: HarnessPlan | None = None,
+    view_value: HarnessSessionView | None = None,
+) -> CommittedExecutionSnapshot:
+    plan_value = plan_value or plan()
+    view_value = view_value or view()
+    snapshot = CommittedExecutionSnapshot(
+        run_id=plan_value.run_id,
+        trace_id=plan_value.trace_id,
+        plan_id=plan_value.plan_id,
+        plan_digest=canonical_plan_digest(plan_value),
+        plan_revision=plan_value.revision,
+        sequence=view_value.sequence,
+        state_revision=view_value.state_revision,
+        view_digest=canonical_view_digest(view_value),
+        event_head_hash=view_value.last_event_hash,
+    )
+    verifier.approve(snapshot)
+    return snapshot
+
+
+def register_backend(
+    backend: LangGraphExecutionBackend,
+    plan_value: HarnessPlan | None = None,
+    view_value: HarnessSessionView | None = None,
+) -> ExecutionHandle:
+    plan_value = plan_value or plan()
+    view_value = view_value or view()
+    return backend.register(
+        plan_value,
+        view_value,
+        committed_snapshot(_BACKEND_VERIFIERS[backend], plan_value, view_value),
+    )
+
+
+def resume_backend(
+    backend: LangGraphExecutionBackend,
+    plan_value: HarnessPlan,
+    view_value: HarnessSessionView,
+    *,
+    disposable_checkpoint: object | None = None,
+) -> ExecutionHandle:
+    return backend.resume(
+        plan_value,
+        view_value,
+        committed_snapshot(_BACKEND_VERIFIERS[backend], plan_value, view_value),
+        disposable_checkpoint=disposable_checkpoint,
+    )
+
+
+def committed_receipt(
+    verifier: TrustedReceiptVerifier,
+    transition_value: HarnessTransition,
+    pre_view: HarnessSessionView,
+    post_view: HarnessSessionView,
+    *,
+    plan_value: HarnessPlan | None = None,
+) -> CommittedTransitionReceipt:
+    plan_value = plan_value or plan()
+    receipt = CommittedTransitionReceipt(
+        pre=committed_snapshot(verifier, plan_value, pre_view),
+        post=committed_snapshot(verifier, plan_value, post_view),
+        transition_digest=canonical_transition_digest(transition_value),
+    )
+    verifier.approve(receipt)
+    return receipt
+
+
+def authority_for(
+    candidate: HarnessTransition,
+    *,
+    dependency_versions: tuple[tuple[str, int], ...] = (),
+) -> TransitionAuthorityRecord:
+    values: dict[str, object] = {
+        "run_id": candidate.run_id,
+        "trace_id": candidate.trace_id,
+        "entity_kind": candidate.entity_kind,
+        "entity_id": candidate.entity_id,
+        "from_state": candidate.from_state,
+        "to_state": candidate.to_state,
+        "expected_state_revision": candidate.expected_state_revision,
+        "plan_revision": candidate.plan_revision,
+        "reason_code": candidate.reason_code,
+        "idempotency_key": candidate.idempotency_key,
+        "dependency_versions": dependency_versions,
+    }
+    if candidate.entity_kind != "run":
+        values.update(
+            {
+                "reservation_id": "reservation-1",
+                "grant_id": "grant-1",
+                "lease_epoch": candidate.lease_epoch,
+                "fencing_token_digest": candidate.fencing_token_digest,
+            }
+        )
+    return TransitionAuthorityRecord(**values)
+
+
+def post_view_for(
+    pre_view: HarnessSessionView,
+    candidate: HarnessTransition,
+    **overrides: object,
+) -> HarnessSessionView:
+    changes: dict[str, object] = {
+        "sequence": pre_view.sequence + 1,
+        "state_revision": pre_view.state_revision + 1,
+        "applied_idempotency_keys": (
+            *pre_view.applied_idempotency_keys,
+            candidate.idempotency_key,
+        ),
+        "last_event_hash": POST_HASH,
+    }
+    if candidate.entity_kind == "run":
+        changes["run_state"] = RunState(candidate.to_state)
+    elif candidate.entity_kind == "work_item":
+        states = dict(pre_view.work_item_states)
+        states[candidate.entity_id] = WorkItemState(candidate.to_state)
+        changes["work_item_states"] = tuple(sorted(states.items()))
+    changes.update(overrides)
+    return HarnessSessionView.model_validate(
+        pre_view.model_copy(update=changes).model_dump(mode="python")
+    )
+
+
+def authority_event(index: int, record: TransitionAuthorityRecord) -> HarnessEvent:
+    return HarnessEvent(
+        event_id=f"authority-{index}",
+        trace_id=record.trace_id,
+        span_id=f"span-authority-{index}",
+        run_id=record.run_id,
+        event_type="transition_authorized",
+        occurred_at=NOW,
+        monotonic_offset=float(index),
+        actor="harness",
+        payload={"authority": "committed"},
+        transition_authority=record,
+    )
+
+
+def transition_event(index: int, candidate: HarnessTransition) -> HarnessEvent:
+    return HarnessEvent(
+        event_id=f"transition-{index}",
+        trace_id=candidate.trace_id,
+        span_id=f"span-transition-{index}",
+        run_id=candidate.run_id,
+        event_type="run_transitioned",
+        occurred_at=NOW,
+        monotonic_offset=float(index),
+        actor="harness",
+        payload={"transition": "committed"},
+        transition=candidate,
+    )
+
+
+def append_run_transition(
+    store: SQLiteHarnessEventStore,
+    index: int,
+    source: str,
+    target: RunState,
+) -> HarnessSessionView:
+    before = store.snapshot("run-1")
+    candidate = transition(
+        from_state=source,
+        to_state=target.value,
+        expected_state_revision=before.state_revision,
+        idempotency_key=f"transition-{index}",
+        reason_code=f"advance-{index}",
+    )
+    store.append(
+        authority_event(index, authority_for(candidate)),
+        expected_sequence=before.sequence,
+        expected_state_revision=before.state_revision,
+    )
+    authorized = store.snapshot("run-1")
+    evidence = RunTransitionEvidence(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_id="run-1",
+        expected_state_revision=authorized.state_revision,
+        plan_revision=0,
+        dependency_versions=authorized.dependency_versions,
+    )
+    assert GlobalTaskStateMachine().validate(
+        candidate, authorized, authorization=evidence
+    ).allowed
+    store.append(
+        transition_event(index, candidate),
+        expected_sequence=authorized.sequence,
+        expected_state_revision=authorized.state_revision,
+    )
+    return store.snapshot("run-1")
+
+
+def committed_running_to_summarizing(
+    tmp_path,
+) -> tuple[HarnessTransition, HarnessSessionView, HarnessSessionView]:
+    store = SQLiteHarnessEventStore(tmp_path / "backend-authority.sqlite3")
+    source = "none"
+    for index, target in enumerate(
+        (
+            RunState.CREATED,
+            RunState.ADMITTED,
+            RunState.PLANNED,
+            RunState.READY,
+            RunState.RUNNING,
+        ),
+        start=1,
+    ):
+        append_run_transition(store, index, source, target)
+        source = target.value
+
+    before_authority = store.snapshot("run-1")
+    candidate = transition(
+        from_state=RunState.RUNNING.value,
+        to_state=RunState.SUMMARIZING.value,
+        expected_state_revision=before_authority.state_revision,
+        idempotency_key="transition-6",
+        reason_code="accepted-results-ready",
+    )
+    store.append(
+        authority_event(6, authority_for(candidate)),
+        expected_sequence=before_authority.sequence,
+        expected_state_revision=before_authority.state_revision,
+    )
+    pre_view = store.snapshot("run-1")
+    store.append(
+        transition_event(6, candidate),
+        expected_sequence=pre_view.sequence,
+        expected_state_revision=pre_view.state_revision,
+    )
+    return candidate, pre_view, store.snapshot("run-1")
 
 
 def test_backend_implements_runtime_protocol(backend: LangGraphExecutionBackend):
@@ -171,7 +450,7 @@ def test_backend_implements_runtime_protocol(backend: LangGraphExecutionBackend)
 def test_register_returns_frozen_strict_handle(
     backend: LangGraphExecutionBackend,
 ):
-    handle = backend.register(plan(), view())
+    handle = register_backend(backend)
 
     assert handle == ExecutionHandle(
         run_id="run-1",
@@ -189,8 +468,8 @@ def test_register_returns_frozen_strict_handle(
 def test_register_is_idempotent_for_the_same_plan_and_folded_view(
     backend: LangGraphExecutionBackend,
 ):
-    first = backend.register(plan(), view())
-    second = backend.register(plan(), view())
+    first = register_backend(backend)
+    second = register_backend(backend)
     assert second == first
 
 
@@ -199,7 +478,7 @@ def test_register_rejects_non_contract_plan_values(
     backend: LangGraphExecutionBackend, invalid: object
 ):
     with pytest.raises(InvalidExecutionInputError):
-        backend.register(cast(HarnessPlan, invalid), view())
+        backend.register(cast(HarnessPlan, invalid), view(), cast(CommittedExecutionSnapshot, None))
 
 
 def test_register_rejects_contract_subclasses(
@@ -210,7 +489,7 @@ def test_register_rejects_contract_subclasses(
 
     subclass = PlanSubclass.model_validate(plan().model_dump(mode="python"))
     with pytest.raises(InvalidExecutionInputError):
-        backend.register(subclass, view())
+        backend.register(subclass, view(), cast(CommittedExecutionSnapshot, None))
 
 
 def test_register_rejects_model_copy_with_undeclared_fields(
@@ -219,7 +498,7 @@ def test_register_rejects_model_copy_with_undeclared_fields(
     forged = plan().model_copy()
     object.__setattr__(forged, "raw_worker_candidate", {"goto": "succeeded"})
     with pytest.raises(InvalidExecutionInputError):
-        backend.register(forged, view())
+        backend.register(forged, view(), cast(CommittedExecutionSnapshot, None))
 
 
 @pytest.mark.parametrize(
@@ -229,14 +508,14 @@ def test_register_rejects_run_or_trace_mismatch(
     backend: LangGraphExecutionBackend, folded_view: HarnessSessionView
 ):
     with pytest.raises(ExecutionIdentityError):
-        backend.register(plan(), folded_view)
+        backend.register(plan(), folded_view, cast(CommittedExecutionSnapshot, None))
 
 
 def test_register_rejects_plan_revision_mismatch(
     backend: LangGraphExecutionBackend,
 ):
     with pytest.raises(ExecutionPlanMismatchError):
-        backend.register(plan(), view(plan_revision=1))
+        backend.register(plan(), view(plan_revision=1), cast(CommittedExecutionSnapshot, None))
 
 
 def test_register_rejects_non_contract_or_subclass_views(
@@ -248,17 +527,20 @@ def test_register_rejects_non_contract_or_subclass_views(
     subclass = ViewSubclass.model_validate(view().model_dump(mode="python"))
     for invalid in (view().model_dump(mode="python"), subclass):
         with pytest.raises(InvalidExecutionInputError):
-            backend.register(plan(), cast(HarnessSessionView, invalid))
+            backend.register(plan(), cast(HarnessSessionView, invalid), cast(CommittedExecutionSnapshot, None))
 
 
 def test_raw_worker_candidate_cannot_select_edge(
     backend: LangGraphExecutionBackend,
 ):
-    handle = backend.register(plan(), view())
+    handle = register_backend(backend)
     with pytest.raises(UncommittedTransitionError):
         backend.apply_committed_transition(
             handle,
             cast(HarnessTransition, {"goto": "succeeded", "retry": True}),
+            cast(HarnessSessionView, None),
+            cast(HarnessSessionView, None),
+            cast(CommittedTransitionReceipt, None),
         )
 
 
@@ -269,9 +551,9 @@ def test_transition_subclass_cannot_select_edge(
         pass
 
     candidate = TransitionSubclass.model_validate(transition().model_dump(mode="python"))
-    handle = backend.register(plan(), view())
+    handle = register_backend(backend)
     with pytest.raises(UncommittedTransitionError):
-        backend.apply_committed_transition(handle, candidate)
+        backend.apply_committed_transition(handle, candidate, cast(HarnessSessionView, None), cast(HarnessSessionView, None), cast(CommittedTransitionReceipt, None))
 
 
 def test_transition_with_undeclared_fields_cannot_select_edge(
@@ -279,28 +561,23 @@ def test_transition_with_undeclared_fields_cannot_select_edge(
 ):
     candidate = transition().model_copy()
     object.__setattr__(candidate, "model_selected_edge", "succeeded")
-    handle = backend.register(plan(), view())
+    handle = register_backend(backend)
     with pytest.raises(UncommittedTransitionError):
-        backend.apply_committed_transition(handle, candidate)
+        backend.apply_committed_transition(handle, candidate, cast(HarnessSessionView, None), cast(HarnessSessionView, None), cast(CommittedTransitionReceipt, None))
 
 
-def test_route_committed_transition_accepts_only_exact_revalidated_transition():
-    assert route_committed_transition(
-        {"committed_transition": transition()}
-    ) == RunState.SUMMARIZING.value
+def test_route_committed_transition_rejects_even_exact_transition():
     with pytest.raises(UncommittedTransitionError):
-        route_committed_transition(
-            {"committed_transition": {"to_state": RunState.SUCCEEDED.value}}
-        )
+        route_committed_transition(cast(object, {"committed_transition": transition()}))
 
 
 def test_apply_rejects_stale_or_forged_handle(
     backend: LangGraphExecutionBackend,
 ):
-    handle = backend.register(plan(), view())
+    handle = register_backend(backend)
     forged = handle.model_copy(update={"state_revision": 3})
     with pytest.raises(ExecutionHandleMismatchError):
-        backend.apply_committed_transition(forged, transition())
+        backend.apply_committed_transition(forged, transition(), cast(HarnessSessionView, None), cast(HarnessSessionView, None), cast(CommittedTransitionReceipt, None))
 
 
 def test_apply_rejects_non_contract_or_subclass_handles(
@@ -309,12 +586,12 @@ def test_apply_rejects_non_contract_or_subclass_handles(
     class HandleSubclass(ExecutionHandle):
         pass
 
-    handle = backend.register(plan(), view())
+    handle = register_backend(backend)
     subclass = HandleSubclass.model_validate(handle.model_dump(mode="python"))
     for invalid in (handle.model_dump(mode="python"), subclass):
         with pytest.raises(ExecutionHandleMismatchError):
             backend.apply_committed_transition(
-                cast(ExecutionHandle, invalid), transition()
+                cast(ExecutionHandle, invalid), transition(), cast(HarnessSessionView, None), cast(HarnessSessionView, None), cast(CommittedTransitionReceipt, None)
             )
 
 
@@ -332,16 +609,26 @@ def test_apply_rejects_identity_plan_and_revision_mismatch(
     candidate: HarnessTransition,
     error_type: type[Exception],
 ):
-    handle = backend.register(plan(), view())
+    handle = register_backend(backend)
     with pytest.raises(error_type):
-        backend.apply_committed_transition(handle, candidate)
+        backend.apply_committed_transition(handle, candidate, cast(HarnessSessionView, None), cast(HarnessSessionView, None), cast(CommittedTransitionReceipt, None))
 
 
 def test_apply_projects_only_the_committed_transition_and_advances_one_revision(
     backend: LangGraphExecutionBackend,
 ):
-    handle = backend.register(plan(), view())
-    advanced = backend.apply_committed_transition(handle, transition())
+    candidate = transition()
+    pre_view = view(transition_authorities=(authority_for(candidate),))
+    post_view = post_view_for(pre_view, candidate)
+    verifier = _BACKEND_VERIFIERS[backend]
+    handle = register_backend(backend, view_value=pre_view)
+    advanced = backend.apply_committed_transition(
+        handle,
+        candidate,
+        pre_view,
+        post_view,
+        committed_receipt(verifier, candidate, pre_view, post_view),
+    )
     assert advanced.state_revision == 5
     assert advanced.routed_state == RunState.SUMMARIZING.value
     assert advanced.run_id == handle.run_id
@@ -353,13 +640,22 @@ def test_duplicate_and_stale_transitions_are_rejected(
     backend: LangGraphExecutionBackend,
 ):
     first = transition()
-    handle = backend.register(plan(), view())
-    advanced = backend.apply_committed_transition(handle, first)
+    pre_view = view(transition_authorities=(authority_for(first),))
+    post_view = post_view_for(pre_view, first)
+    verifier = _BACKEND_VERIFIERS[backend]
+    handle = register_backend(backend, view_value=pre_view)
+    advanced = backend.apply_committed_transition(
+        handle,
+        first,
+        pre_view,
+        post_view,
+        committed_receipt(verifier, first, pre_view, post_view),
+    )
     with pytest.raises(DuplicateExecutionTransitionError):
-        backend.apply_committed_transition(advanced, first)
+        backend.apply_committed_transition(advanced, first, pre_view, post_view, cast(CommittedTransitionReceipt, None))
     with pytest.raises(StaleExecutionTransitionError):
         backend.apply_committed_transition(
-            advanced, transition(idempotency_key="transition-2")
+            advanced, transition(idempotency_key="transition-2"), pre_view, post_view, cast(CommittedTransitionReceipt, None)
         )
 
 
@@ -389,8 +685,16 @@ def test_state_machine_committed_revision_and_backend_projection_agree(
     )
     folded = view(transition_authorities=(authority,))
     committed = GlobalTaskStateMachine().apply(candidate, folded, authorization=evidence)
-    handle = backend.register(plan(), folded)
-    projected = backend.apply_committed_transition(handle, candidate)
+    committed = committed.model_copy(update={"last_event_hash": POST_HASH})
+    verifier = _BACKEND_VERIFIERS[backend]
+    handle = register_backend(backend, view_value=folded)
+    projected = backend.apply_committed_transition(
+        handle,
+        candidate,
+        folded,
+        committed,
+        committed_receipt(verifier, candidate, folded, committed),
+    )
     assert projected.state_revision == committed.state_revision
     assert projected.routed_state == committed.run_state.value
 
@@ -412,7 +716,7 @@ def test_resume_rebuilds_from_folded_view_not_disposable_checkpoint(
         "routed_state": RunState.SUCCEEDED.value,
         "cancelled": True,
     }
-    handle = backend.resume(plan(), folded, disposable_checkpoint=stale_checkpoint)
+    handle = resume_backend(backend, plan(), folded, disposable_checkpoint=stale_checkpoint)
     assert handle.run_id == folded.run_id
     assert handle.trace_id == folded.trace_id
     assert handle.plan_revision == folded.plan_revision
@@ -424,31 +728,31 @@ def test_resume_rebuilds_from_folded_view_not_disposable_checkpoint(
 def test_resume_rejects_different_plan_for_an_existing_run(
     backend: LangGraphExecutionBackend,
 ):
-    backend.register(plan(), view())
+    register_backend(backend)
 
     with pytest.raises(ExecutionPlanMismatchError):
-        backend.resume(plan(plan_id="different-plan"), view())
+        resume_backend(backend, plan(plan_id="different-plan"), view())
 
 
 def test_resume_restores_duplicate_guard_from_folded_view(
     backend: LangGraphExecutionBackend,
 ):
     folded = view(applied_idempotency_keys=("transition-1",))
-    handle = backend.resume(plan(), folded)
+    handle = resume_backend(backend, plan(), folded)
     with pytest.raises(DuplicateExecutionTransitionError):
-        backend.apply_committed_transition(handle, transition())
+        backend.apply_committed_transition(handle, transition(), cast(HarnessSessionView, None), cast(HarnessSessionView, None), cast(CommittedTransitionReceipt, None))
 
 
 def test_cancel_is_idempotent_by_run_id_and_blocks_further_projection(
     backend: LangGraphExecutionBackend,
 ):
-    handle = backend.register(plan(), view())
+    handle = register_backend(backend)
     assert backend.cancel("run-1") is None
     assert backend.cancel("run-1") is None
     with pytest.raises(CancelledExecutionError):
-        backend.apply_committed_transition(handle, transition())
+        backend.apply_committed_transition(handle, transition(), cast(HarnessSessionView, None), cast(HarnessSessionView, None), cast(CommittedTransitionReceipt, None))
     with pytest.raises(CancelledExecutionError):
-        backend.resume(plan(), view())
+        resume_backend(backend, plan(), view())
 
 
 def test_cancel_unknown_run_is_an_idempotent_no_op(
@@ -475,3 +779,238 @@ def test_legacy_llm_workflow_facade_remains_compatible():
         price=lambda result: {"price": 100, "judged": result},
         assemble=lambda result, pricing: (result, pricing),
     ) == ({"price_needed": False}, None)
+
+
+def test_exact_transition_without_post_commit_receipt_is_rejected(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    candidate = transition()
+    pre_view = view(transition_authorities=(authority_for(candidate),))
+    post_view = post_view_for(pre_view, candidate)
+    handle = backend.register(
+        plan_value,
+        pre_view,
+        committed_snapshot(verifier, plan_value, pre_view),
+    )
+
+    with pytest.raises(UnverifiedExecutionReceiptError):
+        backend.apply_committed_transition(
+            handle,
+            candidate,
+            pre_view,
+            post_view,
+            cast(CommittedTransitionReceipt, None),
+        )
+
+
+def test_verified_receipt_cannot_authorize_illegal_running_to_created_edge(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    candidate = transition(to_state=RunState.CREATED.value)
+    pre_view = view(transition_authorities=(authority_for(candidate),))
+    post_view = post_view_for(pre_view, candidate)
+    handle = backend.register(
+        plan_value,
+        pre_view,
+        committed_snapshot(verifier, plan_value, pre_view),
+    )
+    receipt = committed_receipt(
+        verifier, candidate, pre_view, post_view, plan_value=plan_value
+    )
+
+    with pytest.raises(InvalidCommittedTransitionError):
+        backend.apply_committed_transition(
+            handle, candidate, pre_view, post_view, receipt
+        )
+
+
+def test_verified_post_view_without_committed_authority_is_rejected(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    candidate = transition()
+    pre_view = view()
+    post_view = post_view_for(pre_view, candidate)
+    handle = backend.register(
+        plan_value,
+        pre_view,
+        committed_snapshot(verifier, plan_value, pre_view),
+    )
+    receipt = committed_receipt(
+        verifier, candidate, pre_view, post_view, plan_value=plan_value
+    )
+
+    with pytest.raises(InvalidCommittedTransitionError):
+        backend.apply_committed_transition(
+            handle, candidate, pre_view, post_view, receipt
+        )
+
+
+def test_verified_foreign_work_item_transition_is_rejected(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    candidate = HarnessTransition(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="work_item",
+        entity_id="foreign-work",
+        from_state="none",
+        to_state=WorkItemState.PENDING.value,
+        expected_state_revision=4,
+        plan_revision=0,
+        reason_code="foreign-work-created",
+        idempotency_key="foreign-transition",
+        lease_epoch=1,
+        fencing_token_digest=HASH,
+    )
+    pre_view = view(transition_authorities=(authority_for(candidate),))
+    post_view = post_view_for(pre_view, candidate)
+    handle = backend.register(
+        plan_value,
+        pre_view,
+        committed_snapshot(verifier, plan_value, pre_view),
+    )
+    receipt = committed_receipt(
+        verifier, candidate, pre_view, post_view, plan_value=plan_value
+    )
+
+    with pytest.raises(ExecutionIdentityError):
+        backend.apply_committed_transition(
+            handle, candidate, pre_view, post_view, receipt
+        )
+
+
+def test_append_and_fold_then_verified_legal_transition_projects(
+    tmp_path,
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    candidate, pre_view, post_view = committed_running_to_summarizing(tmp_path)
+    handle = backend.register(
+        plan_value,
+        pre_view,
+        committed_snapshot(verifier, plan_value, pre_view),
+    )
+    receipt = committed_receipt(
+        verifier, candidate, pre_view, post_view, plan_value=plan_value
+    )
+
+    advanced = backend.apply_committed_transition(
+        handle, candidate, pre_view, post_view, receipt
+    )
+
+    assert advanced.state_revision == post_view.state_revision
+    assert advanced.routed_state == post_view.run_state.value
+
+
+def test_resume_rejects_older_authoritative_snapshot(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    current_view = view(state_revision=5, sequence=9, last_event_hash=POST_HASH)
+    backend.register(
+        plan_value,
+        current_view,
+        committed_snapshot(verifier, plan_value, current_view),
+    )
+    older_view = view(state_revision=4, sequence=8, last_event_hash=VIEW_HASH)
+
+    with pytest.raises(StaleExecutionSnapshotError):
+        backend.resume(
+            plan_value,
+            older_view,
+            committed_snapshot(verifier, plan_value, older_view),
+        )
+
+
+def test_same_revision_resume_cannot_clear_applied_keys(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    current_view = view(applied_idempotency_keys=("transition-1",))
+    handle = backend.register(
+        plan_value,
+        current_view,
+        committed_snapshot(verifier, plan_value, current_view),
+    )
+    altered_view = view(applied_idempotency_keys=())
+
+    with pytest.raises(StaleExecutionSnapshotError):
+        backend.resume(
+            plan_value,
+            altered_view,
+            committed_snapshot(verifier, plan_value, altered_view),
+        )
+    with pytest.raises(DuplicateExecutionTransitionError):
+        backend.apply_committed_transition(
+            handle,
+            transition(),
+            cast(HarnessSessionView, None),
+            cast(HarnessSessionView, None),
+            cast(CommittedTransitionReceipt, None),
+        )
+
+
+def test_newer_snapshot_cannot_remove_applied_keys(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    current_view = view(applied_idempotency_keys=("transition-1",))
+    backend.register(
+        plan_value,
+        current_view,
+        committed_snapshot(verifier, plan_value, current_view),
+    )
+    newer_view = view(
+        sequence=current_view.sequence + 2,
+        state_revision=current_view.state_revision + 1,
+        run_state=RunState.RECONCILING,
+        applied_idempotency_keys=(),
+        last_event_hash=POST_HASH,
+    )
+
+    with pytest.raises(StaleExecutionSnapshotError):
+        backend.resume(
+            plan_value,
+            newer_view,
+            committed_snapshot(verifier, plan_value, newer_view),
+        )
+
+
+def test_fresh_backend_rejects_self_asserted_unverified_snapshot(
+    backend: LangGraphExecutionBackend,
+):
+    plan_value = plan()
+    view_value = view()
+    unverified = CommittedExecutionSnapshot(
+        run_id=plan_value.run_id,
+        trace_id=plan_value.trace_id,
+        plan_id=plan_value.plan_id,
+        plan_digest=canonical_plan_digest(plan_value),
+        plan_revision=plan_value.revision,
+        sequence=view_value.sequence,
+        state_revision=view_value.state_revision,
+        view_digest=canonical_view_digest(view_value),
+        event_head_hash=view_value.last_event_hash,
+    )
+
+    with pytest.raises(UnverifiedExecutionReceiptError):
+        backend.register(plan_value, view_value, unverified)
+
+
+def test_langgraph_router_rejects_transition_even_when_exact_type():
+    with pytest.raises(UncommittedTransitionError):
+        route_committed_transition(
+            cast(object, {"committed_transition": transition()})
+        )

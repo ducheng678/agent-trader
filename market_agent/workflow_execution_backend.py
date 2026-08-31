@@ -1,30 +1,34 @@
-"""Execution projection boundary for committed deterministic Harness transitions."""
+"""Execution projection boundary for durably committed Harness transitions."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+import hashlib
+import json
 from threading import RLock
 from typing import Protocol, TypedDict, cast, runtime_checkable
 
-from pydantic import StrictBool
+from pydantic import StrictBool, model_validator
 
-from market_agent.workflow_contracts import (
-    ContractModel,
-    NonNegativeInt,
-    ShortText,
-)
+from market_agent.workflow_contracts import ContractModel, Digest, NonNegativeInt, PositiveInt, ShortText
 from market_agent.workflow_harness_contracts import (
-    AttemptState,
+    AttemptWorkItemOwnershipRecord,
     HarnessPlan,
     HarnessSessionView,
     HarnessTransition,
-    RunState,
-    WorkItemState,
+    TransitionAuthorityRecord,
+)
+from market_agent.workflow_state_machine import (
+    AttemptTransitionAuthorization,
+    GlobalTaskStateMachine,
+    RunTransitionEvidence,
+    StateMachineError,
+    WorkItemTransitionAuthorization,
 )
 
 try:
     from langgraph.graph import END, START, StateGraph
-except ImportError as error:  # pragma: no cover - exercised only without the extra
+except ImportError as error:  # pragma: no cover
     END = START = StateGraph = None
     _LANGGRAPH_IMPORT_ERROR: ImportError | None = error
 else:
@@ -32,56 +36,66 @@ else:
 
 
 class ExecutionBackendError(RuntimeError):
-    """Base class for an execution-backend boundary failure."""
+    """Base execution-backend boundary failure."""
 
 
 class ExecutionBackendUnavailableError(ExecutionBackendError):
-    """The optional execution-engine dependency is not installed."""
+    """The optional execution-engine dependency is unavailable."""
 
 
 class InvalidExecutionInputError(ExecutionBackendError):
-    """A public input is not an exact, valid strict Harness contract."""
+    """A public value is not an exact strict Harness contract."""
 
 
 class ExecutionRegistrationError(ExecutionBackendError):
-    """A run cannot be registered without conflicting with executor state."""
+    """Registration conflicts with executor state."""
 
 
 class ExecutionIdentityError(ExecutionBackendError):
-    """Run, trace, or entity identity does not match the registered execution."""
+    """Execution or entity ownership does not match."""
 
 
 class ExecutionPlanMismatchError(ExecutionBackendError):
-    """The active plan identity or revision does not match."""
+    """Committed plan identity, digest, or revision does not match."""
 
 
 class ExecutionHandleMismatchError(ExecutionBackendError):
-    """The caller supplied a stale, forged, or unknown execution handle."""
+    """An execution handle is stale, forged, or unknown."""
 
 
 class UncommittedTransitionError(ExecutionBackendError):
-    """A value other than an exact committed HarnessTransition reached routing."""
+    """Unvalidated data reached the LangGraph router."""
+
+
+class UnverifiedExecutionReceiptError(ExecutionBackendError):
+    """Commit authority is absent, malformed, or unverified."""
+
+
+class InvalidCommittedTransitionError(ExecutionBackendError):
+    """A claimed commit is inconsistent with authoritative state."""
+
+
+class StaleExecutionSnapshotError(ExecutionBackendError):
+    """Resume would replace authority with stale or divergent state."""
 
 
 class StaleExecutionTransitionError(ExecutionBackendError):
-    """A transition was prepared against a different authoritative revision."""
+    """A transition targets a different authoritative revision."""
 
 
 class DuplicateExecutionTransitionError(ExecutionBackendError):
-    """A committed transition idempotency key was already projected."""
+    """A committed idempotency key was already projected."""
 
 
 class CancelledExecutionError(ExecutionBackendError):
-    """A cancelled executor projection cannot be resumed or advanced."""
+    """A cancelled projection cannot be resumed or advanced."""
 
 
 class ExecutionProjectionError(ExecutionBackendError):
-    """LangGraph failed to project an otherwise valid committed transition."""
+    """LangGraph failed to project a validated route."""
 
 
 class ExecutionHandle(ContractModel):
-    """Frozen executor projection; it is never an orchestration authority."""
-
     run_id: ShortText
     trace_id: ShortText
     plan_id: ShortText
@@ -91,38 +105,71 @@ class ExecutionHandle(ContractModel):
     cancelled: StrictBool = False
 
 
-class BackendProjection(TypedDict, total=False):
-    """Disposable LangGraph state for one committed transition projection."""
+class CommittedExecutionSnapshot(ContractModel):
+    """Host-verifiable binding of a plan to one folded event-chain head."""
 
-    committed_transition: HarnessTransition
+    run_id: ShortText
+    trace_id: ShortText
+    plan_id: ShortText
+    plan_digest: Digest
+    plan_revision: NonNegativeInt
+    sequence: PositiveInt
+    state_revision: NonNegativeInt
+    view_digest: Digest
+    event_head_hash: Digest
+
+
+class CommittedTransitionReceipt(ContractModel):
+    """Host-verifiable proof connecting two committed folds."""
+
+    pre: CommittedExecutionSnapshot
+    post: CommittedExecutionSnapshot
+    transition_digest: Digest
+
+    @model_validator(mode="after")
+    def validate_continuity(self) -> CommittedTransitionReceipt:
+        fields = ("run_id", "trace_id", "plan_id", "plan_digest", "plan_revision")
+        if any(getattr(self.pre, name) != getattr(self.post, name) for name in fields):
+            raise ValueError("receipt endpoints have different execution identity")
+        if self.post.sequence != self.pre.sequence + 1:
+            raise ValueError("receipt sequence must advance exactly once")
+        if self.post.state_revision != self.pre.state_revision + 1:
+            raise ValueError("receipt state revision must advance exactly once")
+        if self.post.event_head_hash == self.pre.event_head_hash:
+            raise ValueError("receipt event-chain head must advance")
+        return self
+
+
+AuthorityVerifier = Callable[[object], bool]
+_ROUTE_CAPABILITY = object()
+
+
+class _ValidatedRoute:
+    __slots__ = ("_capability", "target")
+
+    def __init__(self, target: str, capability: object) -> None:
+        if capability is not _ROUTE_CAPABILITY:
+            raise TypeError("validated routes are backend-internal")
+        self._capability = capability
+        self.target = target
+
+
+class BackendProjection(TypedDict, total=False):
+    validated_route: object
     routed_state: str
 
 
 @runtime_checkable
 class ExecutionBackend(Protocol):
-    def register(
-        self, plan: HarnessPlan, view: HarnessSessionView
-    ) -> ExecutionHandle: ...
-
-    def apply_committed_transition(
-        self, handle: ExecutionHandle, transition: HarnessTransition
-    ) -> ExecutionHandle: ...
-
-    def resume(
-        self,
-        plan: HarnessPlan,
-        folded_view: HarnessSessionView,
-        *,
-        disposable_checkpoint: object | None = None,
-    ) -> ExecutionHandle: ...
-
+    def register(self, plan: HarnessPlan, view: HarnessSessionView, committed_snapshot: CommittedExecutionSnapshot) -> ExecutionHandle: ...
+    def apply_committed_transition(self, handle: ExecutionHandle, transition: HarnessTransition, pre_view: HarnessSessionView, post_view: HarnessSessionView, receipt: CommittedTransitionReceipt) -> ExecutionHandle: ...
+    def resume(self, plan: HarnessPlan, folded_view: HarnessSessionView, committed_snapshot: CommittedExecutionSnapshot, *, disposable_checkpoint: object | None = None) -> ExecutionHandle: ...
     def cancel(self, run_id: str) -> None: ...
 
 
 def _reject_undeclared_model_fields(value: object) -> None:
     if isinstance(value, ContractModel):
-        declared = type(value).model_fields
-        if set(value.__dict__).difference(declared):
+        if set(value.__dict__).difference(type(value).model_fields):
             raise ValueError("contract model contains undeclared fields")
         for item in value.__dict__.values():
             _reject_undeclared_model_fields(item)
@@ -134,18 +181,12 @@ def _reject_undeclared_model_fields(value: object) -> None:
             _reject_undeclared_model_fields(item)
 
 
-def _fresh_contract(
-    value: object,
-    expected_type: type[ContractModel],
-    error_type: type[ExecutionBackendError],
-    message: str,
-) -> ContractModel:
+def _fresh_contract(value: object, expected_type: type[ContractModel], error_type: type[ExecutionBackendError], message: str) -> ContractModel:
     if type(value) is not expected_type:
         raise error_type(message)
     try:
         _reject_undeclared_model_fields(value)
-        values = value.model_dump(mode="python", exclude_unset=True)
-        return expected_type.model_validate(values)
+        return expected_type.model_validate(value.model_dump(mode="python", exclude_unset=True))
     except ExecutionBackendError:
         raise
     except Exception as error:
@@ -153,306 +194,342 @@ def _fresh_contract(
 
 
 def _fresh_plan(value: object) -> HarnessPlan:
-    return cast(
-        HarnessPlan,
-        _fresh_contract(
-            value,
-            HarnessPlan,
-            InvalidExecutionInputError,
-            "execution plan must be an exact valid HarnessPlan",
-        ),
-    )
+    return cast(HarnessPlan, _fresh_contract(value, HarnessPlan, InvalidExecutionInputError, "execution plan must be an exact valid HarnessPlan"))
 
 
 def _fresh_view(value: object) -> HarnessSessionView:
-    return cast(
-        HarnessSessionView,
-        _fresh_contract(
-            value,
-            HarnessSessionView,
-            InvalidExecutionInputError,
-            "execution view must be an exact valid folded HarnessSessionView",
-        ),
-    )
+    return cast(HarnessSessionView, _fresh_contract(value, HarnessSessionView, InvalidExecutionInputError, "execution view must be an exact valid folded HarnessSessionView"))
 
 
 def _fresh_handle(value: object) -> ExecutionHandle:
-    return cast(
-        ExecutionHandle,
-        _fresh_contract(
-            value,
-            ExecutionHandle,
-            ExecutionHandleMismatchError,
-            "execution handle is stale, forged, or invalid",
-        ),
-    )
+    return cast(ExecutionHandle, _fresh_contract(value, ExecutionHandle, ExecutionHandleMismatchError, "execution handle is stale, forged, or invalid"))
 
 
 def _fresh_transition(value: object) -> HarnessTransition:
-    return cast(
-        HarnessTransition,
-        _fresh_contract(
-            value,
-            HarnessTransition,
-            UncommittedTransitionError,
-            "LangGraph routing requires an exact committed HarnessTransition",
-        ),
-    )
+    return cast(HarnessTransition, _fresh_contract(value, HarnessTransition, UncommittedTransitionError, "transition must be an exact valid HarnessTransition"))
 
 
-def _validated_route(transition: HarnessTransition) -> str:
-    enum_type = {
-        "run": RunState,
-        "work_item": WorkItemState,
-        "attempt": AttemptState,
-    }[transition.entity_kind]
-    try:
-        enum_type(transition.to_state)
-    except ValueError as error:
-        raise UncommittedTransitionError(
-            "committed transition has an unknown target state"
-        ) from error
-    return transition.to_state
+def _fresh_snapshot(value: object) -> CommittedExecutionSnapshot:
+    return cast(CommittedExecutionSnapshot, _fresh_contract(value, CommittedExecutionSnapshot, UnverifiedExecutionReceiptError, "execution requires an exact committed snapshot"))
+
+
+def _fresh_receipt(value: object) -> CommittedTransitionReceipt:
+    return cast(CommittedTransitionReceipt, _fresh_contract(value, CommittedTransitionReceipt, UnverifiedExecutionReceiptError, "transition requires an exact committed receipt"))
+
+
+def _canonical_digest(value: ContractModel) -> str:
+    encoded = json.dumps(value.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def canonical_plan_digest(plan: HarnessPlan) -> str:
+    return _canonical_digest(_fresh_plan(plan))
+
+
+def canonical_view_digest(view: HarnessSessionView) -> str:
+    return _canonical_digest(_fresh_view(view))
+
+
+def canonical_transition_digest(transition: HarnessTransition) -> str:
+    return _canonical_digest(_fresh_transition(transition))
+
+
+def _route_from_projection(state: object) -> _ValidatedRoute:
+    if not isinstance(state, Mapping):
+        raise UncommittedTransitionError("LangGraph requires a validated route")
+    route = state.get("validated_route")
+    if type(route) is not _ValidatedRoute or route._capability is not _ROUTE_CAPABILITY:
+        raise UncommittedTransitionError("LangGraph accepts only backend-validated routes")
+    return route
 
 
 def route_committed_transition(state: BackendProjection) -> str:
-    """Return the only permitted edge selector: a strict committed transition."""
-
-    if not isinstance(state, Mapping):
-        raise UncommittedTransitionError(
-            "LangGraph routing requires a committed-transition projection"
-        )
-    transition = _fresh_transition(state.get("committed_transition"))
-    return _validated_route(transition)
+    return _route_from_projection(state).target
 
 
-def _accept_committed_transition(state: BackendProjection) -> BackendProjection:
-    transition = _fresh_transition(state.get("committed_transition"))
-    _validated_route(transition)
-    return {"committed_transition": transition}
+def _accept_validated_route(state: BackendProjection) -> BackendProjection:
+    return {"validated_route": _route_from_projection(state)}
 
 
-def _project_route(route: str):
+def _project_route(target: str):
     def project(state: BackendProjection) -> BackendProjection:
-        transition = _fresh_transition(state.get("committed_transition"))
-        if _validated_route(transition) != route:
-            raise UncommittedTransitionError(
-                "committed transition changed during LangGraph projection"
-            )
-        return {"routed_state": route}
-
+        route = _route_from_projection(state)
+        if route.target != target:
+            raise UncommittedTransitionError("validated route changed during projection")
+        return {"routed_state": target}
     return project
 
 
-_ALL_ROUTES = tuple(
-    sorted(
-        {
-            *(state.value for state in RunState),
-            *(state.value for state in WorkItemState),
-            *(state.value for state in AttemptState),
-        }
-    )
-)
+_ALL_ROUTES = ("admitted", "cancelled", "completed", "created", "failed", "pending", "planned", "ready", "reconciling", "retryable", "running", "skipped", "stale", "succeeded", "summarizing", "waiting_reconciliation")
 
 
 def _build_projection_graph():
     if StateGraph is None or START is None or END is None:
-        raise ExecutionBackendUnavailableError(
-            "LangGraph is required for LangGraphExecutionBackend"
-        ) from _LANGGRAPH_IMPORT_ERROR
+        raise ExecutionBackendUnavailableError("LangGraph is required") from _LANGGRAPH_IMPORT_ERROR
     builder = StateGraph(BackendProjection)
-    router_node = "accept_committed_transition"
-    builder.add_node(router_node, _accept_committed_transition)
+    router_node = "accept_validated_route"
+    builder.add_node(router_node, _accept_validated_route)
     builder.add_edge(START, router_node)
-    route_nodes: dict[str, str] = {}
-    for route in _ALL_ROUTES:
-        node_name = f"project_{route}"
-        route_nodes[route] = node_name
-        builder.add_node(node_name, _project_route(route))
+    route_nodes = {}
+    for target in _ALL_ROUTES:
+        node_name = f"project_{target}"
+        route_nodes[target] = node_name
+        builder.add_node(node_name, _project_route(target))
         builder.add_edge(node_name, END)
     builder.add_conditional_edges(router_node, route_committed_transition, route_nodes)
     return builder.compile()
 
 
-def _validate_plan_view(
-    plan: HarnessPlan, view: HarnessSessionView
-) -> tuple[HarnessPlan, HarnessSessionView]:
+def _validate_plan_view(plan: HarnessPlan, view: HarnessSessionView) -> tuple[HarnessPlan, HarnessSessionView]:
     plan = _fresh_plan(plan)
     view = _fresh_view(view)
     if view.run_id is None or view.trace_id is None:
-        raise ExecutionIdentityError(
-            "executor registration requires folded run and trace identity"
-        )
+        raise ExecutionIdentityError("folded run and trace identity is required")
     if plan.run_id != view.run_id or plan.trace_id != view.trace_id:
-        raise ExecutionIdentityError(
-            "plan identity does not match the folded Harness view"
-        )
+        raise ExecutionIdentityError("plan identity does not match folded view")
     if plan.revision != view.plan_revision:
-        raise ExecutionPlanMismatchError(
-            "plan revision does not match the folded Harness view"
-        )
+        raise ExecutionPlanMismatchError("plan revision does not match folded view")
+    if view.last_event_hash is None:
+        raise UnverifiedExecutionReceiptError("folded view has no committed event head")
     return plan, view
 
 
-def _handle_from_view(
-    plan: HarnessPlan, view: HarnessSessionView
-) -> ExecutionHandle:
-    return ExecutionHandle(
-        run_id=plan.run_id,
-        trace_id=plan.trace_id,
-        plan_id=plan.plan_id,
-        plan_revision=plan.revision,
-        state_revision=view.state_revision,
-        routed_state=view.run_state.value if view.run_state is not None else None,
-        cancelled=False,
-    )
+def _handle_from_view(plan: HarnessPlan, view: HarnessSessionView) -> ExecutionHandle:
+    return ExecutionHandle(run_id=plan.run_id, trace_id=plan.trace_id, plan_id=plan.plan_id, plan_revision=plan.revision, state_revision=view.state_revision, routed_state=view.run_state.value if view.run_state is not None else None, cancelled=False)
 
 
 class LangGraphExecutionBackend:
-    """Disposable LangGraph projection driven only by committed transitions."""
+    """Disposable projection driven only by verified committed Harness state."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, authority_verifier: AuthorityVerifier) -> None:
+        if not callable(authority_verifier) or isinstance(authority_verifier, Mapping):
+            raise InvalidExecutionInputError("authority verifier must be callable")
+        self._authority_verifier = authority_verifier
         self._graph = _build_projection_graph()
+        self._state_machine = GlobalTaskStateMachine()
         self._lock = RLock()
         self._handles: dict[str, ExecutionHandle] = {}
         self._plans: dict[str, HarnessPlan] = {}
+        self._views: dict[str, HarnessSessionView] = {}
+        self._snapshots: dict[str, CommittedExecutionSnapshot] = {}
         self._applied_idempotency_keys: dict[str, set[str]] = {}
         self._cancelled_run_ids: set[str] = set()
 
-    def register(
-        self, plan: HarnessPlan, view: HarnessSessionView
-    ) -> ExecutionHandle:
+    def _verify_authority(self, value: ContractModel) -> None:
+        try:
+            verified = self._authority_verifier(value)
+        except Exception as error:
+            raise UnverifiedExecutionReceiptError("commit authority verification failed") from error
+        if type(verified) is not bool or not verified:
+            raise UnverifiedExecutionReceiptError("commit authority was not verified")
+
+    def _validated_snapshot(self, plan: HarnessPlan, view: HarnessSessionView, snapshot: CommittedExecutionSnapshot) -> tuple[HarnessPlan, HarnessSessionView, CommittedExecutionSnapshot]:
         plan, view = _validate_plan_view(plan, view)
+        snapshot = _fresh_snapshot(snapshot)
+        matches = (
+            snapshot.run_id == plan.run_id == view.run_id
+            and snapshot.trace_id == plan.trace_id == view.trace_id
+            and snapshot.plan_id == plan.plan_id
+            and snapshot.plan_revision == plan.revision == view.plan_revision
+            and snapshot.plan_digest == canonical_plan_digest(plan)
+            and snapshot.sequence == view.sequence
+            and snapshot.state_revision == view.state_revision
+            and snapshot.view_digest == canonical_view_digest(view)
+            and snapshot.event_head_hash == view.last_event_hash
+        )
+        if not matches:
+            raise UnverifiedExecutionReceiptError("snapshot does not bind the plan and folded view")
+        self._verify_authority(snapshot)
+        return plan, view, snapshot
+
+    def register(self, plan: HarnessPlan, view: HarnessSessionView, committed_snapshot: CommittedExecutionSnapshot) -> ExecutionHandle:
+        plan, view, committed_snapshot = self._validated_snapshot(plan, view, committed_snapshot)
         handle = _handle_from_view(plan, view)
         with self._lock:
             if plan.run_id in self._cancelled_run_ids:
-                raise CancelledExecutionError(
-                    "cancelled execution cannot be registered again"
-                )
+                raise CancelledExecutionError("cancelled execution cannot be registered")
             existing = self._handles.get(plan.run_id)
             if existing is not None:
-                if existing == handle and self._plans.get(plan.run_id) == plan:
+                if existing == handle and self._plans.get(plan.run_id) == plan and self._views.get(plan.run_id) == view and self._snapshots.get(plan.run_id) == committed_snapshot:
                     return existing
-                raise ExecutionRegistrationError(
-                    "run is already registered with different executor state"
-                )
+                raise ExecutionRegistrationError("run is already registered differently")
             self._handles[plan.run_id] = handle
             self._plans[plan.run_id] = plan
-            self._applied_idempotency_keys[plan.run_id] = set(
-                view.applied_idempotency_keys
-            )
+            self._views[plan.run_id] = view
+            self._snapshots[plan.run_id] = committed_snapshot
+            self._applied_idempotency_keys[plan.run_id] = set(view.applied_idempotency_keys)
             return handle
 
-    def apply_committed_transition(
-        self, handle: ExecutionHandle, transition: HarnessTransition
-    ) -> ExecutionHandle:
+    @staticmethod
+    def _authorization(transition: HarnessTransition, view: HarnessSessionView) -> RunTransitionEvidence | WorkItemTransitionAuthorization | AttemptTransitionAuthorization:
+        matching = [record for record in view.transition_authorities if (
+            record.run_id == transition.run_id
+            and record.trace_id == transition.trace_id
+            and record.entity_kind == transition.entity_kind
+            and record.entity_id == transition.entity_id
+            and record.from_state == transition.from_state
+            and record.to_state == transition.to_state
+            and record.expected_state_revision == transition.expected_state_revision
+            and record.plan_revision == transition.plan_revision
+            and record.reason_code == transition.reason_code
+            and record.idempotency_key == transition.idempotency_key
+            and record.lease_epoch == transition.lease_epoch
+            and record.fencing_token_digest == transition.fencing_token_digest
+        )]
+        if len(matching) != 1:
+            raise InvalidCommittedTransitionError("exactly one committed authority record must identify the transition")
+        record: TransitionAuthorityRecord = matching[0]
+        common: dict[str, object] = {
+            "run_id": record.run_id,
+            "trace_id": record.trace_id,
+            "entity_id": record.entity_id,
+            "expected_state_revision": record.expected_state_revision,
+            "plan_revision": record.plan_revision,
+            "dependency_versions": record.dependency_versions,
+        }
+        if transition.entity_kind == "run":
+            return RunTransitionEvidence(**common)
+        leased = {
+            **common,
+            "reservation_id": record.reservation_id,
+            "grant_id": record.grant_id,
+            "lease_epoch": record.lease_epoch,
+            "fencing_token_digest": record.fencing_token_digest,
+        }
+        if transition.entity_kind == "work_item":
+            return WorkItemTransitionAuthorization(**leased)
+        return AttemptTransitionAuthorization(**leased)
+
+    @staticmethod
+    def _validate_entity_ownership(plan: HarnessPlan, view: HarnessSessionView, transition: HarnessTransition) -> None:
+        work_item_ids = {item.work_item_id for item in plan.work_items}
+        if transition.entity_kind == "run":
+            if transition.entity_id != plan.run_id:
+                raise ExecutionIdentityError("run transition entity is foreign")
+            return
+        if transition.entity_kind == "work_item":
+            if transition.entity_id not in work_item_ids:
+                raise ExecutionIdentityError("work item is not owned by the plan")
+            return
+        owners = [owner for owner in view.attempt_work_item_owners if owner.attempt_id == transition.entity_id]
+        if len(owners) != 1:
+            raise ExecutionIdentityError("attempt has no unique committed owner")
+        owner: AttemptWorkItemOwnershipRecord = owners[0]
+        if owner.run_id != plan.run_id or owner.trace_id != plan.trace_id or owner.plan_revision != plan.revision or owner.work_item_id not in work_item_ids:
+            raise ExecutionIdentityError("attempt ownership is foreign to the plan")
+
+    def apply_committed_transition(self, handle: ExecutionHandle, transition: HarnessTransition, pre_view: HarnessSessionView, post_view: HarnessSessionView, receipt: CommittedTransitionReceipt) -> ExecutionHandle:
         handle = _fresh_handle(handle)
         transition = _fresh_transition(transition)
         with self._lock:
             if handle.run_id in self._cancelled_run_ids:
-                raise CancelledExecutionError(
-                    "cancelled execution cannot project transitions"
-                )
+                raise CancelledExecutionError("cancelled execution cannot project transitions")
             current = self._handles.get(handle.run_id)
             if current is None or current != handle:
-                raise ExecutionHandleMismatchError(
-                    "execution handle is stale, forged, or unknown"
-                )
+                raise ExecutionHandleMismatchError("execution handle is stale, forged, or unknown")
             applied = self._applied_idempotency_keys[handle.run_id]
             if transition.idempotency_key in applied:
-                raise DuplicateExecutionTransitionError(
-                    "transition idempotency key was already projected"
-                )
-            if (
-                transition.run_id != handle.run_id
-                or transition.trace_id != handle.trace_id
-                or (
-                    transition.entity_kind == "run"
-                    and transition.entity_id != handle.run_id
-                )
-            ):
-                raise ExecutionIdentityError(
-                    "transition identity does not match execution handle"
-                )
+                raise DuplicateExecutionTransitionError("idempotency key was already projected")
+            if transition.run_id != handle.run_id or transition.trace_id != handle.trace_id:
+                raise ExecutionIdentityError("transition identity does not match execution")
             if transition.plan_revision != handle.plan_revision:
-                raise ExecutionPlanMismatchError(
-                    "transition plan revision does not match execution handle"
-                )
+                raise ExecutionPlanMismatchError("transition plan revision does not match")
             if transition.expected_state_revision != handle.state_revision:
-                raise StaleExecutionTransitionError(
-                    "transition expected state revision is stale"
-                )
+                raise StaleExecutionTransitionError("transition revision is stale")
+
+            plan = self._plans[handle.run_id]
+            pre_view = _fresh_view(pre_view)
+            post_view = _fresh_view(post_view)
+            receipt = _fresh_receipt(receipt)
+            _, pre_view, pre_snapshot = self._validated_snapshot(plan, pre_view, receipt.pre)
+            _, post_view, post_snapshot = self._validated_snapshot(plan, post_view, receipt.post)
+            self._verify_authority(receipt)
+            if canonical_transition_digest(transition) != receipt.transition_digest:
+                raise InvalidCommittedTransitionError("receipt identifies another transition")
+            if self._views[handle.run_id] != pre_view or self._snapshots[handle.run_id] != pre_snapshot or pre_snapshot.state_revision != handle.state_revision:
+                raise StaleExecutionTransitionError("receipt pre-state is not registered authority")
+            self._validate_entity_ownership(plan, pre_view, transition)
+            authorization = self._authorization(transition, pre_view)
             try:
-                projected = self._graph.invoke(
-                    {"committed_transition": transition}
-                )
+                expected_post = self._state_machine.apply(transition, pre_view, authorization=authorization)
+            except StateMachineError as error:
+                raise InvalidCommittedTransitionError("transition is illegal for authoritative pre-state") from error
+            if expected_post.model_dump(exclude={"last_event_hash"}) != post_view.model_dump(exclude={"last_event_hash"}):
+                raise InvalidCommittedTransitionError("post fold differs from state-machine result")
+
+            target = post_view.run_state.value if transition.entity_kind == "run" and post_view.run_state is not None else transition.to_state
+            route = _ValidatedRoute(target, _ROUTE_CAPABILITY)
+            try:
+                projected = self._graph.invoke({"validated_route": route})
             except UncommittedTransitionError:
                 raise
             except Exception as error:
-                raise ExecutionProjectionError(
-                    "LangGraph failed to project committed transition"
-                ) from error
+                raise ExecutionProjectionError("LangGraph failed to project route") from error
             routed_state = projected.get("routed_state")
-            if routed_state != transition.to_state:
-                raise ExecutionProjectionError(
-                    "LangGraph projected an inconsistent transition target"
-                )
+            if routed_state != target:
+                raise ExecutionProjectionError("LangGraph projected inconsistent target")
             advanced = ExecutionHandle(
                 run_id=handle.run_id,
                 trace_id=handle.trace_id,
                 plan_id=handle.plan_id,
                 plan_revision=handle.plan_revision,
-                state_revision=handle.state_revision + 1,
+                state_revision=post_view.state_revision,
                 routed_state=routed_state,
                 cancelled=False,
             )
             self._handles[handle.run_id] = advanced
+            self._views[handle.run_id] = post_view
+            self._snapshots[handle.run_id] = post_snapshot
             applied.add(transition.idempotency_key)
             return advanced
 
-    def resume(
-        self,
-        plan: HarnessPlan,
-        folded_view: HarnessSessionView,
-        *,
-        disposable_checkpoint: object | None = None,
-    ) -> ExecutionHandle:
-        # Checkpoints are deliberately neither read nor validated. The event-folded
-        # view is the complete authority for executor reconstruction.
-        plan, folded_view = _validate_plan_view(plan, folded_view)
+    def resume(self, plan: HarnessPlan, folded_view: HarnessSessionView, committed_snapshot: CommittedExecutionSnapshot, *, disposable_checkpoint: object | None = None) -> ExecutionHandle:
+        # Disposable checkpoints are intentionally unread and non-authoritative.
+        plan, folded_view, committed_snapshot = self._validated_snapshot(plan, folded_view, committed_snapshot)
         handle = _handle_from_view(plan, folded_view)
+        incoming_keys = set(folded_view.applied_idempotency_keys)
         with self._lock:
             if plan.run_id in self._cancelled_run_ids:
-                raise CancelledExecutionError(
-                    "cancelled execution cannot be resumed"
-                )
+                raise CancelledExecutionError("cancelled execution cannot be resumed")
             existing_plan = self._plans.get(plan.run_id)
-            if existing_plan is not None and existing_plan != plan:
-                raise ExecutionPlanMismatchError(
-                    "resume plan differs from the registered execution plan"
-                )
+            if existing_plan is None:
+                self._plans[plan.run_id] = plan
+                self._views[plan.run_id] = folded_view
+                self._snapshots[plan.run_id] = committed_snapshot
+                self._handles[plan.run_id] = handle
+                self._applied_idempotency_keys[plan.run_id] = incoming_keys
+                return handle
+            if existing_plan != plan:
+                raise ExecutionPlanMismatchError("resume plan differs from registered plan")
+            current = self._handles[plan.run_id]
+            current_view = self._views[plan.run_id]
+            current_snapshot = self._snapshots[plan.run_id]
+            current_keys = self._applied_idempotency_keys[plan.run_id]
+            if folded_view.state_revision < current_view.state_revision:
+                raise StaleExecutionSnapshotError("resume snapshot is older than authority")
+            if folded_view.state_revision == current_view.state_revision:
+                if folded_view != current_view or committed_snapshot != current_snapshot or incoming_keys != current_keys:
+                    raise StaleExecutionSnapshotError("same-revision snapshot diverges from authority")
+                return current
+            if folded_view.sequence <= current_view.sequence or committed_snapshot.event_head_hash == current_snapshot.event_head_hash or not current_keys.issubset(incoming_keys):
+                raise StaleExecutionSnapshotError("new snapshot is not a monotonic extension")
             self._handles[plan.run_id] = handle
-            self._plans[plan.run_id] = plan
-            self._applied_idempotency_keys[plan.run_id] = set(
-                folded_view.applied_idempotency_keys
-            )
+            self._views[plan.run_id] = folded_view
+            self._snapshots[plan.run_id] = committed_snapshot
+            self._applied_idempotency_keys[plan.run_id] = incoming_keys
             return handle
 
     def cancel(self, run_id: str) -> None:
         if type(run_id) is not str:
-            raise InvalidExecutionInputError(
-                "run identifier must be a strict string"
-            )
+            raise InvalidExecutionInputError("run identifier must be a strict string")
         normalized = run_id.strip()
         if not normalized or len(normalized) > 256:
-            raise InvalidExecutionInputError(
-                "run identifier must be nonblank and at most 256 characters"
-            )
+            raise InvalidExecutionInputError("run identifier must be nonblank and at most 256 characters")
         with self._lock:
             current = self._handles.get(normalized)
             if current is None or normalized in self._cancelled_run_ids:
                 return
-            cancelled = ExecutionHandle(
+            self._handles[normalized] = ExecutionHandle(
                 run_id=current.run_id,
                 trace_id=current.trace_id,
                 plan_id=current.plan_id,
@@ -461,5 +538,4 @@ class LangGraphExecutionBackend:
                 routed_state=current.routed_state,
                 cancelled=True,
             )
-            self._handles[normalized] = cancelled
             self._cancelled_run_ids.add(normalized)
