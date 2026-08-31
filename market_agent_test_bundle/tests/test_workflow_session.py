@@ -8,7 +8,13 @@ import sqlite3
 
 import pytest
 
-from market_agent.workflow_harness_contracts import HarnessTransition, RunState
+from market_agent.workflow_harness_contracts import (
+    AttemptWorkItemOwnershipRecord,
+    HarnessTransition,
+    ReconciliationResolutionRecord,
+    RunState,
+    TransitionAuthorityRecord,
+)
 from market_agent.workflow_session import (
     EventIntegrityError,
     HarnessEvent,
@@ -109,6 +115,36 @@ def work_event(event_id: str, lease, *, payload=None) -> HarnessEvent:
             lease_epoch=lease.lease_epoch,
             fencing_token_digest=lease_digest(lease.fencing_token),
         ),
+    )
+
+
+def authority_event(
+    event_id: str,
+    *,
+    transition_authority=None,
+    attempt_ownership=None,
+    reconciliation_resolution=None,
+) -> HarnessEvent:
+    event_type = (
+        "transition_authorized"
+        if transition_authority is not None
+        else "attempt_ownership_recorded"
+        if attempt_ownership is not None
+        else "reconciliation_resolved"
+    )
+    return HarnessEvent(
+        event_id=event_id,
+        trace_id="trace-1",
+        span_id=f"span-{event_id}",
+        run_id="run-1",
+        event_type=event_type,
+        occurred_at=NOW,
+        monotonic_offset=4.0,
+        actor="harness",
+        payload={"authority_record": event_type},
+        transition_authority=transition_authority,
+        attempt_ownership=attempt_ownership,
+        reconciliation_resolution=reconciliation_resolution,
     )
 
 
@@ -772,3 +808,65 @@ def test_live_fencing_token_is_absent_from_event_and_outbox_json(store, tmp_path
     assert lease_digest(lease.fencing_token) in event_json
     assert lease_digest(lease.fencing_token) in lease_row
     assert json.loads(event_json)["transition"]["lease_epoch"] == lease.lease_epoch
+
+
+def test_allowlisted_authority_events_fold_durable_transition_relationships(store):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    authority = TransitionAuthorityRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="work_item",
+        entity_id="work-1",
+        expected_state_revision=1,
+        plan_revision=0,
+        dependency_versions=(),
+        reservation_id="reservation-1",
+        grant_id="grant-1",
+        lease_epoch=1,
+        fencing_token_digest="a" * 64,
+    )
+    ownership = AttemptWorkItemOwnershipRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        attempt_id="attempt-1",
+        work_item_id="work-1",
+        plan_revision=0,
+    )
+    resolution = ReconciliationResolutionRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        reconciliation_id="broker-observation-1",
+        expected_state_revision=1,
+        plan_revision=0,
+        broker_observation_digest="a" * 64,
+        side_effect_resolved=True,
+    )
+
+    for event in (
+        authority_event("authority", transition_authority=authority),
+        authority_event("ownership", attempt_ownership=ownership),
+        authority_event("resolution", reconciliation_resolution=resolution),
+    ):
+        store.append(
+            event,
+            expected_sequence=store.snapshot("run-1").sequence,
+            expected_state_revision=store.snapshot("run-1").state_revision,
+        )
+
+    view = store.snapshot("run-1")
+    assert view.transition_authorities == (authority,)
+    assert view.attempt_work_item_owners == (ownership,)
+    assert view.reconciliation_resolutions == (resolution,)
+
+
+def test_generic_audit_payload_cannot_be_interpreted_as_authority(store):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    store.append(
+        audit_event("looks-authoritative").model_copy(
+            update={"payload": {"reservation_id": "reservation-1"}}
+        ),
+        expected_sequence=1,
+        expected_state_revision=1,
+    )
+
+    assert store.snapshot("run-1").transition_authorities == ()

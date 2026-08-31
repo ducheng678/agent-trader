@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from market_agent.workflow_contracts import WorkflowMode
 from market_agent.workflow_harness_contracts import (
+    AttemptWorkItemOwnershipRecord,
     AttemptState,
     HarnessOutcome,
     HarnessPlan,
@@ -15,10 +16,12 @@ from market_agent.workflow_harness_contracts import (
     PinnedVersions,
     ProgressTargetSet,
     ProgressVector,
+    ReconciliationResolutionRecord,
     RiskClass,
     RunState,
     StageSpec,
     TaskKind,
+    TransitionAuthorityRecord,
     WorkItemSpec,
     WorkItemState,
     WorkerSpec,
@@ -570,3 +573,43 @@ def test_unknown_external_side_effect_accepts_waiting_reconciliation_without_out
     )
 
     assert view.outcome is None
+
+
+def test_folded_authority_records_are_strict_and_never_contain_live_tokens():
+    authority = TransitionAuthorityRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="work_item",
+        entity_id="work-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        dependency_versions=(("input", 7),),
+        reservation_id="reservation-1",
+        grant_id="grant-1",
+        lease_epoch=4,
+        fencing_token_digest=HASH,
+    )
+    ownership = AttemptWorkItemOwnershipRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        attempt_id="attempt-1",
+        work_item_id="work-1",
+        plan_revision=2,
+    )
+    resolution = ReconciliationResolutionRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        reconciliation_id="broker-observation-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        broker_observation_digest=HASH,
+        side_effect_resolved=True,
+    )
+
+    assert authority.fencing_token_digest == HASH
+    assert ownership.attempt_id == "attempt-1"
+    assert resolution.side_effect_resolved is True
+    with pytest.raises(ValidationError):
+        TransitionAuthorityRecord(
+            **{**authority.model_dump(), "fencing_token": "live"}
+        )

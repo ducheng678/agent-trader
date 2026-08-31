@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 
 from market_agent.workflow_harness_contracts import (
+    AttemptWorkItemOwnershipRecord,
     AttemptState,
     HarnessSessionView,
     HarnessTransition,
     RunState,
+    ReconciliationResolutionRecord,
+    TransitionAuthorityRecord,
     WorkItemState,
 )
 from market_agent.workflow_state_machine import (
@@ -166,10 +169,12 @@ def validated(
 ):
     if isinstance(candidate, PermanentFailureDecision):
         return machine.validate(candidate, view, **kwargs)
+    authorization = authorization_for(candidate, view)
+    view = folded_authority_view(view, candidate, authorization, **kwargs)
     return machine.validate(
         candidate,
         view,
-        authorization=authorization_for(candidate, view),
+        authorization=authorization,
         **kwargs,
     )
 
@@ -182,12 +187,75 @@ def applied(
 ) -> HarnessSessionView:
     if isinstance(candidate, PermanentFailureDecision):
         return machine.apply(candidate, view, **kwargs)
+    authorization = authorization_for(candidate, view)
+    view = folded_authority_view(view, candidate, authorization, **kwargs)
     return machine.apply(
         candidate,
         view,
-        authorization=authorization_for(candidate, view),
+        authorization=authorization,
         **kwargs,
     )
+
+
+def folded_authority_view(
+    view: HarnessSessionView,
+    candidate: HarnessTransition,
+    authorization: RunTransitionEvidence
+    | WorkItemTransitionAuthorization
+    | AttemptTransitionAuthorization,
+    **kwargs: object,
+) -> HarnessSessionView:
+    record_values: dict[str, object] = {
+        "run_id": authorization.run_id,
+        "trace_id": authorization.trace_id,
+        "entity_kind": candidate.entity_kind,
+        "entity_id": authorization.entity_id,
+        "expected_state_revision": authorization.expected_state_revision,
+        "plan_revision": authorization.plan_revision,
+        "dependency_versions": authorization.dependency_versions,
+    }
+    if candidate.entity_kind != "run":
+        record_values.update(
+            {
+                "reservation_id": authorization.reservation_id,
+                "grant_id": authorization.grant_id,
+                "lease_epoch": authorization.lease_epoch,
+                "fencing_token_digest": authorization.fencing_token_digest,
+            }
+        )
+    updates: dict[str, object] = {
+        "transition_authorities": (
+            *view.transition_authorities,
+            TransitionAuthorityRecord(**record_values),
+        )
+    }
+    retry = kwargs.get("retry_authorization")
+    if isinstance(retry, StaleAttemptRetryAuthorization):
+        updates["attempt_work_item_owners"] = (
+            *view.attempt_work_item_owners,
+            AttemptWorkItemOwnershipRecord(
+                run_id=retry.run_id,
+                trace_id=retry.trace_id,
+                attempt_id=retry.attempt_id,
+                work_item_id=retry.work_item_id,
+                plan_revision=retry.plan_revision,
+            ),
+        )
+    resolution = kwargs.get("reconciliation_resolution")
+    if isinstance(resolution, ReconciliationResolution):
+        updates["reconciliation_resolutions"] = (
+            *view.reconciliation_resolutions,
+            ReconciliationResolutionRecord(
+                run_id=resolution.run_id,
+                trace_id=resolution.trace_id,
+                reconciliation_id=resolution.reconciliation_id,
+                expected_state_revision=resolution.expected_state_revision,
+                plan_revision=resolution.plan_revision,
+                broker_observation_digest=resolution.broker_observation_digest,
+                side_effect_resolved=resolution.side_effect_resolved,
+            ),
+        )
+    return HarnessSessionView.model_validate(view.model_copy(update=updates).model_dump())
 
 
 @pytest.fixture
@@ -241,10 +309,14 @@ def test_declared_work_item_edges_are_legal(machine, source, target):
             lease_epoch=4,
             fencing_token_digest=HASH,
         )
+        authorization = authorization_for(candidate, view)
+        view = folded_authority_view(
+            view, candidate, authorization, retry_authorization=retry
+        )
         assert machine.validate(
             candidate,
             view,
-            authorization=authorization_for(candidate, view),
+            authorization=authorization,
             retry_authorization=retry,
         ).allowed
     else:
@@ -325,6 +397,7 @@ def test_validation_checks_dependency_versions_and_durable_lease_identity(machin
     view = work_view(WorkItemState.READY)
     candidate = work_transition(WorkItemState.READY, WorkItemState.LEASED)
     evidence = authorization_for(candidate, view)
+    view = folded_authority_view(view, candidate, evidence)
     assert machine.validate(candidate, view, authorization=evidence).allowed
     assert not machine.validate(
         candidate,
@@ -364,10 +437,14 @@ def test_stale_attempt_can_drive_nonterminal_work_item_to_retry_wait(machine):
         lease_epoch=4,
         fencing_token_digest=HASH,
     )
+    authorization = authorization_for(candidate, view)
+    view = folded_authority_view(
+        view, candidate, authorization, retry_authorization=retry
+    )
     assert machine.validate(
         candidate,
         view,
-        authorization=authorization_for(candidate, view),
+        authorization=authorization,
         retry_authorization=retry,
     ).allowed
     assert not validated(
@@ -543,9 +620,12 @@ def test_retry_wait_requires_a_stale_attempt_authorization_owned_by_work_item(ma
     )
 
     assert not machine.validate(candidate, view, authorization=evidence).allowed
+    authorized_view = folded_authority_view(
+        view, candidate, evidence, retry_authorization=proof
+    )
     assert machine.validate(
         candidate,
-        view,
+        authorized_view,
         authorization=evidence,
         retry_authorization=proof,
     ).allowed
@@ -556,7 +636,7 @@ def test_retry_wait_requires_a_stale_attempt_authorization_owned_by_work_item(ma
     ):
         assert not machine.validate(
             candidate,
-            view,
+            authorized_view,
             authorization=evidence,
             retry_authorization=proof.model_copy(update=change),
         ).allowed
@@ -611,3 +691,104 @@ def test_public_state_machine_payloads_are_strict_frozen_contract_models():
         PermanentFailureDecision(**{**decision.model_dump(), "unexpected": True})
     with pytest.raises(Exception):
         decision.reason_code = "integrity"
+
+
+def test_mismatched_folded_authority_record_fails_even_when_candidate_proof_matches(
+    machine,
+):
+    view = work_view(WorkItemState.READY)
+    candidate = work_transition(WorkItemState.READY, WorkItemState.LEASED)
+    evidence = authorization_for(candidate, view)
+    authoritative = folded_authority_view(view, candidate, evidence)
+    mismatched = authoritative.model_copy(
+        update={
+            "transition_authorities": (
+                authoritative.transition_authorities[0].model_copy(
+                    update={"grant_id": "another-grant"}
+                ),
+            )
+        }
+    )
+
+    assert not machine.validate(
+        candidate, mismatched, authorization=evidence
+    ).allowed
+
+
+def test_reconciliation_input_must_match_a_folded_resolution_record(machine):
+    view = run_view(
+        RunState.WAITING_RECONCILIATION, external_side_effect_unknown=True
+    )
+    candidate = run_transition(
+        RunState.WAITING_RECONCILIATION, RunState.RECONCILING
+    )
+    resolution = ReconciliationResolution(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_id="run-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        reconciliation_id="broker-observation-1",
+        broker_observation_digest=HASH,
+        side_effect_resolved=True,
+    )
+    evidence = authorization_for(candidate, view)
+    authoritative = folded_authority_view(view, candidate, evidence)
+
+    assert not machine.validate(
+        candidate,
+        authoritative,
+        authorization=evidence,
+        reconciliation_resolution=resolution,
+    ).allowed
+
+
+def test_retry_requires_folded_attempt_ownership_not_only_retry_input(machine):
+    view = HarnessSessionView(
+        run_id="run-1",
+        trace_id="trace-1",
+        run_state=RunState.RUNNING,
+        work_item_states=(("work-1", WorkItemState.RUNNING),),
+        attempt_states=(("attempt-1", AttemptState.STALE),),
+        state_revision=3,
+        plan_revision=2,
+    )
+    candidate = work_transition(WorkItemState.RUNNING, WorkItemState.RETRY_WAIT)
+    evidence = authorization_for(candidate, view)
+    authoritative = folded_authority_view(view, candidate, evidence)
+    retry = StaleAttemptRetryAuthorization(
+        run_id="run-1",
+        trace_id="trace-1",
+        work_item_id="work-1",
+        attempt_id="attempt-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        lease_epoch=4,
+        fencing_token_digest=HASH,
+    )
+
+    assert not machine.validate(
+        candidate,
+        authoritative,
+        authorization=evidence,
+        retry_authorization=retry,
+    ).allowed
+
+
+def test_orphan_nonrun_transition_fails_even_for_initial_none_state(machine):
+    view = HarnessSessionView.empty()
+    candidate = work_transition("none", WorkItemState.PENDING)
+    evidence = WorkItemTransitionAuthorization(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_id="work-1",
+        expected_state_revision=0,
+        plan_revision=0,
+        dependency_versions=(),
+        reservation_id="reservation-1",
+        grant_id="grant-1",
+        lease_epoch=4,
+        fencing_token_digest=HASH,
+    )
+
+    assert not machine.validate(candidate, view, authorization=evidence).allowed

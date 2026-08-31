@@ -22,11 +22,14 @@ from market_agent.workflow_contracts import (
     ShortText,
 )
 from market_agent.workflow_harness_contracts import (
+    AttemptWorkItemOwnershipRecord,
     AttemptState,
     HarnessSessionView,
     HarnessTransition,
     LeaseToken,
+    ReconciliationResolutionRecord,
     RunState,
+    TransitionAuthorityRecord,
     WorkItemState,
 )
 
@@ -115,6 +118,9 @@ class HarnessEvent(ContractModel):
     actor: ShortText
     payload: FrozenJsonMapping
     transition: HarnessTransition | None = None
+    transition_authority: TransitionAuthorityRecord | None = None
+    attempt_ownership: AttemptWorkItemOwnershipRecord | None = None
+    reconciliation_resolution: ReconciliationResolutionRecord | None = None
     previous_event_hash: Digest | None = None
     event_hash: Digest | None = None
 
@@ -143,6 +149,29 @@ class HarnessEvent(ContractModel):
         ):
             if value is not None and _SENSITIVE_VALUE.search(value):
                 raise ValueError("harness event contains a sensitive value")
+        authorities = (
+            self.transition_authority,
+            self.attempt_ownership,
+            self.reconciliation_resolution,
+        )
+        if sum(record is not None for record in authorities) > 1:
+            raise ValueError("harness authority event must carry one record")
+        if any(record is not None for record in authorities):
+            if self.transition is not None:
+                raise ValueError("harness authority event cannot carry a transition")
+            expected_type = (
+                "transition_authorized"
+                if self.transition_authority is not None
+                else "attempt_ownership_recorded"
+                if self.attempt_ownership is not None
+                else "reconciliation_resolved"
+            )
+            if self.event_type != expected_type:
+                raise ValueError("harness authority event type is not allowlisted")
+            record = next(record for record in authorities if record is not None)
+            if record.run_id != self.run_id or record.trace_id != self.trace_id:
+                raise ValueError("harness authority identity must match the event")
+            return self
         if self.transition is None:
             return self
         if (
@@ -224,6 +253,46 @@ def _apply_committed_event(
         if event.trace_id != view.trace_id:
             raise EventIntegrityError("trace identity changed during replay")
         run_id, trace_id = view.run_id, view.trace_id
+
+    if event.transition_authority is not None:
+        record = event.transition_authority
+        return view.model_copy(
+            update={
+                "sequence": event.sequence,
+                "run_id": run_id,
+                "trace_id": trace_id,
+                "transition_authorities": (*view.transition_authorities, record),
+                "last_event_hash": event.event_hash,
+            }
+        )
+    if event.attempt_ownership is not None:
+        record = event.attempt_ownership
+        return view.model_copy(
+            update={
+                "sequence": event.sequence,
+                "run_id": run_id,
+                "trace_id": trace_id,
+                "attempt_work_item_owners": (
+                    *view.attempt_work_item_owners,
+                    record,
+                ),
+                "last_event_hash": event.event_hash,
+            }
+        )
+    if event.reconciliation_resolution is not None:
+        record = event.reconciliation_resolution
+        return view.model_copy(
+            update={
+                "sequence": event.sequence,
+                "run_id": run_id,
+                "trace_id": trace_id,
+                "reconciliation_resolutions": (
+                    *view.reconciliation_resolutions,
+                    record,
+                ),
+                "last_event_hash": event.event_hash,
+            }
+        )
 
     transition = event.transition
     if transition is None:

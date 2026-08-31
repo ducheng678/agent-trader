@@ -15,10 +15,13 @@ from market_agent.workflow_contracts import (
     ShortText,
 )
 from market_agent.workflow_harness_contracts import (
+    AttemptWorkItemOwnershipRecord,
     AttemptState,
     HarnessSessionView,
     HarnessTransition,
+    ReconciliationResolutionRecord,
     RunState,
+    TransitionAuthorityRecord,
     WorkItemState,
 )
 
@@ -339,6 +342,10 @@ class GlobalTaskStateMachine:
             expected_type = AttemptTransitionAuthorization
         if authorization is None:
             return TransitionValidation(False, "required transition evidence is missing")
+        if transition.entity_kind != "run" and (
+            view.run_id is None or view.trace_id is None or view.run_state is None
+        ):
+            return TransitionValidation(False, "non-run transition requires active run")
         if type(authorization) is not expected_type:
             return TransitionValidation(False, "transition evidence type is incompatible")
         if authorization.run_id != transition.run_id or (
@@ -368,6 +375,9 @@ class GlobalTaskStateMachine:
             or authorization.fencing_token_digest != transition.fencing_token_digest
         ):
             return TransitionValidation(False, "durable lease evidence does not match")
+        authority_record = _authority_record(transition, authorization)
+        if authority_record not in view.transition_authorities:
+            return TransitionValidation(False, "committed transition authority is missing")
         return None
 
     def _validate_edge(
@@ -520,7 +530,7 @@ def _resolution_matches(
     transition: HarnessTransition,
     view: HarnessSessionView,
 ) -> bool:
-    return resolution is not None and (
+    if resolution is None or not (
         resolution.run_id == transition.run_id == view.run_id
         and resolution.trace_id == transition.trace_id == view.trace_id
         and resolution.entity_id == transition.entity_id
@@ -528,7 +538,17 @@ def _resolution_matches(
         == transition.expected_state_revision
         == view.state_revision
         and resolution.plan_revision == transition.plan_revision == view.plan_revision
-    )
+    ):
+        return False
+    return ReconciliationResolutionRecord(
+        run_id=resolution.run_id,
+        trace_id=resolution.trace_id,
+        reconciliation_id=resolution.reconciliation_id,
+        expected_state_revision=resolution.expected_state_revision,
+        plan_revision=resolution.plan_revision,
+        broker_observation_digest=resolution.broker_observation_digest,
+        side_effect_resolved=resolution.side_effect_resolved,
+    ) in view.reconciliation_resolutions
 
 
 def _validate_retry_authorization(
@@ -559,7 +579,40 @@ def _validate_retry_authorization(
         return TransitionValidation(False, "stale attempt retry proof does not match")
     if dict(view.attempt_states).get(retry.attempt_id) is not AttemptState.STALE:
         return TransitionValidation(False, "retry attempt is not stale")
+    ownership = AttemptWorkItemOwnershipRecord(
+        run_id=retry.run_id,
+        trace_id=retry.trace_id,
+        attempt_id=retry.attempt_id,
+        work_item_id=retry.work_item_id,
+        plan_revision=retry.plan_revision,
+    )
+    if ownership not in view.attempt_work_item_owners:
+        return TransitionValidation(False, "committed attempt ownership is missing")
     return TransitionValidation(allowed=True)
+
+
+def _authority_record(
+    transition: HarnessTransition, authorization: Authorization
+) -> TransitionAuthorityRecord:
+    values: dict[str, object] = {
+        "run_id": authorization.run_id,
+        "trace_id": authorization.trace_id,
+        "entity_kind": transition.entity_kind,
+        "entity_id": authorization.entity_id,
+        "expected_state_revision": authorization.expected_state_revision,
+        "plan_revision": authorization.plan_revision,
+        "dependency_versions": authorization.dependency_versions,
+    }
+    if isinstance(authorization, _LeasedTransitionAuthorization):
+        values.update(
+            {
+                "reservation_id": authorization.reservation_id,
+                "grant_id": authorization.grant_id,
+                "lease_epoch": authorization.lease_epoch,
+                "fencing_token_digest": authorization.fencing_token_digest,
+            }
+        )
+    return TransitionAuthorityRecord(**values)
 
 
 def _replace_state(

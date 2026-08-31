@@ -382,6 +382,55 @@ class LeaseToken(ContractModel):
     expires_at_monotonic: PositiveFinite
 
 
+class TransitionAuthorityRecord(ContractModel):
+    """Committed authority for one transition; it contains no live secret."""
+
+    run_id: ShortText
+    trace_id: ShortText
+    entity_kind: Literal["run", "work_item", "attempt"]
+    entity_id: ShortText
+    expected_state_revision: NonNegativeInt
+    plan_revision: NonNegativeInt
+    dependency_versions: tuple[tuple[ShortText, NonNegativeInt], ...] = ()
+    reservation_id: ShortText | None = None
+    grant_id: ShortText | None = None
+    lease_epoch: PositiveInt | None = None
+    fencing_token_digest: Digest | None = None
+
+    @model_validator(mode="after")
+    def validate_authority_shape(self) -> TransitionAuthorityRecord:
+        dependency_ids = tuple(identifier for identifier, _ in self.dependency_versions)
+        _require_unique(dependency_ids, "authority dependency versions")
+        leased = (self.reservation_id, self.grant_id, self.lease_epoch, self.fencing_token_digest)
+        if self.entity_kind == "run" and any(value is not None for value in leased):
+            raise ValueError("run authority cannot carry reservation or lease evidence")
+        if self.entity_kind != "run" and any(value is None for value in leased):
+            raise ValueError("non-run authority requires reservation, grant, and lease evidence")
+        return self
+
+
+class AttemptWorkItemOwnershipRecord(ContractModel):
+    """Immutable committed relationship from an attempt to its owning work item."""
+
+    run_id: ShortText
+    trace_id: ShortText
+    attempt_id: ShortText
+    work_item_id: ShortText
+    plan_revision: NonNegativeInt
+
+
+class ReconciliationResolutionRecord(ContractModel):
+    """Durable broker observation proving an unknown external effect resolved."""
+
+    run_id: ShortText
+    trace_id: ShortText
+    reconciliation_id: ShortText
+    expected_state_revision: NonNegativeInt
+    plan_revision: NonNegativeInt
+    broker_observation_digest: Digest
+    side_effect_resolved: Literal[True]
+
+
 class HarnessSessionView(ContractModel):
     sequence: NonNegativeInt = 0
     state_revision: NonNegativeInt = 0
@@ -393,6 +442,9 @@ class HarnessSessionView(ContractModel):
     work_item_states: tuple[tuple[ShortText, WorkItemState], ...] = ()
     attempt_states: tuple[tuple[ShortText, AttemptState], ...] = ()
     dependency_versions: tuple[tuple[ShortText, NonNegativeInt], ...] = ()
+    transition_authorities: tuple[TransitionAuthorityRecord, ...] = ()
+    attempt_work_item_owners: tuple[AttemptWorkItemOwnershipRecord, ...] = ()
+    reconciliation_resolutions: tuple[ReconciliationResolutionRecord, ...] = ()
     applied_idempotency_keys: TargetIds = ()
     external_side_effect_unknown: StrictBool = False
     last_event_hash: Digest | None = None
@@ -418,6 +470,21 @@ class HarnessSessionView(ContractModel):
         _require_unique(tuple(key for key, _ in self.attempt_states), "attempt states")
         _require_unique(
             tuple(key for key, _ in self.dependency_versions), "dependency versions"
+        )
+        _require_unique(
+            tuple(
+                (record.entity_kind, record.entity_id, record.expected_state_revision)
+                for record in self.transition_authorities
+            ),
+            "transition authorities",
+        )
+        _require_unique(
+            tuple(record.attempt_id for record in self.attempt_work_item_owners),
+            "attempt ownership records",
+        )
+        _require_unique(
+            tuple(record.reconciliation_id for record in self.reconciliation_resolutions),
+            "reconciliation resolution records",
         )
         _require_unique(self.applied_idempotency_keys, "idempotency keys")
         return self
