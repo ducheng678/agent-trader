@@ -85,7 +85,7 @@ class HardGateSnapshot(_Public):
         if self.plan_revision<0:raise CalibrationError("invalid hard gate snapshot")
         return self
 class TrustedRequestContext(_Public):
-    request_class:Literal["informational","active","trading"]; evaluation_epoch:int; hard_gates:HardGateSnapshot
+    request_class:Literal["informational","active","trading"]; evaluation_epoch:int; recovery_used:StrictBool; hard_gates:HardGateSnapshot
     @model_validator(mode="after")
     def vc(self):
         if self.evaluation_epoch<0:raise CalibrationError("invalid request context")
@@ -122,9 +122,12 @@ class ConfidenceGate:
             if len(es)!=len(o.accepted_evidence) or len(slots)!=len(o.accepted_evidence) or any(not r.enabled for r in rs.values()) or any(x.source_id not in rs for x in o.accepted_evidence) or not set(o.targets.required_evidence_slot_ids)<=set(slots) or not set(o.targets.required_source_ids)<=set(rs) or {slots[s].source_id for s in o.targets.required_evidence_slot_ids}!=set(o.targets.required_source_ids) or set(o.targets.known_conflict_slot_ids)!=set(cs) or any(not x.resolved or not set(x.evidence_ids)<=set(es) for x in cs.values()) or not set(o.targets.required_dependency_ids)<=set(o.folded_state.completed_dependency_ids) or not set(o.targets.required_output_field_paths)<=set(o.folded_state.valid_output_field_paths) or not set(o.targets.risk_invariant_ids)<=set(o.folded_state.satisfied_risk_invariant_ids):raise CalibrationError("incomplete host metadata")
             v=ConfidenceFeatureVector(artifact_hash=a.artifact_hash,features=tuple(ConfidenceFeatureValue(feature_name=n,value=Decimal(1)) for n in FEATURE_ORDER))
             with localcontext(_CTX):score=+(a.intercept+sum((x.coefficient for x in a.feature_specs),Decimal(0)))
-            return self.decide(score=score,recovered=False,feature_vector=v)
+            return self._decide(score=score,recovered=self._context.recovery_used,feature_vector=v)
         except Exception:return _fallback(c)
-    def decide(self,*,score:object,recovered:object,feature_vector:ConfidenceFeatureVector)->ConfidenceDecision:
+    def decide(self, *, score: object, recovered: object, feature_vector: ConfidenceFeatureVector) -> ConfidenceDecision:
+        return _fallback(self._context.request_class)
+
+    def _decide(self, *, score: object, recovered: object, feature_vector: ConfidenceFeatureVector) -> ConfidenceDecision:
         try:
             s=_dec(score);v=ConfidenceFeatureVector.model_validate(feature_vector.model_dump());
             if s>=SUCCESS:return ConfidenceDecision(score=s,feature_vector=v,may_succeed=True,next_action="succeed",reason_code="calibrated")

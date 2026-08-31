@@ -16,7 +16,7 @@ def art(**x):
 def gate(a=None,**x):
  a=a or art();p=TrustedConfidencePolicy(artifact_id=a.artifact_id,artifact_version=a.artifact_version,artifact_hash=a.artifact_hash,schema_hash=a.schema_hash,policy_hash=a.policy_hash,dataset_hash=a.dataset_hash,key_id=a.key_id,applicability_domain="market",accepted_record_snapshot_hash="f"*64,provenance_snapshot_hash="1"*64,issued_epoch=a.issued_epoch,expires_epoch=a.expires_epoch)
  g=HardGateSnapshot(permission=True,risk=True,budget=True,loop=True,evidence=True,audit_integrity=True,run_id="run",trace_hash="e"*64,plan_revision=1,policy_hash=a.policy_hash)
- return ConfidenceGate(trusted_policy=p,signature_verifier=Verifier(),request_context=TrustedRequestContext(request_class=x.get("request_class","informational"),evaluation_epoch=x.get("epoch",15),hard_gates=x.get("hard_gates",g)))
+ return ConfidenceGate(trusted_policy=p,signature_verifier=Verifier(),request_context=TrustedRequestContext(request_class=x.get("request_class","informational"),evaluation_epoch=x.get("epoch",15),recovery_used=x.get("recovery_used",False),hard_gates=x.get("hard_gates",g)))
 def test_gate_requires_host_owned_trusted_policy_before_success():
  assert gate().evaluate(obs(),art()).may_succeed
 def test_self_authenticated_artifact_hash_cannot_authorize_success():
@@ -33,7 +33,13 @@ def test_exact_complete_vector_and_decimal_thresholds_are_context_independent():
  for p in (2,6,28):
   getcontext().prec=p;d=gate(a).evaluate(obs(),a);scores.append((d.score,d.next_action,len(d.feature_vector.features)))
  assert scores==[(Decimal(".85"),"succeed",3)]*3
- v=ConfidenceFeatureVector(artifact_hash=a.artifact_hash,features=tuple(ConfidenceFeatureValue(feature_name=n,value=Decimal(1)) for n in FEATURE_ORDER));assert gate(a).decide(score=Decimal(".45"),recovered=False,feature_vector=v).next_action=="one_recovery";assert gate(a).decide(score=Decimal(".849999999999999999"),recovered=False,feature_vector=v).next_action=="one_recovery"
+ v=ConfidenceFeatureVector(artifact_hash=a.artifact_hash,features=tuple(ConfidenceFeatureValue(feature_name=n,value=Decimal(1)) for n in FEATURE_ORDER));assert gate(a).decide(score=Decimal(".45"),recovered=False,feature_vector=v).next_action=="safe_retrieval";assert gate(a).decide(score=Decimal(".849999999999999999"),recovered=False,feature_vector=v).next_action=="safe_retrieval"
 def test_duplicate_slot_or_disabled_or_orphan_evidence_fails_closed():
  a=art();e=AcceptedEvidenceRecord(evidence_id="x",source_id="official",required_slot_id="primary",provenance_hash="2"*64,accepted_by_host=True);assert not gate(a).evaluate(obs(accepted_evidence=(obs().accepted_evidence[0],e)),a).may_succeed
  assert not gate(a).evaluate(obs(source_registry=(SourceRegistryRecord(source_id="official",registry_hash="d"*64,enabled=False),)),a).may_succeed
+
+def test_public_decide_cannot_bypass_host_hard_gates():
+    a = art()
+    blocked = HardGateSnapshot(permission=False, risk=True, budget=True, loop=True, evidence=True, audit_integrity=True, run_id="run", trace_hash="e" * 64, plan_revision=1, policy_hash=a.policy_hash)
+    v = ConfidenceFeatureVector(artifact_hash=a.artifact_hash, features=tuple(ConfidenceFeatureValue(feature_name=n, value=Decimal(1)) for n in FEATURE_ORDER))
+    assert not gate(a, hard_gates=blocked).decide(score=Decimal("1"), recovered=False, feature_vector=v).may_succeed
