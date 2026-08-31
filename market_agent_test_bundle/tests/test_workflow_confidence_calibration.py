@@ -115,3 +115,23 @@ def test_private_decide_rejects_malformed_vector_without_raising():
     decision=gate(a)._decide(score=Decimal(".9"),recovered=False,feature_vector=None)
     assert not decision.may_succeed
     assert decision.next_action=="safe_retrieval"
+
+
+def test_trusted_snapshots_are_fresh_read_only_and_secret_free():
+    a = art()
+    current = gate(a)
+    context = current.trusted_context_snapshot()
+    policy = current.trusted_policy_snapshot()
+    assert context is not None and policy is not None
+    assert (context.hard_gates.run_id, context.hard_gates.trace_hash, context.hard_gates.plan_revision, context.hard_gates.policy_hash) == ("run", "e" * 64, 1, a.policy_hash)
+    assert (policy.artifact_hash, policy.schema_hash, policy.policy_hash, policy.dataset_hash) == (a.artifact_hash, a.schema_hash, a.policy_hash, a.dataset_hash)
+    with pytest.raises(Exception):
+        context.model_copy(update={"request_class": "forged"})
+    assert current.trusted_context_snapshot() == context
+    assert "verifier" not in policy.model_dump()
+
+
+def test_sealed_gate_exposes_no_trusted_snapshots():
+    sealed = ConfidenceGate()
+    assert sealed.trusted_context_snapshot() is None
+    assert sealed.trusted_policy_snapshot() is None

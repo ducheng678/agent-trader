@@ -144,6 +144,16 @@ class ConfidenceGate:
             if type(trusted_policy) is not TrustedConfidencePolicy or type(request_context) is not TrustedRequestContext or type(signature_verifier) is dict or not callable(getattr(signature_verifier, "verify", None)): return
             self._policy=TrustedConfidencePolicy.model_validate(trusted_policy.model_dump()); self._context=TrustedRequestContext.model_validate(request_context.model_dump()); self._verifier=signature_verifier; self._sealed=False
         except Exception: return
+    def trusted_context_snapshot(self) -> TrustedRequestContext | None:
+        if self._sealed or self._context is None: return None
+        try: return TrustedRequestContext.model_validate(self._context.model_dump(mode="python", round_trip=True))
+        except Exception: return None
+
+    def trusted_policy_snapshot(self) -> TrustedConfidencePolicy | None:
+        if self._sealed or self._policy is None: return None
+        try: return TrustedConfidencePolicy.model_validate(self._policy.model_dump(mode="python", round_trip=True))
+        except Exception: return None
+
     def evaluate(self,observation:object,artifact:object)->ConfidenceDecision:
         if self._sealed: return _fallback(None)
         c=self._context.request_class
