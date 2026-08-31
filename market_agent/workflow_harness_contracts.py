@@ -434,6 +434,16 @@ class ReconciliationResolutionRecord(ContractModel):
     broker_observation_digest: Digest
     side_effect_resolved: Literal[True]
 
+    def semantic_authority_key(self) -> tuple[str, str, int, int]:
+        """Return the run-scoped authority key, excluding the caller-chosen ID."""
+
+        return (
+            self.run_id,
+            self.trace_id,
+            self.plan_revision,
+            self.expected_state_revision,
+        )
+
 
 class HarnessSessionView(ContractModel):
     sequence: NonNegativeInt = 0
@@ -487,7 +497,10 @@ class HarnessSessionView(ContractModel):
             "attempt ownership records",
         )
         _require_unique(
-            tuple(record.reconciliation_id for record in self.reconciliation_resolutions),
+            tuple(
+                record.semantic_authority_key()
+                for record in self.reconciliation_resolutions
+            ),
             "reconciliation resolution records",
         )
         _require_unique(self.applied_idempotency_keys, "idempotency keys")

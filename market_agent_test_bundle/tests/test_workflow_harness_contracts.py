@@ -617,3 +617,31 @@ def test_folded_authority_records_are_strict_and_never_contain_live_tokens():
         TransitionAuthorityRecord(
             **{**authority.model_dump(), "fencing_token": "live"}
         )
+
+
+@pytest.mark.parametrize("second_digest", [HASH, "b" * 64])
+def test_reconciliation_resolution_scope_is_unique_across_caller_chosen_ids(
+    second_digest,
+):
+    first = ReconciliationResolutionRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        reconciliation_id="broker-observation-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        broker_observation_digest=HASH,
+        side_effect_resolved=True,
+    )
+    second = first.model_copy(
+        update={
+            "reconciliation_id": "broker-observation-2",
+            "broker_observation_digest": second_digest,
+        }
+    )
+
+    with pytest.raises(ValidationError, match="reconciliation resolution"):
+        HarnessSessionView(
+            run_id="run-1",
+            trace_id="trace-1",
+            reconciliation_resolutions=(first, second),
+        )

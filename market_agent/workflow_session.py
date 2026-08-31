@@ -163,22 +163,26 @@ class HarnessEvent(ContractModel):
         )
         if sum(record is not None for record in authorities) > 1:
             raise ValueError("harness authority event must carry one record")
-        if any(record is not None for record in authorities):
+        authority_by_event_type = {
+            "transition_authorized": self.transition_authority,
+            "attempt_ownership_recorded": self.attempt_ownership,
+            "reconciliation_resolved": self.reconciliation_resolution,
+        }
+        if self.event_type in authority_by_event_type:
+            record = authority_by_event_type[self.event_type]
+            if record is None:
+                raise ValueError(
+                    "reserved harness authority event requires its corresponding record"
+                )
             if self.transition is not None:
                 raise ValueError("harness authority event cannot carry a transition")
-            expected_type = (
-                "transition_authorized"
-                if self.transition_authority is not None
-                else "attempt_ownership_recorded"
-                if self.attempt_ownership is not None
-                else "reconciliation_resolved"
-            )
-            if self.event_type != expected_type:
-                raise ValueError("harness authority event type is not allowlisted")
-            record = next(record for record in authorities if record is not None)
             if record.run_id != self.run_id or record.trace_id != self.trace_id:
                 raise ValueError("harness authority identity must match the event")
             return self
+        if any(record is not None for record in authorities):
+            if self.transition is not None:
+                raise ValueError("harness authority event cannot carry a transition")
+            raise ValueError("harness authority event type is not allowlisted")
         if self.transition is None:
             return self
         if (

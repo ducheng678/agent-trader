@@ -148,6 +148,20 @@ def authority_event(
     )
 
 
+def resolution_record(
+    reconciliation_id: str, *, broker_observation_digest: str = "a" * 64
+) -> ReconciliationResolutionRecord:
+    return ReconciliationResolutionRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        reconciliation_id=reconciliation_id,
+        expected_state_revision=1,
+        plan_revision=0,
+        broker_observation_digest=broker_observation_digest,
+        side_effect_resolved=True,
+    )
+
+
 def rehash(event: HarnessEvent) -> HarnessEvent:
     unsigned = event.model_copy(update={"event_hash": None})
     return unsigned.model_copy(
@@ -1009,3 +1023,200 @@ def test_fold_rejects_conflicting_authority_records_at_one_revision(store):
             expected_sequence=2,
             expected_state_revision=1,
         )
+
+
+@pytest.mark.parametrize("second_digest", ["a" * 64, "b" * 64])
+def test_append_rejects_duplicate_reconciliation_scope_across_record_ids(
+    store, second_digest
+):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    first = resolution_record("broker-observation-1")
+    second = resolution_record(
+        "broker-observation-2", broker_observation_digest=second_digest
+    )
+    store.append(
+        authority_event("first-resolution", reconciliation_resolution=first),
+        expected_sequence=1,
+        expected_state_revision=1,
+    )
+
+    with pytest.raises(EventIntegrityError, match="authority"):
+        store.append(
+            authority_event("second-resolution", reconciliation_resolution=second),
+            expected_sequence=2,
+            expected_state_revision=1,
+        )
+
+
+@pytest.mark.parametrize("second_digest", ["a" * 64, "b" * 64])
+def test_independent_fold_rejects_duplicate_reconciliation_scope_across_record_ids(
+    second_digest,
+):
+    created = rehash(
+        run_event("run-created").model_copy(
+            update={"sequence": 1, "state_revision": 1}
+        )
+    )
+    first = rehash(
+        authority_event(
+            "first-resolution",
+            reconciliation_resolution=resolution_record("broker-observation-1"),
+        ).model_copy(
+            update={
+                "sequence": 2,
+                "state_revision": 1,
+                "previous_event_hash": created.event_hash,
+            }
+        )
+    )
+    second = rehash(
+        authority_event(
+            "second-resolution",
+            reconciliation_resolution=resolution_record(
+                "broker-observation-2",
+                broker_observation_digest=second_digest,
+            ),
+        ).model_copy(
+            update={
+                "sequence": 3,
+                "state_revision": 1,
+                "previous_event_hash": first.event_hash,
+            }
+        )
+    )
+
+    with pytest.raises(EventIntegrityError, match="authority"):
+        fold_events((created, first, second))
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "transition_authorized",
+        "attempt_ownership_recorded",
+        "reconciliation_resolved",
+    ],
+)
+@pytest.mark.parametrize("with_transition", [False, True])
+def test_reserved_authority_event_requires_its_record_and_forbids_transitions(
+    event_type, with_transition
+):
+    values = audit_event(f"missing-{event_type}").model_dump(mode="python")
+    values["event_type"] = event_type
+    if with_transition:
+        values["transition"] = run_event("incompatible-transition").transition
+
+    with pytest.raises(ValueError, match="authority"):
+        HarnessEvent(**values)
+
+
+def authority_records_for_cross_wiring():
+    transition_authority = TransitionAuthorityRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="run",
+        entity_id="run-1",
+        from_state="created",
+        to_state="admitted",
+        expected_state_revision=1,
+        plan_revision=0,
+        reason_code="admitted",
+        idempotency_key="authority-cross-wire",
+    )
+    attempt_ownership = AttemptWorkItemOwnershipRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        attempt_id="attempt-1",
+        work_item_id="work-1",
+        plan_revision=0,
+    )
+    return transition_authority, attempt_ownership, resolution_record("resolution-cross-wire")
+
+
+@pytest.mark.parametrize(
+    ("event_type", "record_field", "record_index"),
+    [
+        ("transition_authorized", "attempt_ownership", 1),
+        ("transition_authorized", "reconciliation_resolution", 2),
+        ("attempt_ownership_recorded", "transition_authority", 0),
+        ("attempt_ownership_recorded", "reconciliation_resolution", 2),
+        ("reconciliation_resolved", "transition_authority", 0),
+        ("reconciliation_resolved", "attempt_ownership", 1),
+    ],
+)
+def test_reserved_authority_event_rejects_cross_wired_records(
+    event_type, record_field, record_index
+):
+    records = authority_records_for_cross_wiring()
+    values = audit_event(f"cross-wired-{event_type}-{record_field}").model_dump(
+        mode="python"
+    )
+    values.update({"event_type": event_type, record_field: records[record_index]})
+
+    with pytest.raises(ValueError, match="authority"):
+        HarnessEvent(**values)
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "transition_authorized",
+        "attempt_ownership_recorded",
+        "reconciliation_resolved",
+    ],
+)
+def test_model_copy_cannot_bypass_reserved_authority_record_requirement(
+    store, event_type
+):
+    bypassed = audit_event(f"bypassed-{event_type}").model_copy(
+        update={"event_type": event_type}
+    )
+
+    with pytest.raises(EventIntegrityError, match="authority"):
+        store.append(bypassed, expected_sequence=0, expected_state_revision=0)
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "transition_authorized",
+        "attempt_ownership_recorded",
+        "reconciliation_resolved",
+    ],
+)
+def test_persisted_reserved_authority_event_without_record_fails_replay(
+    tmp_path, event_type
+):
+    database_path = tmp_path / f"invalid-{event_type}.sqlite3"
+    SQLiteHarnessEventStore(database_path)
+    committed = rehash(
+        audit_event(f"persisted-{event_type}").model_copy(
+            update={"event_type": event_type, "sequence": 1}
+        )
+    )
+    rendered = json.dumps(
+        committed.model_dump(mode="json", exclude_unset=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO harness_runs VALUES (?, ?, ?, ?, ?)",
+            ("run-1", "trace-1", 1, 0, committed.event_hash),
+        )
+        connection.execute(
+            "INSERT INTO harness_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                committed.event_id,
+                committed.run_id,
+                committed.trace_id,
+                committed.sequence,
+                committed.state_revision,
+                committed.event_hash,
+                committed.previous_event_hash,
+                rendered,
+            ),
+        )
+
+    with pytest.raises(EventIntegrityError, match="persisted harness event"):
+        SQLiteHarnessEventStore(database_path).snapshot("run-1")

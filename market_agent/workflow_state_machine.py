@@ -542,7 +542,7 @@ def _resolution_matches(
         and resolution.plan_revision == transition.plan_revision == view.plan_revision
     ):
         return False
-    return ReconciliationResolutionRecord(
+    expected_record = ReconciliationResolutionRecord(
         run_id=resolution.run_id,
         trace_id=resolution.trace_id,
         reconciliation_id=resolution.reconciliation_id,
@@ -550,7 +550,14 @@ def _resolution_matches(
         plan_revision=resolution.plan_revision,
         broker_observation_digest=resolution.broker_observation_digest,
         side_effect_resolved=resolution.side_effect_resolved,
-    ) in view.reconciliation_resolutions
+    )
+    authoritative_records = tuple(
+        record
+        for record in view.reconciliation_resolutions
+        if record.semantic_authority_key()
+        == expected_record.semantic_authority_key()
+    )
+    return len(authoritative_records) == 1 and authoritative_records[0] == expected_record
 
 
 def _validate_retry_authorization(

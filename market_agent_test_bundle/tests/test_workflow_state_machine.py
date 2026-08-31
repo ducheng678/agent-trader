@@ -849,3 +849,50 @@ def test_authority_cannot_authorize_another_branch_reason_or_idempotency(machine
         assert not machine.validate(
             candidate, folded, authorization=authorization_for(candidate, folded)
         ).allowed
+
+
+def test_reconciliation_rejects_competing_record_in_the_same_semantic_scope(machine):
+    view = run_view(
+        RunState.WAITING_RECONCILIATION, external_side_effect_unknown=True
+    )
+    candidate = run_transition(
+        RunState.WAITING_RECONCILIATION, RunState.RECONCILING
+    )
+    resolution = ReconciliationResolution(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_id="run-1",
+        expected_state_revision=3,
+        plan_revision=2,
+        reconciliation_id="broker-observation-1",
+        broker_observation_digest=HASH,
+        side_effect_resolved=True,
+    )
+    evidence = authorization_for(candidate, view)
+    authoritative = folded_authority_view(
+        view,
+        candidate,
+        evidence,
+        reconciliation_resolution=resolution,
+    )
+    competing = authoritative.reconciliation_resolutions[0].model_copy(
+        update={
+            "reconciliation_id": "broker-observation-2",
+            "broker_observation_digest": "b" * 64,
+        }
+    )
+    bypassed = authoritative.model_copy(
+        update={
+            "reconciliation_resolutions": (
+                *authoritative.reconciliation_resolutions,
+                competing,
+            )
+        }
+    )
+
+    assert not machine.validate(
+        candidate,
+        bypassed,
+        authorization=evidence,
+        reconciliation_resolution=resolution,
+    ).allowed
