@@ -85,3 +85,16 @@ def test_decision_calibrated_payload_and_model_copy_require_bound_vector_hash():
     good=ConfidenceDecision(score=Decimal(".45"),feature_vector=v,artifact_hash=a.artifact_hash,may_succeed=False,next_action="one_recovery",reason_code="calibrated")
     with pytest.raises(ValidationError): good.model_copy(update={"artifact_hash":"0"*64})
     with pytest.raises(ValidationError): good.model_copy(update={"reason_code":"calibration_unavailable"})
+
+
+def test_invalid_verifiers_seal_gate_to_no_trade():
+    a=art()
+    for verifier in (None, {}, object()):
+        sealed=ConfidenceGate(trusted_policy=gate(a)._policy,signature_verifier=verifier,request_context=gate(a)._context)
+        assert sealed.evaluate(obs(),a).next_action=="degrade_no_trade"
+
+def test_success_reason_and_vector_pin_cannot_be_forged():
+    from pydantic import ValidationError
+    a=art(); v=ConfidenceFeatureVector(artifact_hash="9"*64,features=tuple(ConfidenceFeatureValue(feature_name=n,value=Decimal(1)) for n in FEATURE_ORDER))
+    with pytest.raises(ValidationError): ConfidenceDecision(score=Decimal(".9"),feature_vector=v,artifact_hash=v.artifact_hash,may_succeed=True,next_action="succeed",reason_code="hard_gate_blocked")
+    assert not gate(a)._decide(score=Decimal(".9"),recovered=False,feature_vector=v).may_succeed

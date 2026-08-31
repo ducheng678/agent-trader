@@ -129,7 +129,7 @@ class ConfidenceDecision(_Public):
         return value
     @model_validator(mode="after")
     def decision_shape(self):
-        if self.may_succeed != (self.next_action == "succeed"): raise CalibrationError("invalid confidence decision")
+        if self.may_succeed != (self.next_action == "succeed") or (self.may_succeed and self.reason_code != "calibrated"): raise CalibrationError("invalid confidence decision")
         if self.reason_code == "calibrated" and (self.score is None or self.feature_vector is None or self.artifact_hash is None or self.feature_vector.artifact_hash != self.artifact_hash): raise CalibrationError("invalid confidence decision")
         if self.may_succeed and (self.score is None or self.feature_vector is None): raise CalibrationError("invalid confidence decision")
         if not self.may_succeed and self.reason_code != "calibrated" and (self.score is not None or self.feature_vector is not None or self.artifact_hash is not None): raise CalibrationError("invalid confidence decision")
@@ -141,7 +141,7 @@ class ConfidenceGate:
     def __init__(self, *, trusted_policy=None, signature_verifier=None, request_context=None):
         self._sealed = True; self._context = None; self._policy = None; self._verifier = None
         try:
-            if type(trusted_policy) is not TrustedConfidencePolicy or type(request_context) is not TrustedRequestContext: return
+            if type(trusted_policy) is not TrustedConfidencePolicy or type(request_context) is not TrustedRequestContext or type(signature_verifier) is dict or not callable(getattr(signature_verifier, "verify", None)): return
             self._policy=TrustedConfidencePolicy.model_validate(trusted_policy.model_dump()); self._context=TrustedRequestContext.model_validate(request_context.model_dump()); self._verifier=signature_verifier; self._sealed=False
         except Exception: return
     def evaluate(self,observation:object,artifact:object)->ConfidenceDecision:
@@ -162,6 +162,7 @@ class ConfidenceGate:
         return _fallback(self._context.request_class)
 
     def _decide(self, *, score: object, recovered: object, feature_vector: ConfidenceFeatureVector) -> ConfidenceDecision:
+        if feature_vector.artifact_hash != self._policy.artifact_hash: return _fallback(self._context.request_class)
         try:
             s=_dec(score);v=ConfidenceFeatureVector.model_validate(feature_vector.model_dump());
             if s>=SUCCESS:return ConfidenceDecision(score=s,feature_vector=v,artifact_hash=v.artifact_hash,may_succeed=True,next_action="succeed",reason_code="calibrated")
