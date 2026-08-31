@@ -43,6 +43,16 @@ class LeaseConflictError(RuntimeError):
     """A lease epoch or fencing token is stale."""
 
 
+class LegacyHarnessDatabaseError(EventIntegrityError):
+    """A legacy database cannot be safely interpreted by this event contract."""
+
+
+_LEGACY_OPERATOR_GUIDANCE = (
+    "revoke all outstanding lease credentials, securely quarantine or delete "
+    "this database, and create a fresh harness database"
+)
+
+
 _SENSITIVE_KEY_MARKERS = (
     "authorization",
     "cookie",
@@ -329,7 +339,78 @@ class SQLiteHarnessEventStore:
     ) -> None:
         self._database_path = str(database_path)
         self._monotonic = monotonic
+        self._reject_incompatible_legacy_storage()
         self._initialize()
+
+    def _reject_incompatible_legacy_storage(self) -> None:
+        if self._database_path == ":memory:":
+            return
+        database_path = Path(self._database_path)
+        if not database_path.exists():
+            return
+        read_only_uri = database_path.resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(read_only_uri, uri=True, isolation_level=None)
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "harness_leases" in tables:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(harness_leases)"
+                    )
+                }
+                if "fencing_token" in columns:
+                    raise LegacyHarnessDatabaseError(
+                        "legacy b9f82ee lease storage may contain raw fencing "
+                        f"credentials; {_LEGACY_OPERATOR_GUIDANCE}"
+                    )
+                if "fencing_token_digest" not in columns:
+                    raise LegacyHarnessDatabaseError(
+                        "legacy harness lease schema has no canonical fencing "
+                        f"digest; {_LEGACY_OPERATOR_GUIDANCE}"
+                    )
+            for table_name in ("harness_events", "harness_outbox"):
+                if table_name not in tables:
+                    continue
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        f"PRAGMA table_info({table_name})"
+                    )
+                }
+                if "event_json" not in columns:
+                    continue
+                for (rendered,) in connection.execute(
+                    f"SELECT event_json FROM {table_name}"
+                ):
+                    try:
+                        values = json.loads(str(rendered))
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(values, dict):
+                        continue
+                    transition = values.get("transition")
+                    if not isinstance(transition, dict):
+                        continue
+                    if transition.get("entity_kind") not in {"work_item", "attempt"}:
+                        continue
+                    if values.get("schema_version", "v1") == "v1" and (
+                        "fencing_token" in transition
+                        or "lease_epoch" not in transition
+                        or "fencing_token_digest" not in transition
+                    ):
+                        raise LegacyHarnessDatabaseError(
+                            "incompatible v1 non-run event uses the b9f82ee live "
+                            "fencing-token contract; hash-chain bytes will not be "
+                            f"reinterpreted or rewritten; {_LEGACY_OPERATOR_GUIDANCE}"
+                        )
+        finally:
+            connection.close()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(

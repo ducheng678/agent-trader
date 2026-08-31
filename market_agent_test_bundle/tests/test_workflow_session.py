@@ -12,6 +12,7 @@ from market_agent.workflow_harness_contracts import HarnessTransition, RunState
 from market_agent.workflow_session import (
     EventIntegrityError,
     HarnessEvent,
+    LegacyHarnessDatabaseError,
     LeaseConflictError,
     OptimisticConcurrencyError,
     SQLiteHarnessEventStore,
@@ -119,6 +120,46 @@ def rehash(event: HarnessEvent) -> HarnessEvent:
                 unsigned.model_dump(mode="json", exclude={"event_hash"})
             )
         }
+    )
+
+
+def legacy_non_run_event_json() -> str:
+    return json.dumps(
+        {
+            "schema_version": "v1",
+            "event_id": "legacy-work-leased",
+            "trace_id": "trace-1",
+            "span_id": "span-legacy",
+            "parent_span_id": None,
+            "run_id": "run-1",
+            "work_item_id": "work-1",
+            "attempt_id": "attempt-1",
+            "sequence": 1,
+            "state_revision": 1,
+            "event_type": "work_item_transitioned",
+            "occurred_at": NOW.isoformat(),
+            "monotonic_offset": 1.0,
+            "actor": "harness",
+            "payload": {"lease_epoch": 1},
+            "transition": {
+                "schema_version": "v1",
+                "run_id": "run-1",
+                "trace_id": "trace-1",
+                "entity_kind": "work_item",
+                "entity_id": "work-1",
+                "from_state": "none",
+                "to_state": "leased",
+                "expected_state_revision": 0,
+                "plan_revision": 0,
+                "reason_code": "lease_acquired",
+                "idempotency_key": "legacy-lease",
+                "fencing_token": "fence-1-legacy-live-secret",
+            },
+            "previous_event_hash": None,
+            "event_hash": "a" * 64,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
 
 
@@ -325,6 +366,129 @@ def test_reopen_replays_the_same_snapshot(tmp_path):
 
     assert reopened.snapshot("run-1") == before
     assert reopened.snapshot("run-1").run_state is RunState.CREATED
+
+
+def test_b9f82ee_raw_lease_schema_is_rejected_before_any_mutation(tmp_path):
+    database_path = tmp_path / "legacy-raw-lease.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE harness_leases ("
+            "run_id TEXT NOT NULL, work_item_id TEXT NOT NULL, "
+            "attempt_id TEXT NOT NULL, lease_epoch INTEGER NOT NULL, "
+            "fencing_token TEXT NOT NULL, holder_id TEXT NOT NULL, "
+            "expires_at_monotonic REAL NOT NULL, "
+            "PRIMARY KEY(run_id, work_item_id))"
+        )
+        connection.execute(
+            "INSERT INTO harness_leases VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "run-1",
+                "work-1",
+                "attempt-1",
+                1,
+                "fence-1-legacy-live-secret",
+                "worker-1",
+                10.0,
+            ),
+        )
+    before = database_path.read_bytes()
+    with pytest.raises(
+        LegacyHarnessDatabaseError, match="revoke.*securely.*fresh"
+    ):
+        SQLiteHarnessEventStore(database_path)
+
+    assert database_path.read_bytes() == before
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(harness_leases)")
+        }
+        token = connection.execute(
+            "SELECT fencing_token FROM harness_leases"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert columns == {
+        "run_id",
+        "work_item_id",
+        "attempt_id",
+        "lease_epoch",
+        "fencing_token",
+        "holder_id",
+        "expires_at_monotonic",
+    }
+    assert token == "fence-1-legacy-live-secret"
+    assert tables == {"harness_leases"}
+
+
+def test_b9f82ee_v1_non_run_event_is_rejected_before_schema_mutation(tmp_path):
+    database_path = tmp_path / "legacy-v1-event.sqlite3"
+    rendered = legacy_non_run_event_json()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE harness_events ("
+            "event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, "
+            "trace_id TEXT NOT NULL, sequence INTEGER NOT NULL, "
+            "state_revision INTEGER NOT NULL, event_hash TEXT NOT NULL, "
+            "previous_event_hash TEXT, event_json TEXT NOT NULL, "
+            "UNIQUE(run_id, sequence))"
+        )
+        connection.execute(
+            "INSERT INTO harness_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-work-leased",
+                "run-1",
+                "trace-1",
+                1,
+                1,
+                "a" * 64,
+                None,
+                rendered,
+            ),
+        )
+        connection.execute(
+            "CREATE TABLE harness_leases ("
+            "run_id TEXT NOT NULL, work_item_id TEXT NOT NULL, "
+            "attempt_id TEXT NOT NULL, lease_epoch INTEGER NOT NULL, "
+            "fencing_token_digest TEXT NOT NULL, holder_id TEXT NOT NULL, "
+            "expires_at_monotonic REAL NOT NULL, "
+            "PRIMARY KEY(run_id, work_item_id))"
+        )
+    before = database_path.read_bytes()
+    with pytest.raises(
+        LegacyHarnessDatabaseError, match="incompatible v1 non-run event"
+    ):
+        SQLiteHarnessEventStore(database_path)
+
+    assert database_path.read_bytes() == before
+
+
+def test_current_digest_only_non_run_stream_reopens_unchanged(tmp_path):
+    database_path = tmp_path / "current-digest-only.sqlite3"
+    store = SQLiteHarnessEventStore(database_path, monotonic=lambda: 5.0)
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    lease = store.acquire_lease(
+        "run-1",
+        "work-1",
+        "attempt-1",
+        "worker-a",
+        expires_at_monotonic=10.0,
+        expected_lease_epoch=0,
+    )
+    store.append(
+        work_event("work-leased", lease),
+        expected_sequence=1,
+        expected_state_revision=1,
+        lease=lease,
+    )
+    before = store.snapshot("run-1")
+
+    reopened = SQLiteHarnessEventStore(database_path, monotonic=lambda: 5.0)
+
+    assert reopened.snapshot("run-1") == before
 
 
 def test_load_rejects_canonical_json_for_another_run_stored_under_requested_run(
