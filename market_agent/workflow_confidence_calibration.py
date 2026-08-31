@@ -18,7 +18,7 @@ def _dec(v:object)->Decimal:
 def _canon(v:object)->object:
     if isinstance(v,Decimal): return format(v,"f")
     if isinstance(v,ContractModel): return _canon(v.model_dump(mode="python",round_trip=True))
-    if type(v) is tuple:return [_canon(x) for x in v]
+    if type(v) in {tuple, list}:return [_canon(x) for x in v]
     if type(v) is dict:return {str(k):_canon(x) for k,x in sorted(v.items())}
     if type(v) in {str,int,bool} or v is None:return v
     raise CalibrationError("invalid confidence value")
@@ -26,6 +26,13 @@ def artifact_payload(a:object)->bytes:
     if not isinstance(a,ConfidenceCalibratorArtifact): raise CalibrationError("invalid calibration artifact")
     d=a.model_dump(mode="python",round_trip=True,exclude={"signature"})
     return json.dumps(_canon(d),sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
+def _snapshot_hash(value: object) -> str:
+    return sha256(json.dumps(_canon(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+def confidence_snapshot_hashes(observation: "ConfidenceObservation") -> tuple[str, str]:
+    accepted = _snapshot_hash({"evidence": tuple(sorted((_canon(item) for item in observation.accepted_evidence), key=str)), "sources": tuple(sorted((_canon(item) for item in observation.source_registry), key=str)), "folded": _canon(observation.folded_state)})
+    provenance = _snapshot_hash({"evidence": tuple(sorted(item.provenance_hash for item in observation.accepted_evidence)), "conflicts": tuple(sorted((item.provenance_hash, tuple(sorted(item.evidence_ids))) for item in observation.conflicts)), "sources": tuple(sorted(item.registry_hash for item in observation.source_registry))})
+    return accepted, provenance
 class ArtifactSignatureVerifier(Protocol):
     def verify(self,key_id:str,payload:bytes,signature:str)->bool: ...
 class _Public(ContractModel):
@@ -107,17 +114,36 @@ class ConfidenceFeatureVector(_Public):
 class ConfidenceDecision(_Public):
     score:Decimal|None=None; feature_vector:ConfidenceFeatureVector|None=None; may_succeed:StrictBool; next_action:Literal["succeed","one_recovery","safe_retrieval","degrade_unknown","degrade_no_trade"]; reason_code:Literal["calibrated","calibration_unavailable","hard_gate_blocked"]
 
+    @field_validator("score", mode="before")
+    @classmethod
+    def bounded_score(cls, value):
+        if value is None: return None
+        value = _dec(value)
+        if value < 0 or value > 1: raise CalibrationError("invalid confidence decision")
+        return value
+    @model_validator(mode="after")
+    def decision_shape(self):
+        if self.may_succeed != (self.next_action == "succeed"): raise CalibrationError("invalid confidence decision")
+        if self.may_succeed and (self.score is None or self.feature_vector is None): raise CalibrationError("invalid confidence decision")
+        if not self.may_succeed and self.reason_code != "calibrated" and (self.score is not None or self.feature_vector is not None): raise CalibrationError("invalid confidence decision")
+        return self
 def _fallback(c:object,reason:str="calibration_unavailable")->ConfidenceDecision:
-    return ConfidenceDecision(may_succeed=False,next_action="degrade_no_trade" if c in {"active","trading"} else "safe_retrieval",reason_code=reason)
+    return ConfidenceDecision(may_succeed=False,next_action="safe_retrieval" if c == "informational" else "degrade_no_trade",reason_code=reason)
 class ConfidenceGate:
     SUCCESS=SUCCESS; ABSTAIN=RECOVERY
-    def __init__(self,*,trusted_policy:TrustedConfidencePolicy,signature_verifier:ArtifactSignatureVerifier,request_context:TrustedRequestContext):self._policy=TrustedConfidencePolicy.model_validate(trusted_policy.model_dump());self._verifier=signature_verifier;self._context=TrustedRequestContext.model_validate(request_context.model_dump())
+    def __init__(self, *, trusted_policy, signature_verifier, request_context):
+        self._sealed = True; self._context = None; self._policy = None; self._verifier = None
+        try:
+            if type(trusted_policy) is not TrustedConfidencePolicy or type(request_context) is not TrustedRequestContext: return
+            self._policy=TrustedConfidencePolicy.model_validate(trusted_policy.model_dump()); self._context=TrustedRequestContext.model_validate(request_context.model_dump()); self._verifier=signature_verifier; self._sealed=False
+        except Exception: return
     def evaluate(self,observation:object,artifact:object)->ConfidenceDecision:
+        if self._sealed: return _fallback(None)
         c=self._context.request_class
         try:
             o=ConfidenceObservation.model_validate(observation.model_dump(mode="python",round_trip=True));a=ConfidenceCalibratorArtifact.model_validate(artifact.model_dump(mode="python",round_trip=True));p=self._policy;g=self._context.hard_gates
             if not all((g.permission,g.risk,g.budget,g.loop,g.evidence,g.audit_integrity)) or g.policy_hash!=p.policy_hash:return _fallback(c,"hard_gate_blocked")
-            if (a.artifact_id,a.artifact_version,a.artifact_hash,a.schema_hash,a.policy_hash,a.dataset_hash,a.key_id,tuple(a.feature_specs[i].feature_name for i in range(3)),a.issued_epoch,a.expires_epoch)!=(p.artifact_id,p.artifact_version,p.artifact_hash,p.schema_hash,p.policy_hash,p.dataset_hash,p.key_id,p.feature_order,p.issued_epoch,p.expires_epoch) or o.applicability_domain!=p.applicability_domain or o.applicability_domain not in a.applicability_domains or o.accepted_record_snapshot_hash!=p.accepted_record_snapshot_hash or o.provenance_snapshot_hash!=p.provenance_snapshot_hash or not a.issued_epoch<=self._context.evaluation_epoch<=a.expires_epoch or not self._verifier.verify(a.key_id,artifact_payload(a),a.signature):raise CalibrationError("untrusted artifact")
+            if (a.artifact_id,a.artifact_version,a.artifact_hash,a.schema_hash,a.policy_hash,a.dataset_hash,a.key_id,tuple(a.feature_specs[i].feature_name for i in range(3)),a.issued_epoch,a.expires_epoch)!=(p.artifact_id,p.artifact_version,p.artifact_hash,p.schema_hash,p.policy_hash,p.dataset_hash,p.key_id,p.feature_order,p.issued_epoch,p.expires_epoch) or o.applicability_domain!=p.applicability_domain or o.applicability_domain not in a.applicability_domains or confidence_snapshot_hashes(o)!=(o.accepted_record_snapshot_hash,o.provenance_snapshot_hash) or o.accepted_record_snapshot_hash!=p.accepted_record_snapshot_hash or o.provenance_snapshot_hash!=p.provenance_snapshot_hash or not a.issued_epoch<=self._context.evaluation_epoch<=a.expires_epoch or not self._verifier.verify(a.key_id,artifact_payload(a),a.signature):raise CalibrationError("untrusted artifact")
             es={x.evidence_id:x for x in o.accepted_evidence}; slots={x.required_slot_id:x for x in o.accepted_evidence}; rs={x.source_id:x for x in o.source_registry}; cs={x.conflict_id:x for x in o.conflicts}
             if len(es)!=len(o.accepted_evidence) or len(slots)!=len(o.accepted_evidence) or any(not r.enabled for r in rs.values()) or any(x.source_id not in rs for x in o.accepted_evidence) or not set(o.targets.required_evidence_slot_ids)<=set(slots) or not set(o.targets.required_source_ids)<=set(rs) or {slots[s].source_id for s in o.targets.required_evidence_slot_ids}!=set(o.targets.required_source_ids) or set(o.targets.known_conflict_slot_ids)!=set(cs) or any(not x.resolved or not set(x.evidence_ids)<=set(es) for x in cs.values()) or not set(o.targets.required_dependency_ids)<=set(o.folded_state.completed_dependency_ids) or not set(o.targets.required_output_field_paths)<=set(o.folded_state.valid_output_field_paths) or not set(o.targets.risk_invariant_ids)<=set(o.folded_state.satisfied_risk_invariant_ids):raise CalibrationError("incomplete host metadata")
             v=ConfidenceFeatureVector(artifact_hash=a.artifact_hash,features=tuple(ConfidenceFeatureValue(feature_name=n,value=Decimal(1)) for n in FEATURE_ORDER))
@@ -125,6 +151,7 @@ class ConfidenceGate:
             return self._decide(score=score,recovered=self._context.recovery_used,feature_vector=v)
         except Exception:return _fallback(c)
     def decide(self, *, score: object, recovered: object, feature_vector: ConfidenceFeatureVector) -> ConfidenceDecision:
+        if self._sealed: return _fallback(None)
         return _fallback(self._context.request_class)
 
     def _decide(self, *, score: object, recovered: object, feature_vector: ConfidenceFeatureVector) -> ConfidenceDecision:

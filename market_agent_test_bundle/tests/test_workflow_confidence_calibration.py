@@ -8,13 +8,13 @@ class Verifier:
 def targets(): return ConfidenceTargetSnapshot(required_dependency_ids=("collect",),required_output_field_paths=("result.summary",),required_evidence_slot_ids=("primary",),required_source_ids=("official",),known_conflict_slot_ids=("claim",),risk_invariant_ids=("safe",))
 def obs(**x):
  d=dict(applicability_domain="market",targets=targets(),accepted_evidence=(AcceptedEvidenceRecord(evidence_id="e",source_id="official",required_slot_id="primary",provenance_hash="b"*64,accepted_by_host=True),),conflicts=(ConflictRecord(conflict_id="claim",evidence_ids=("e",),resolved=True,provenance_hash="c"*64),),source_registry=(SourceRegistryRecord(source_id="official",registry_hash="d"*64,enabled=True),),folded_state=ConfidenceFoldedState(completed_dependency_ids=("collect",),valid_output_field_paths=("result.summary",),satisfied_risk_invariant_ids=("safe",),event_fold_hash="e"*64),accepted_record_snapshot_hash="f"*64,provenance_snapshot_hash="1"*64)
- d.update(x);return ConfidenceObservation(**d)
+ d.update(x);raw=ConfidenceObservation.model_construct(**d);d["accepted_record_snapshot_hash"],d["provenance_snapshot_hash"]=confidence_snapshot_hashes(raw);return ConfidenceObservation(**d)
 def specs():return tuple(ConfidenceFeatureSpec(feature_name=n,coefficient=Decimal(v)) for n,v in zip(FEATURE_ORDER,(".4",".3",".15")))
 def art(**x):
  d=dict(artifact_id="cal-v1",artifact_version="v1",schema_hash=H,policy_hash="b"*64,dataset_hash="c"*64,applicability_domains=("market",),feature_specs=specs(),intercept=Decimal("0"),issued_epoch=10,expires_epoch=20,key_id="host-key",artifact_hash="d"*64,signature="0"*64);d.update(x)
  raw=ConfidenceCalibratorArtifact.model_construct(**d);d["signature"]=sha256(b"host-secret"+artifact_payload(raw)).hexdigest();return ConfidenceCalibratorArtifact(**d)
 def gate(a=None,**x):
- a=a or art();p=TrustedConfidencePolicy(artifact_id=a.artifact_id,artifact_version=a.artifact_version,artifact_hash=a.artifact_hash,schema_hash=a.schema_hash,policy_hash=a.policy_hash,dataset_hash=a.dataset_hash,key_id=a.key_id,applicability_domain="market",accepted_record_snapshot_hash="f"*64,provenance_snapshot_hash="1"*64,issued_epoch=a.issued_epoch,expires_epoch=a.expires_epoch)
+ a=a or art();p=TrustedConfidencePolicy(artifact_id=a.artifact_id,artifact_version=a.artifact_version,artifact_hash=a.artifact_hash,schema_hash=a.schema_hash,policy_hash=a.policy_hash,dataset_hash=a.dataset_hash,key_id=a.key_id,applicability_domain="market",accepted_record_snapshot_hash=obs().accepted_record_snapshot_hash,provenance_snapshot_hash=obs().provenance_snapshot_hash,issued_epoch=a.issued_epoch,expires_epoch=a.expires_epoch)
  g=HardGateSnapshot(permission=True,risk=True,budget=True,loop=True,evidence=True,audit_integrity=True,run_id="run",trace_hash="e"*64,plan_revision=1,policy_hash=a.policy_hash)
  return ConfidenceGate(trusted_policy=p,signature_verifier=Verifier(),request_context=TrustedRequestContext(request_class=x.get("request_class","informational"),evaluation_epoch=x.get("epoch",15),recovery_used=x.get("recovery_used",False),hard_gates=x.get("hard_gates",g)))
 def test_gate_requires_host_owned_trusted_policy_before_success():
@@ -43,3 +43,20 @@ def test_public_decide_cannot_bypass_host_hard_gates():
     blocked = HardGateSnapshot(permission=False, risk=True, budget=True, loop=True, evidence=True, audit_integrity=True, run_id="run", trace_hash="e" * 64, plan_revision=1, policy_hash=a.policy_hash)
     v = ConfidenceFeatureVector(artifact_hash=a.artifact_hash, features=tuple(ConfidenceFeatureValue(feature_name=n, value=Decimal(1)) for n in FEATURE_ORDER))
     assert not gate(a, hard_gates=blocked).decide(score=Decimal("1"), recovered=False, feature_vector=v).may_succeed
+
+
+def test_snapshot_recomputes_provenance_and_rejects_unchanged_claim():
+    a=art(); changed=obs().model_copy(update={"accepted_evidence":(AcceptedEvidenceRecord(evidence_id="e",source_id="official",required_slot_id="primary",provenance_hash="9"*64,accepted_by_host=True),)})
+    assert not gate(a).evaluate(changed,a).may_succeed
+
+def test_decimal_over_one_coefficient_sum_fails_closed():
+    a=art(); forged=ConfidenceCalibratorArtifact.model_construct(**{**a.__dict__,"feature_specs":tuple(ConfidenceFeatureSpec(feature_name=n,coefficient=Decimal(".4")) for n in FEATURE_ORDER)})
+    assert not gate(a).evaluate(obs(),forged).may_succeed
+
+def test_invalid_context_creates_sealed_no_trade_gate():
+    a=art(); g=ConfidenceGate(trusted_policy=gate(a)._policy,signature_verifier=Verifier(),request_context=None)
+    assert g.evaluate(obs(),a).next_action=="degrade_no_trade"
+
+def test_decision_direct_construction_enforces_cross_field_invariants():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError): ConfidenceDecision(score=Decimal("2"),may_succeed=False,next_action="succeed",reason_code="calibrated")
