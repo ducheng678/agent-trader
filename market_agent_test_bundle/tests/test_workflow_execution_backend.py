@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
+import hashlib
+import math
+import secrets
 from typing import cast
 
 import pytest
@@ -29,8 +31,10 @@ from market_agent.workflow_execution_backend import (
     UnverifiedExecutionReceiptError,
     UncommittedTransitionError,
     canonical_plan_digest,
+    canonical_authority_signing_bytes,
     canonical_transition_digest,
     canonical_view_digest,
+    load_pinned_execution_receipt_verifier,
     route_committed_transition,
 )
 from market_agent.workflow_harness_contracts import (
@@ -65,23 +69,79 @@ NOW = datetime(2026, 8, 31, tzinfo=timezone.utc)
 
 
 class TrustedReceiptVerifier:
-    def __init__(self) -> None:
-        self._approved: set[bytes] = set()
-        self.capability = ExecutionReceiptVerifier(self._verify)
+    def __init__(
+        self,
+        *,
+        modulus: int,
+        private_exponent: int,
+        key_id: str,
+        capability: ExecutionReceiptVerifier,
+    ) -> None:
+        self._modulus = modulus
+        self._private_exponent = private_exponent
+        self.key_id = key_id
+        self.capability = capability
 
-    @staticmethod
-    def _key(value: object) -> bytes:
-        return json.dumps(
-            value.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+    def approve(
+        self, value: CommittedExecutionSnapshot | CommittedTransitionReceipt
+    ) -> CommittedExecutionSnapshot | CommittedTransitionReceipt:
+        payload = canonical_authority_signing_bytes(value)
+        digest_info = (
+            execution_backend_module._SHA256_DIGEST_INFO_PREFIX
+            + hashlib.sha256(payload).digest()
+        )
+        size = 256
+        encoded = b"\x00\x01" + b"\xff" * (size - len(digest_info) - 3) + b"\x00" + digest_info
+        signature = pow(
+            int.from_bytes(encoded, "big"),
+            self._private_exponent,
+            self._modulus,
+        ).to_bytes(size, "big").hex()
+        return type(value).model_validate(
+            value.model_copy(update={"signature": signature}).model_dump(mode="python")
+        )
 
-    def approve(self, value: object) -> None:
-        self._approved.add(self._key(value))
 
-    def _verify(self, payload: bytes) -> bool:
-        return payload in self._approved
+def _is_probable_prime(candidate: int) -> bool:
+    small_primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+    for prime in small_primes:
+        if candidate % prime == 0:
+            return candidate == prime
+    odd = candidate - 1
+    powers = 0
+    while odd % 2 == 0:
+        powers += 1
+        odd //= 2
+    for _ in range(24):
+        base = secrets.randbelow(candidate - 3) + 2
+        value = pow(base, odd, candidate)
+        if value in (1, candidate - 1):
+            continue
+        for _ in range(powers - 1):
+            value = pow(value, 2, candidate)
+            if value == candidate - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _generate_prime(bits: int) -> int:
+    while True:
+        candidate = secrets.randbits(bits) | 1 | (1 << (bits - 1))
+        if _is_probable_prime(candidate):
+            return candidate
+
+
+def _generate_test_rsa_key() -> tuple[int, int, int]:
+    exponent = 65537
+    while True:
+        left = _generate_prime(1024)
+        right = _generate_prime(1024)
+        if left != right and math.gcd(exponent, (left - 1) * (right - 1)) == 1:
+            modulus = left * right
+            private = pow(exponent, -1, (left - 1) * (right - 1))
+            return modulus, exponent, private
 
 
 def plan(**overrides: object) -> HarnessPlan:
@@ -199,9 +259,28 @@ def transition(**overrides: object) -> HarnessTransition:
     return HarnessTransition(**values)
 
 
+@pytest.fixture(scope="session")
+def test_rsa_key() -> tuple[int, int, int]:
+    return _generate_test_rsa_key()
+
+
 @pytest.fixture
-def verifier() -> TrustedReceiptVerifier:
-    return TrustedReceiptVerifier()
+def verifier(monkeypatch, test_rsa_key: tuple[int, int, int]) -> TrustedReceiptVerifier:
+    modulus, exponent, private = test_rsa_key
+    key_id = "test-host-rsa"
+    keys = {key_id: (modulus, exponent)}
+    monkeypatch.setattr(execution_backend_module, "_PINNED_PUBLIC_KEYS", keys)
+    monkeypatch.setattr(
+        execution_backend_module,
+        "_EXPECTED_TRUST_CONFIG_DIGEST",
+        execution_backend_module._trust_config_digest(keys),
+    )
+    return TrustedReceiptVerifier(
+        modulus=modulus,
+        private_exponent=private,
+        key_id=key_id,
+        capability=load_pinned_execution_receipt_verifier(),
+    )
 
 
 _BACKEND_VERIFIERS: dict[LangGraphExecutionBackend, TrustedReceiptVerifier] = {}
@@ -231,9 +310,10 @@ def committed_snapshot(
         state_revision=view_value.state_revision,
         view_digest=canonical_view_digest(view_value),
         event_head_hash=view_value.last_event_hash,
+        trust_key_id=verifier.key_id,
+        signature="0" * 512,
     )
-    verifier.approve(snapshot)
-    return snapshot
+    return cast(CommittedExecutionSnapshot, verifier.approve(snapshot))
 
 
 def register_backend(
@@ -278,9 +358,10 @@ def committed_receipt(
         pre=committed_snapshot(verifier, plan_value, pre_view),
         post=committed_snapshot(verifier, plan_value, post_view),
         transition_digest=canonical_transition_digest(transition_value),
+        trust_key_id=verifier.key_id,
+        signature="0" * 512,
     )
-    verifier.approve(receipt)
-    return receipt
+    return cast(CommittedTransitionReceipt, verifier.approve(receipt))
 
 
 def authority_for(
@@ -1012,6 +1093,8 @@ def test_fresh_backend_rejects_self_asserted_unverified_snapshot(
         state_revision=view_value.state_revision,
         view_digest=canonical_view_digest(view_value),
         event_head_hash=view_value.last_event_hash,
+        trust_key_id="attacker-key",
+        signature="0" * 512,
     )
 
     with pytest.raises(UnverifiedExecutionReceiptError):
@@ -1228,47 +1311,64 @@ def test_backend_rejects_arbitrary_callable_as_receipt_verifier():
         LangGraphExecutionBackend(authority_verifier=lambda _: True)
 
 
-def test_verifier_side_mutation_cannot_change_stored_snapshot():
+def test_verifier_has_no_public_callback_or_constructor(
+    verifier: TrustedReceiptVerifier,
+):
+    with pytest.raises(TypeError):
+        ExecutionReceiptVerifier(lambda _: True)  # type: ignore[arg-type]
+    assert not hasattr(verifier.capability, "_verify_bytes")
+
+
+def test_backend_rejects_non_factory_verifier_forgery():
+    forged = object.__new__(ExecutionReceiptVerifier)
+    object.__setattr__(
+        forged,
+        "_config_digest",
+        execution_backend_module._EXPECTED_TRUST_CONFIG_DIGEST,
+    )
+    with pytest.raises(InvalidExecutionInputError):
+        LangGraphExecutionBackend(authority_verifier=forged)
+
+
+def test_cancel_during_verification_cannot_publish_uncancelled_projection(
+    monkeypatch,
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
     plan_value = plan()
-    view_value = view()
-    original = CommittedExecutionSnapshot(
-        run_id=plan_value.run_id,
-        trace_id=plan_value.trace_id,
-        plan_id=plan_value.plan_id,
-        plan_digest=canonical_plan_digest(plan_value),
-        plan_revision=plan_value.revision,
-        sequence=view_value.sequence,
-        state_revision=view_value.state_revision,
-        view_digest=canonical_view_digest(view_value),
-        event_head_hash=view_value.last_event_hash,
+    candidate = transition()
+    pre_view = view(transition_authorities=(authority_for(candidate),))
+    post_view = post_view_for(pre_view, candidate)
+    handle = backend.register(
+        plan_value,
+        pre_view,
+        committed_snapshot(verifier, plan_value, pre_view),
     )
-    mutated = False
-
-    def mutate_caller_object(_: bytes) -> bool:
-        nonlocal mutated
-        if not mutated:
-            object.__setattr__(original, "state_revision", 99)
-            mutated = True
-        return True
-
-    backend = LangGraphExecutionBackend(
-        authority_verifier=ExecutionReceiptVerifier(mutate_caller_object)
+    receipt = committed_receipt(
+        verifier, candidate, pre_view, post_view, plan_value=plan_value
     )
-    first = backend.register(plan_value, view_value, original)
-    clean = CommittedExecutionSnapshot(
-        run_id=plan_value.run_id,
-        trace_id=plan_value.trace_id,
-        plan_id=plan_value.plan_id,
-        plan_digest=canonical_plan_digest(plan_value),
-        plan_revision=plan_value.revision,
-        sequence=view_value.sequence,
-        state_revision=view_value.state_revision,
-        view_digest=canonical_view_digest(view_value),
-        event_head_hash=view_value.last_event_hash,
-    )
+    original_verify = ExecutionReceiptVerifier.verify
+    cancelled = False
 
-    assert original.state_revision == 99
-    assert backend.register(plan_value, view_value, clean) == first
+    def cancel_then_verify(self, value):
+        nonlocal cancelled
+        if type(value) is CommittedTransitionReceipt and not cancelled:
+            cancelled = True
+            backend.cancel("run-1")
+        return original_verify(self, value)
+
+    monkeypatch.setattr(ExecutionReceiptVerifier, "verify", cancel_then_verify)
+
+    with pytest.raises(CancelledExecutionError):
+        backend.apply_committed_transition(
+            handle, candidate, pre_view, post_view, receipt
+        )
+    with pytest.raises(CancelledExecutionError):
+        backend.resume(
+            plan_value,
+            pre_view,
+            committed_snapshot(verifier, plan_value, pre_view),
+        )
 
 
 @pytest.mark.parametrize("invalid_kind", ("mapping", "subclass", "forged"))
@@ -1320,6 +1420,28 @@ def test_plan_rejects_nested_contract_subclass_before_snapshot_verification(
     )
     forged = original.model_copy(update={"workers": (nested,)})
 
+    with pytest.raises(InvalidExecutionInputError):
+        backend.register(
+            forged,
+            view(),
+            cast(CommittedExecutionSnapshot, None),
+        )
+
+
+def test_pinned_verifier_factory_rejects_attacker_selected_key(monkeypatch):
+    monkeypatch.setattr(
+        execution_backend_module,
+        "_PINNED_PUBLIC_KEYS",
+        {"attacker": ((1 << 2047) + 1, 65537)},
+    )
+    with pytest.raises(InvalidExecutionInputError):
+        load_pinned_execution_receipt_verifier()
+
+
+def test_scalar_normalization_is_rejected_before_snapshot_verification(
+    backend: LangGraphExecutionBackend,
+):
+    forged = plan().model_copy(update={"run_id": " run-1 "})
     with pytest.raises(InvalidExecutionInputError):
         backend.register(
             forged,

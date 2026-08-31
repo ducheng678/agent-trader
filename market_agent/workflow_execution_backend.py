@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
+import hmac
 import hashlib
 import json
 from threading import RLock
-from typing import Protocol, TypedDict, cast, final, runtime_checkable
+from types import MappingProxyType
+from typing import Annotated, Protocol, TypedDict, cast, final, runtime_checkable
 
-from pydantic import StrictBool, model_validator
+from pydantic import StrictBool, StringConstraints, model_validator
 
 from market_agent.workflow_contracts import ContractModel, Digest, NonNegativeInt, PositiveInt, ShortText
 from market_agent.workflow_harness_contracts import (
@@ -108,6 +110,12 @@ class ExecutionHandle(ContractModel):
     cancelled: StrictBool = False
 
 
+SignatureHex = Annotated[
+    str,
+    StringConstraints(pattern=r"^[0-9a-f]{512}$"),
+]
+
+
 class CommittedExecutionSnapshot(ContractModel):
     """Host-verifiable binding of a plan to one folded event-chain head."""
 
@@ -120,6 +128,8 @@ class CommittedExecutionSnapshot(ContractModel):
     state_revision: NonNegativeInt
     view_digest: Digest
     event_head_hash: Digest
+    trust_key_id: ShortText
+    signature: SignatureHex
 
 
 class CommittedTransitionReceipt(ContractModel):
@@ -128,6 +138,8 @@ class CommittedTransitionReceipt(ContractModel):
     pre: CommittedExecutionSnapshot
     post: CommittedExecutionSnapshot
     transition_digest: Digest
+    trust_key_id: ShortText
+    signature: SignatureHex
 
     @model_validator(mode="after")
     def validate_continuity(self) -> CommittedTransitionReceipt:
@@ -143,24 +155,100 @@ class CommittedTransitionReceipt(ContractModel):
         return self
 
 
+_TRUST_VERSION = "harness-execution-trust-v1"
+_PINNED_PUBLIC_KEYS: Mapping[str, tuple[int, int]] = MappingProxyType(
+    {
+        "host-rsa-2026-01": (
+            int(
+                "92dda69113b634737c9d3ae71ad0a972dbb77cfcfdb5f7fff20084ed1790f3104"
+                "f497fe93e648644c6060e932172c2250072d68b988fbd5f21073da3db470cb11c"
+                "016e1248d2694933622fe45edd17e7bade074c38dfc6c7702cd1cb18aeeb968f3"
+                "7d31c24f5b5b2da3de7b0700bed5e22f39e853c8499e76b6c0577b4c59f7b7"
+                "8ba0f8b91a1abb3d7c140cf388eb32e329124fba941e16ccaaa0f536bf7b81d1"
+                "a1fb4744b249fda51afea54223b1175b36295ad9829f125cd174a9dfaaded2b3b"
+                "bda116621db228c318a032f571110771c0267ea1f1d643b29df636a6ad100a5fd"
+                "4f935379c64036744689d6eb89caa7f460aed2e195f9c5584ffd63ca4e015",
+                16,
+            ),
+            65537,
+        )
+    }
+)
+_EXPECTED_TRUST_CONFIG_DIGEST = (
+    "b2c85efa22de500b345d39fe9b7452395b8f3a54e4972d2bbf3ebabcd0312103"
+)
+_VERIFIER_FACTORY_CAPABILITY = object()
+_SHA256_DIGEST_INFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def _trust_config_digest(keys: Mapping[str, tuple[int, int]]) -> str:
+    value = {
+        "version": _TRUST_VERSION,
+        "keys": {
+            key_id: {"n": format(n, "x"), "e": e}
+            for key_id, (n, e) in sorted(keys.items())
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 @final
 class ExecutionReceiptVerifier:
-    """Frozen host capability that verifies immutable canonical receipt bytes."""
+    """Pure verifier bound to the module-pinned versioned public-key set."""
 
-    __slots__ = ("_verify_bytes",)
+    __slots__ = ("_config_digest", "_factory_capability", "_keys", "_version")
 
-    def __init__(self, verify_bytes: Callable[[bytes], bool]) -> None:
-        if not callable(verify_bytes) or isinstance(verify_bytes, Mapping):
-            raise InvalidExecutionInputError("receipt verifier function must be callable")
-        object.__setattr__(self, "_verify_bytes", verify_bytes)
+    def __init__(self, capability: object = None) -> None:
+        if capability is not _VERIFIER_FACTORY_CAPABILITY:
+            raise TypeError("receipt verifiers are created only by the pinned factory")
+        actual = _trust_config_digest(_PINNED_PUBLIC_KEYS)
+        if actual != _EXPECTED_TRUST_CONFIG_DIGEST:
+            raise InvalidExecutionInputError("pinned execution trust config mismatch")
+        object.__setattr__(self, "_version", _TRUST_VERSION)
+        object.__setattr__(self, "_config_digest", actual)
+        object.__setattr__(self, "_factory_capability", _VERIFIER_FACTORY_CAPABILITY)
+        object.__setattr__(self, "_keys", MappingProxyType(dict(_PINNED_PUBLIC_KEYS)))
 
     def __setattr__(self, name: str, value: object) -> None:
         raise TypeError("receipt verifier is immutable")
 
-    def verify(self, payload: bytes) -> bool:
-        if type(payload) is not bytes:
-            raise TypeError("receipt verifier input must be immutable bytes")
-        return self._verify_bytes(payload)
+    @property
+    def config_digest(self) -> str:
+        return self._config_digest
+
+    def verify(
+        self, value: CommittedExecutionSnapshot | CommittedTransitionReceipt
+    ) -> bool:
+        if type(value) not in (
+            CommittedExecutionSnapshot,
+            CommittedTransitionReceipt,
+        ):
+            return False
+        key = self._keys.get(value.trust_key_id)
+        if key is None:
+            return False
+        modulus, exponent = key
+        size = (modulus.bit_length() + 7) // 8
+        if size != 256 or exponent != 65537 or len(value.signature) != size * 2:
+            return False
+        signature = int(value.signature, 16)
+        if signature >= modulus:
+            return False
+        actual = pow(signature, exponent, modulus).to_bytes(size, "big")
+        digest_info = _SHA256_DIGEST_INFO_PREFIX + hashlib.sha256(
+            canonical_authority_signing_bytes(value)
+        ).digest()
+        padding = b"\xff" * (size - len(digest_info) - 3)
+        expected = b"\x00\x01" + padding + b"\x00" + digest_info
+        return hmac.compare_digest(actual, expected)
+
+
+def load_pinned_execution_receipt_verifier() -> ExecutionReceiptVerifier:
+    """Create an exact verifier for the compiled trust-config pin."""
+
+    return ExecutionReceiptVerifier(_VERIFIER_FACTORY_CAPABILITY)
 
 
 _ROUTE_CAPABILITY = object()
@@ -225,6 +313,18 @@ def _require_same_contract_tree(original: object, fresh: object) -> None:
             raise TypeError("nested contract sequence shape changed")
         for original_item, fresh_item in zip(original, fresh, strict=True):
             _require_same_contract_tree(original_item, fresh_item)
+        return
+    if type(original) is not type(fresh) or original != fresh:
+        raise TypeError("contract scalar type or value changed during validation")
+
+
+def _serialized_contract_bytes(value: ContractModel) -> bytes:
+    return json.dumps(
+        value.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
 def _fresh_contract(value: object, expected_type: type[ContractModel], error_type: type[ExecutionBackendError], message: str) -> ContractModel:
@@ -232,10 +332,13 @@ def _fresh_contract(value: object, expected_type: type[ContractModel], error_typ
         raise error_type(message)
     try:
         _reject_undeclared_model_fields(value)
+        before = _serialized_contract_bytes(value)
         fresh = expected_type.model_validate(
             value.model_dump(mode="python", exclude_unset=True)
         )
         _require_same_contract_tree(value, fresh)
+        if _serialized_contract_bytes(fresh) != before:
+            raise TypeError("contract canonical bytes changed during validation")
         return fresh
     except ExecutionBackendError:
         raise
@@ -275,8 +378,24 @@ def _fresh_receipt(value: object) -> CommittedTransitionReceipt:
 
 
 def _canonical_bytes(value: ContractModel) -> bytes:
+    return _serialized_contract_bytes(value)
+
+
+def canonical_authority_signing_bytes(
+    value: CommittedExecutionSnapshot | CommittedTransitionReceipt,
+) -> bytes:
+    """Return deterministic bytes signed by the host's pinned RSA key."""
+
+    if type(value) is CommittedExecutionSnapshot:
+        fresh = _fresh_snapshot(value)
+    elif type(value) is CommittedTransitionReceipt:
+        fresh = _fresh_receipt(value)
+    else:
+        raise UnverifiedExecutionReceiptError(
+            "only exact execution authority contracts can be signed"
+        )
     return json.dumps(
-        value.model_dump(mode="json"),
+        fresh.model_dump(mode="json", exclude={"signature"}),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -404,7 +523,13 @@ class LangGraphExecutionBackend:
     """Disposable projection driven only by verified committed Harness state."""
 
     def __init__(self, *, authority_verifier: ExecutionReceiptVerifier) -> None:
-        if type(authority_verifier) is not ExecutionReceiptVerifier:
+        if (
+            type(authority_verifier) is not ExecutionReceiptVerifier
+            or getattr(authority_verifier, "_factory_capability", None)
+            is not _VERIFIER_FACTORY_CAPABILITY
+            or getattr(authority_verifier, "_config_digest", None)
+            != _EXPECTED_TRUST_CONFIG_DIGEST
+        ):
             raise InvalidExecutionInputError(
                 "authority verifier must be an exact ExecutionReceiptVerifier"
             )
@@ -428,7 +553,12 @@ class LangGraphExecutionBackend:
         )
         payload = _canonical_bytes(fresh_before)
         try:
-            verified = self._authority_verifier.verify(payload)
+            verified = self._authority_verifier.verify(
+                cast(
+                    CommittedExecutionSnapshot | CommittedTransitionReceipt,
+                    fresh_before,
+                )
+            )
         except Exception as error:
             raise UnverifiedExecutionReceiptError("commit authority verification failed") from error
         if type(verified) is not bool or not verified:
@@ -558,47 +688,73 @@ class LangGraphExecutionBackend:
                 raise ExecutionPlanMismatchError("transition plan revision does not match")
             if transition.expected_state_revision != handle.state_revision:
                 raise StaleExecutionTransitionError("transition revision is stale")
-
             plan = self._plans[handle.run_id]
-            pre_view = _fresh_view(pre_view)
-            post_view = _fresh_view(post_view)
-            receipt = _fresh_receipt(receipt)
-            _, pre_view, pre_snapshot = self._validated_snapshot(plan, pre_view, receipt.pre)
-            _, post_view, post_snapshot = self._validated_snapshot(plan, post_view, receipt.post)
-            receipt = cast(CommittedTransitionReceipt, self._verify_authority(receipt))
-            if canonical_transition_digest(transition) != receipt.transition_digest:
-                raise InvalidCommittedTransitionError("receipt identifies another transition")
-            if self._views[handle.run_id] != pre_view or self._snapshots[handle.run_id] != pre_snapshot or pre_snapshot.state_revision != handle.state_revision:
-                raise StaleExecutionTransitionError("receipt pre-state is not registered authority")
-            self._validate_entity_ownership(plan, pre_view, transition)
-            authorization = self._authorization(transition, pre_view)
-            try:
-                expected_post = self._state_machine.apply(transition, pre_view, authorization=authorization)
-            except StateMachineError as error:
-                raise InvalidCommittedTransitionError("transition is illegal for authoritative pre-state") from error
-            if expected_post.model_dump(exclude={"last_event_hash"}) != post_view.model_dump(exclude={"last_event_hash"}):
-                raise InvalidCommittedTransitionError("post fold differs from state-machine result")
+            registered_view = self._views[handle.run_id]
+            registered_snapshot = self._snapshots[handle.run_id]
+            registered_applied = frozenset(applied)
 
-            target = post_view.run_state.value if transition.entity_kind == "run" and post_view.run_state is not None else transition.to_state
-            route = _ValidatedRoute(target, _ROUTE_CAPABILITY)
-            try:
-                projected = self._graph.invoke({"validated_route": route})
-            except UncommittedTransitionError:
-                raise
-            except Exception as error:
-                raise ExecutionProjectionError("LangGraph failed to project route") from error
-            routed_state = projected.get("routed_state")
-            if routed_state != target:
-                raise ExecutionProjectionError("LangGraph projected inconsistent target")
-            advanced = ExecutionHandle(
-                run_id=handle.run_id,
-                trace_id=handle.trace_id,
-                plan_id=handle.plan_id,
-                plan_revision=handle.plan_revision,
-                state_revision=post_view.state_revision,
-                routed_state=routed_state,
-                cancelled=False,
-            )
+        # RSA verification, state-machine validation, and disposable projection
+        # are pure and deliberately run without the backend lock.
+        pre_view = _fresh_view(pre_view)
+        post_view = _fresh_view(post_view)
+        receipt = _fresh_receipt(receipt)
+        _, pre_view, pre_snapshot = self._validated_snapshot(plan, pre_view, receipt.pre)
+        _, post_view, post_snapshot = self._validated_snapshot(plan, post_view, receipt.post)
+        receipt = cast(CommittedTransitionReceipt, self._verify_authority(receipt))
+        if canonical_transition_digest(transition) != receipt.transition_digest:
+            raise InvalidCommittedTransitionError("receipt identifies another transition")
+        if registered_view != pre_view or registered_snapshot != pre_snapshot or pre_snapshot.state_revision != handle.state_revision:
+            raise StaleExecutionTransitionError("receipt pre-state is not registered authority")
+        self._validate_entity_ownership(plan, pre_view, transition)
+        authorization = self._authorization(transition, pre_view)
+        try:
+            expected_post = self._state_machine.apply(transition, pre_view, authorization=authorization)
+        except StateMachineError as error:
+            raise InvalidCommittedTransitionError("transition is illegal for authoritative pre-state") from error
+        if expected_post.model_dump(exclude={"last_event_hash"}) != post_view.model_dump(exclude={"last_event_hash"}):
+            raise InvalidCommittedTransitionError("post fold differs from state-machine result")
+
+        target = post_view.run_state.value if transition.entity_kind == "run" and post_view.run_state is not None else transition.to_state
+        route = _ValidatedRoute(target, _ROUTE_CAPABILITY)
+        try:
+            projected = self._graph.invoke({"validated_route": route})
+        except UncommittedTransitionError:
+            raise
+        except Exception as error:
+            raise ExecutionProjectionError("LangGraph failed to project route") from error
+        routed_state = projected.get("routed_state")
+        if routed_state != target:
+            raise ExecutionProjectionError("LangGraph projected inconsistent target")
+        advanced = ExecutionHandle(
+            run_id=handle.run_id,
+            trace_id=handle.trace_id,
+            plan_id=handle.plan_id,
+            plan_revision=handle.plan_revision,
+            state_revision=post_view.state_revision,
+            routed_state=routed_state,
+            cancelled=False,
+        )
+
+        with self._lock:
+            if handle.run_id in self._cancelled_run_ids:
+                raise CancelledExecutionError(
+                    "execution was cancelled during transition verification"
+                )
+            applied = self._applied_idempotency_keys[handle.run_id]
+            if transition.idempotency_key in applied:
+                raise DuplicateExecutionTransitionError(
+                    "idempotency key was projected during verification"
+                )
+            if (
+                self._handles.get(handle.run_id) != handle
+                or self._plans.get(handle.run_id) != plan
+                or self._views.get(handle.run_id) != pre_view
+                or self._snapshots.get(handle.run_id) != pre_snapshot
+                or frozenset(applied) != registered_applied
+            ):
+                raise StaleExecutionTransitionError(
+                    "execution authority changed during transition verification"
+                )
             self._handles[handle.run_id] = advanced
             self._views[handle.run_id] = post_view
             self._snapshots[handle.run_id] = post_snapshot
