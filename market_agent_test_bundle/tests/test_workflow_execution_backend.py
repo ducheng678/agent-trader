@@ -22,10 +22,16 @@ from market_agent.workflow_execution_backend import (
     ExecutionHandleMismatchError,
     ExecutionIdentityError,
     ExecutionPlanMismatchError,
+    ExecutionRegistrationError,
     ExecutionReceiptVerifier,
+    IssuerTrustDescriptor,
     InvalidExecutionInputError,
     InvalidCommittedTransitionError,
     LangGraphExecutionBackend,
+    RegistrationPreparation,
+    RegistrationPreparationError,
+    RegistrationTokenConsumedError,
+    RegistrationTokenMismatchError,
     StaleExecutionSnapshotError,
     StaleExecutionTransitionError,
     UnverifiedExecutionReceiptError,
@@ -310,10 +316,27 @@ def committed_snapshot(
         state_revision=view_value.state_revision,
         view_digest=canonical_view_digest(view_value),
         event_head_hash=view_value.last_event_hash,
+        folded_view=view_value,
         trust_key_id=verifier.key_id,
         signature="0" * 512,
     )
     return cast(CommittedExecutionSnapshot, verifier.approve(snapshot))
+
+
+def issuer_descriptor(verifier: TrustedReceiptVerifier) -> IssuerTrustDescriptor:
+    return IssuerTrustDescriptor(
+        trust_version=execution_backend_module._TRUST_VERSION,
+        trust_config_digest=execution_backend_module._EXPECTED_TRUST_CONFIG_DIGEST,
+        key_id=verifier.key_id,
+    )
+
+
+def provisional_view(plan_value: HarnessPlan) -> HarnessSessionView:
+    return HarnessSessionView(
+        plan_revision=plan_value.revision,
+        run_id=plan_value.run_id,
+        trace_id=plan_value.trace_id,
+    )
 
 
 def register_backend(
@@ -1093,6 +1116,7 @@ def test_fresh_backend_rejects_self_asserted_unverified_snapshot(
         state_revision=view_value.state_revision,
         view_digest=canonical_view_digest(view_value),
         event_head_hash=view_value.last_event_hash,
+        folded_view=view_value,
         trust_key_id="attacker-key",
         signature="0" * 512,
     )
@@ -1357,6 +1381,7 @@ def test_backend_cannot_inject_forged_verifier_or_attacker_signed_snapshot(
         state_revision=view_value.state_revision,
         view_digest=canonical_view_digest(view_value),
         event_head_hash=view_value.last_event_hash,
+        folded_view=view_value,
         trust_key_id="attacker",
         signature="0" * 512,
     )
@@ -1528,3 +1553,131 @@ def test_scalar_normalization_is_rejected_before_snapshot_verification(
             view(),
             cast(CommittedExecutionSnapshot, None),
         )
+
+
+def test_prepare_allocation_can_be_rolled_back_after_external_exception(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    token = backend.prepare_registration(
+        plan_value, provisional_view(plan_value), issuer_descriptor(verifier)
+    )
+    assert type(token) is RegistrationPreparation
+    with pytest.raises(ValidationError):
+        token.run_id = "other-run"  # type: ignore[misc]
+
+    try:
+        raise RuntimeError("event append failed")
+    except RuntimeError:
+        backend.rollback_registration(token)
+    backend.rollback_registration(token)
+
+    replacement = backend.prepare_registration(
+        plan_value, provisional_view(plan_value), issuer_descriptor(verifier)
+    )
+    assert replacement.token_id != token.token_id
+    backend.rollback_registration(replacement)
+
+
+def test_prepare_does_not_create_handle_or_allow_register_bypass(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    token = backend.prepare_registration(
+        plan_value, provisional_view(plan_value), issuer_descriptor(verifier)
+    )
+    committed_view = view()
+    snapshot = committed_snapshot(verifier, plan_value, committed_view)
+
+    with pytest.raises(ExecutionRegistrationError):
+        backend.register(plan_value, committed_view, snapshot)
+    with pytest.raises(ExecutionHandleMismatchError):
+        backend.apply_committed_transition(
+            ExecutionHandle(
+                run_id="run-1",
+                trace_id="trace-1",
+                plan_id="plan-1",
+                plan_revision=0,
+                state_revision=4,
+            ),
+            transition(),
+            cast(HarnessSessionView, None),
+            cast(HarnessSessionView, None),
+            cast(CommittedTransitionReceipt, None),
+        )
+    backend.rollback_registration(token)
+
+
+def test_prepare_rejects_wrong_issuer_without_pending_residue(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    wrong = issuer_descriptor(verifier).model_copy(update={"key_id": "attacker"})
+    with pytest.raises(RegistrationPreparationError):
+        backend.prepare_registration(plan_value, provisional_view(plan_value), wrong)
+
+    token = backend.prepare_registration(
+        plan_value, provisional_view(plan_value), issuer_descriptor(verifier)
+    )
+    backend.rollback_registration(token)
+
+
+def test_commit_registration_consumes_token_and_double_rollback_is_idempotent(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    committed_view = view()
+    token = backend.prepare_registration(
+        plan_value, provisional_view(plan_value), issuer_descriptor(verifier)
+    )
+    snapshot = committed_snapshot(verifier, plan_value, committed_view)
+
+    handle = backend.commit_registration(token, snapshot)
+
+    assert handle.state_revision == committed_view.state_revision
+    with pytest.raises(RegistrationTokenConsumedError):
+        backend.commit_registration(token, snapshot)
+    with pytest.raises(RegistrationTokenConsumedError):
+        backend.rollback_registration(token)
+
+    other_plan = plan(run_id="run-2", trace_id="trace-2", plan_id="plan-2")
+    rolled_back = backend.prepare_registration(
+        other_plan,
+        provisional_view(other_plan),
+        IssuerTrustDescriptor(
+            trust_version=execution_backend_module._TRUST_VERSION,
+            trust_config_digest=execution_backend_module._EXPECTED_TRUST_CONFIG_DIGEST,
+            key_id=verifier.key_id,
+        ),
+    )
+    backend.rollback_registration(rolled_back)
+    assert backend.rollback_registration(rolled_back) is None
+
+
+def test_failed_commit_remains_rollbackable_and_cross_run_token_is_rejected(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+):
+    plan_value = plan()
+    token = backend.prepare_registration(
+        plan_value, provisional_view(plan_value), issuer_descriptor(verifier)
+    )
+    foreign = token.model_copy(update={"run_id": "run-2"})
+    snapshot = committed_snapshot(verifier, plan_value, view())
+
+    with pytest.raises(RegistrationTokenMismatchError):
+        backend.commit_registration(foreign, snapshot)
+
+    invalid_snapshot = snapshot.model_copy(update={"trust_key_id": "attacker"})
+    with pytest.raises(RegistrationPreparationError):
+        backend.commit_registration(token, invalid_snapshot)
+    backend.rollback_registration(token)
+
+    replacement = backend.prepare_registration(
+        plan_value, provisional_view(plan_value), issuer_descriptor(verifier)
+    )
+    backend.rollback_registration(replacement)

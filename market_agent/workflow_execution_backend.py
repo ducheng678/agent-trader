@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import json
 import re
+import secrets
 from threading import RLock
 from types import MappingProxyType
 from typing import Annotated, Protocol, TypedDict, cast, final, runtime_checkable
@@ -85,6 +86,18 @@ class StaleExecutionSnapshotError(ExecutionBackendError):
     """Resume would replace authority with stale or divergent state."""
 
 
+class RegistrationPreparationError(ExecutionBackendError):
+    """A provisional execution registration cannot be prepared."""
+
+
+class RegistrationTokenMismatchError(ExecutionBackendError):
+    """A registration token is unknown, forged, or belongs elsewhere."""
+
+
+class RegistrationTokenConsumedError(ExecutionBackendError):
+    """A registration token was already committed or rolled back."""
+
+
 class StaleExecutionTransitionError(ExecutionBackendError):
     """A transition targets a different authoritative revision."""
 
@@ -129,6 +142,7 @@ class CommittedExecutionSnapshot(ContractModel):
     state_revision: NonNegativeInt
     view_digest: Digest
     event_head_hash: Digest
+    folded_view: HarnessSessionView | None = None
     trust_key_id: ShortText
     signature: SignatureHex
 
@@ -154,6 +168,29 @@ class CommittedTransitionReceipt(ContractModel):
         if self.post.event_head_hash == self.pre.event_head_hash:
             raise ValueError("receipt event-chain head must advance")
         return self
+
+
+class IssuerTrustDescriptor(ContractModel):
+    """Public issuer identity expected to sign a registration snapshot."""
+
+    trust_version: ShortText
+    trust_config_digest: Digest
+    key_id: ShortText
+
+
+class RegistrationPreparation(ContractModel):
+    """Non-secret backend-local token for one pending create registration."""
+
+    token_id: Digest
+    run_id: ShortText
+    trace_id: ShortText
+    plan_id: ShortText
+    plan_digest: Digest
+    plan_revision: NonNegativeInt
+    provisional_view_digest: Digest
+    provisional_sequence: NonNegativeInt
+    provisional_state_revision: NonNegativeInt
+    issuer: IssuerTrustDescriptor
 
 
 _TRUST_VERSION = "harness-execution-trust-v1"
@@ -315,6 +352,9 @@ class BackendProjection(TypedDict, total=False):
 
 @runtime_checkable
 class ExecutionBackend(Protocol):
+    def prepare_registration(self, plan: HarnessPlan, provisional_view: HarnessSessionView, issuer_trust_descriptor: IssuerTrustDescriptor) -> RegistrationPreparation: ...
+    def commit_registration(self, token: RegistrationPreparation, signed_committed_snapshot: CommittedExecutionSnapshot) -> ExecutionHandle: ...
+    def rollback_registration(self, token: RegistrationPreparation) -> None: ...
     def register(self, plan: HarnessPlan, view: HarnessSessionView, committed_snapshot: CommittedExecutionSnapshot) -> ExecutionHandle: ...
     def apply_committed_transition(self, handle: ExecutionHandle, transition: HarnessTransition, pre_view: HarnessSessionView, post_view: HarnessSessionView, receipt: CommittedTransitionReceipt) -> ExecutionHandle: ...
     def resume(self, plan: HarnessPlan, folded_view: HarnessSessionView, committed_snapshot: CommittedExecutionSnapshot, *, disposable_checkpoint: object | None = None) -> ExecutionHandle: ...
@@ -419,6 +459,30 @@ def _fresh_receipt(value: object) -> CommittedTransitionReceipt:
             "receipt endpoints must be exact committed snapshots"
         )
     return cast(CommittedTransitionReceipt, _fresh_contract(value, CommittedTransitionReceipt, UnverifiedExecutionReceiptError, "transition requires an exact committed receipt"))
+
+
+def _fresh_issuer_descriptor(value: object) -> IssuerTrustDescriptor:
+    return cast(
+        IssuerTrustDescriptor,
+        _fresh_contract(
+            value,
+            IssuerTrustDescriptor,
+            RegistrationPreparationError,
+            "issuer trust descriptor must be exact and valid",
+        ),
+    )
+
+
+def _fresh_registration_token(value: object) -> RegistrationPreparation:
+    return cast(
+        RegistrationPreparation,
+        _fresh_contract(
+            value,
+            RegistrationPreparation,
+            RegistrationTokenMismatchError,
+            "registration token must be exact and valid",
+        ),
+    )
 
 
 def _canonical_bytes(value: ContractModel) -> bytes:
@@ -596,6 +660,18 @@ class LangGraphExecutionBackend:
         self._snapshots: dict[str, CommittedExecutionSnapshot] = {}
         self._applied_idempotency_keys: dict[str, set[str]] = {}
         self._cancelled_run_ids: set[str] = set()
+        self._pending_registrations: dict[
+            str,
+            tuple[
+                RegistrationPreparation,
+                HarnessPlan,
+                HarnessSessionView,
+                IssuerTrustDescriptor,
+            ],
+        ] = {}
+        self._consumed_registrations: dict[
+            str, tuple[RegistrationPreparation, str]
+        ] = {}
 
     def _verify_authority(self, value: ContractModel) -> ContractModel:
         fresh_before = _fresh_contract(
@@ -641,11 +717,176 @@ class LangGraphExecutionBackend:
             and snapshot.state_revision == view.state_revision
             and snapshot.view_digest == canonical_view_digest(view)
             and snapshot.event_head_hash == view.last_event_hash
+            and snapshot.folded_view == view
         )
         if not matches:
             raise UnverifiedExecutionReceiptError("snapshot does not bind the plan and folded view")
         snapshot = cast(CommittedExecutionSnapshot, self._verify_authority(snapshot))
         return plan, view, snapshot
+
+    def prepare_registration(
+        self,
+        plan: HarnessPlan,
+        provisional_view: HarnessSessionView,
+        issuer_trust_descriptor: IssuerTrustDescriptor,
+    ) -> RegistrationPreparation:
+        plan = _fresh_plan(plan)
+        provisional_view = _fresh_view(provisional_view)
+        issuer = _fresh_issuer_descriptor(issuer_trust_descriptor)
+        expected_provisional = HarnessSessionView(
+            plan_revision=plan.revision,
+            run_id=plan.run_id,
+            trace_id=plan.trace_id,
+        )
+        if provisional_view != expected_provisional:
+            raise RegistrationPreparationError(
+                "registration preparation requires an exact pre-event folded view"
+            )
+        pinned_keys = self._authority_verifier._keys
+        if (
+            issuer.trust_version != _TRUST_VERSION
+            or issuer.trust_config_digest
+            != self._authority_verifier.config_digest
+            or issuer.key_id not in pinned_keys
+        ):
+            raise RegistrationPreparationError(
+                "issuer descriptor is incompatible with pinned execution trust"
+            )
+        preparation = RegistrationPreparation(
+            token_id=secrets.token_hex(32),
+            run_id=plan.run_id,
+            trace_id=plan.trace_id,
+            plan_id=plan.plan_id,
+            plan_digest=canonical_plan_digest(plan),
+            plan_revision=plan.revision,
+            provisional_view_digest=canonical_view_digest(provisional_view),
+            provisional_sequence=provisional_view.sequence,
+            provisional_state_revision=provisional_view.state_revision,
+            issuer=issuer,
+        )
+        with self._lock:
+            if plan.run_id in self._cancelled_run_ids:
+                raise CancelledExecutionError(
+                    "cancelled execution cannot prepare registration"
+                )
+            if plan.run_id in self._handles or any(
+                pending[0].run_id == plan.run_id
+                for pending in self._pending_registrations.values()
+            ):
+                raise RegistrationPreparationError(
+                    "run already has an execution or pending registration"
+                )
+            self._pending_registrations[preparation.token_id] = (
+                preparation,
+                plan,
+                provisional_view,
+                issuer,
+            )
+            return preparation
+
+    def commit_registration(
+        self,
+        token: RegistrationPreparation,
+        signed_committed_snapshot: CommittedExecutionSnapshot,
+    ) -> ExecutionHandle:
+        token = _fresh_registration_token(token)
+        snapshot = _fresh_snapshot(signed_committed_snapshot)
+        with self._lock:
+            pending = self._pending_registrations.get(token.token_id)
+            if pending is None:
+                consumed = self._consumed_registrations.get(token.token_id)
+                if consumed is not None and consumed[0] == token:
+                    raise RegistrationTokenConsumedError(
+                        "registration token was already consumed"
+                    )
+                raise RegistrationTokenMismatchError(
+                    "registration token is not active in this backend"
+                )
+            if pending[0] != token:
+                raise RegistrationTokenMismatchError(
+                    "registration token binding does not match active preparation"
+                )
+            _, plan, provisional_view, issuer = pending
+            if token.run_id in self._cancelled_run_ids:
+                raise CancelledExecutionError(
+                    "cancelled execution cannot commit registration"
+                )
+            if token.run_id in self._handles:
+                raise RegistrationPreparationError(
+                    "run already has an execution handle"
+                )
+
+        if snapshot.trust_key_id != issuer.key_id:
+            raise RegistrationPreparationError(
+                "committed snapshot signer differs from prepared issuer"
+            )
+        committed_view = snapshot.folded_view
+        if committed_view is None:
+            raise RegistrationPreparationError(
+                "registration commit snapshot must embed its committed folded view"
+            )
+        _, committed_view, snapshot = self._validated_snapshot(
+            plan, committed_view, snapshot
+        )
+        if (
+            committed_view.sequence <= provisional_view.sequence
+            or committed_view.state_revision < provisional_view.state_revision
+        ):
+            raise RegistrationPreparationError(
+                "committed snapshot does not advance the provisional fold"
+            )
+        handle = _handle_from_view(plan, committed_view)
+
+        with self._lock:
+            current = self._pending_registrations.get(token.token_id)
+            if current != pending:
+                raise RegistrationTokenMismatchError(
+                    "registration preparation changed during commit verification"
+                )
+            if token.run_id in self._cancelled_run_ids:
+                raise CancelledExecutionError(
+                    "execution was cancelled during registration commit"
+                )
+            if token.run_id in self._handles:
+                raise RegistrationPreparationError(
+                    "run was registered during commit verification"
+                )
+            self._handles[token.run_id] = handle
+            self._plans[token.run_id] = plan
+            self._views[token.run_id] = committed_view
+            self._snapshots[token.run_id] = snapshot
+            self._applied_idempotency_keys[token.run_id] = set(
+                committed_view.applied_idempotency_keys
+            )
+            del self._pending_registrations[token.token_id]
+            self._consumed_registrations[token.token_id] = (token, "committed")
+            return handle
+
+    def rollback_registration(self, token: RegistrationPreparation) -> None:
+        token = _fresh_registration_token(token)
+        with self._lock:
+            pending = self._pending_registrations.get(token.token_id)
+            if pending is not None:
+                if pending[0] != token:
+                    raise RegistrationTokenMismatchError(
+                        "registration token binding does not match active preparation"
+                    )
+                del self._pending_registrations[token.token_id]
+                self._consumed_registrations[token.token_id] = (
+                    token,
+                    "rolled_back",
+                )
+                return
+            consumed = self._consumed_registrations.get(token.token_id)
+            if consumed is None or consumed[0] != token:
+                raise RegistrationTokenMismatchError(
+                    "registration token is not known to this backend"
+                )
+            if consumed[1] == "rolled_back":
+                return
+            raise RegistrationTokenConsumedError(
+                "committed registration cannot be rolled back"
+            )
 
     def register(self, plan: HarnessPlan, view: HarnessSessionView, committed_snapshot: CommittedExecutionSnapshot) -> ExecutionHandle:
         plan, view, committed_snapshot = self._validated_snapshot(plan, view, committed_snapshot)
@@ -653,6 +894,13 @@ class LangGraphExecutionBackend:
         with self._lock:
             if plan.run_id in self._cancelled_run_ids:
                 raise CancelledExecutionError("cancelled execution cannot be registered")
+            if any(
+                pending[0].run_id == plan.run_id
+                for pending in self._pending_registrations.values()
+            ):
+                raise ExecutionRegistrationError(
+                    "pending create registration must commit its active token"
+                )
             existing = self._handles.get(plan.run_id)
             if existing is not None:
                 if existing == handle and self._plans.get(plan.run_id) == plan and self._views.get(plan.run_id) == view and self._snapshots.get(plan.run_id) == committed_snapshot:
