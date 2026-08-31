@@ -126,7 +126,7 @@ def checkpoint(
         plan_revision=1,
         fingerprint_schema_version="v1",
         observation_kind=observation_kind,
-        worker_id=worker_id,
+        worker_id=worker_id if failure else None,
         normalized_failure=failure,
         failure_context_hash=digest({"context": "fixed"}) if failure else None,
         failure_dependency_hash=digest({"dependency": "fixed"}) if failure else None,
@@ -499,3 +499,96 @@ def test_recovery_rejects_fabricated_and_nonprimitive_cycle_signatures(loop_guar
         scope=LoopScope.STAGE, plan_revision=1, fingerprint_schema_version="v1", period=period,
     )
     assert loop_guard.authorize_recovery(forged).stop_reason == "unregistered_cycle_signature"
+
+
+@pytest.mark.parametrize(
+    ("arguments"),
+    [
+        {"label": 1}, {"symbol": 1.0}, {"event_type": False},
+        {"attempt_limit": True}, {"attempt_limit": 1.0}, {"attempt_limit": "1"},
+        {"operation": 1}, {"target": False}, {"condition": 1.0},
+        {"mode": 1}, {"limit": True}, {"limit": 1.0}, {"limit": "1"},
+    ],
+)
+def test_each_semantic_argument_name_rejects_wrong_scalar_domain(arguments):
+    with pytest.raises(ValueError, match="invalid action fingerprint input"):
+        action_input(arguments)
+
+
+def action_input(arguments: object, **overrides: object) -> ActionFingerprint:
+    values: dict[str, object] = {
+        "worker_id": "worker-a", "worker_version": "v1", "action_kind": "inspect",
+        "canonical_arguments": arguments, "context_hash": digest({"context": 1}),
+        "dependency_hash": digest({"dependency": 1}), "plan_revision": 1,
+        "prompt_hash": digest({"prompt": 1}), "tool_hash": digest({"tool": 1}),
+        "output_schema_hash": digest({"schema": 1}), "model_route": "route",
+        "correction_ordinal": 0,
+    }
+    values.update(overrides)
+    return build_action_fingerprint(**values)
+
+
+def test_symbol_normalization_and_integer_representation_are_canonical():
+    assert action_input({"symbol": "btc", "limit": 1}) == action_input(
+        {"limit": 1, "symbol": "BTC"}
+    )
+    with pytest.raises(ValueError):
+        action_input({"limit": 1.0})
+
+
+class OversizedSequence:
+    def __len__(self) -> int:
+        return 65
+
+    def __iter__(self):
+        raise AssertionError("must not materialize oversized input")
+
+
+class UnsizedGenerator:
+    def __iter__(self):
+        yield "evidence-1"
+
+
+@pytest.mark.parametrize("sequence", [OversizedSequence(), UnsizedGenerator()])
+def test_result_sequences_are_bounded_before_sorting_or_materialization(sequence):
+    with pytest.raises(ValueError, match="invalid result fingerprint input"):
+        build_result_fingerprint(
+            outcome_kind="answer", validated_output_hash=digest({"out": 1}),
+            normalized_error_class=None, normalized_error_code=None,
+            accepted_evidence_ids=sequence, tool_result_hashes=(), result_schema_version="v1",
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ghp_abcdefghijklmnopqrstuvwxyz", "AKIAABCDEFGHIJKLMNOP", "aaa.bbb.ccc",
+        "-----BEGIN PRIVATE KEY-----", "Bearer abcdefghijklmnopqrstuvwxyz",
+        "sk-live-abcdefghijklmnopqrstuvwxyz", "p" * 80,
+    ],
+)
+def test_semantic_string_fields_reject_credential_shaped_values_without_echoing(value):
+    with pytest.raises(ValueError) as error:
+        action_input({"label": value})
+    assert value not in str(error.value)
+
+
+def test_failure_requires_worker_and_nonfailures_cannot_carry_workers():
+    with pytest.raises(ValidationError):
+        checkpoint("missing", failure="source_failure").model_copy(update={"worker_id": None})
+    with pytest.raises(ValidationError):
+        checkpoint("success").model_copy(update={"worker_id": "worker-a"})
+
+
+def test_failure_oscillation_rejects_missing_identity_but_stops_valid_a_b_a(loop_guard: LoopGuard):
+    with pytest.raises(ValidationError):
+        checkpoint("missing", failure="source_failure").model_copy(update={"worker_id": None})
+    assert loop_guard.observe_checkpoint(
+        checkpoint("one", worker_id="worker-a", failure="source_failure")
+    ).allowed
+    assert loop_guard.observe_checkpoint(
+        checkpoint("two", worker_id="worker-b", failure="source_failure")
+    ).allowed
+    assert loop_guard.observe_checkpoint(
+        checkpoint("three", worker_id="worker-a", failure="source_failure")
+    ).stop_reason == "cross_worker_failure_oscillation"

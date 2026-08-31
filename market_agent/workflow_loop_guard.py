@@ -7,6 +7,7 @@ from enum import Enum
 from hashlib import sha256
 import json
 import math
+import re
 from typing import Any, Literal, Sequence
 
 from pydantic import Field, StrictBool, StrictFloat, StrictInt, field_validator, model_validator
@@ -63,7 +64,10 @@ class SemanticArgumentName(str, Enum):
     LIMIT = "limit"
 
 
-SemanticScalar = StrictBool | StrictInt | StrictFloat | ShortText
+SemanticScalar = StrictInt | ShortText
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_CODE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_SYMBOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,15}$")
 
 
 def _digest(value: object) -> str:
@@ -122,11 +126,7 @@ class _ActionFingerprintInput(_PublicContract):
         if len(set(names)) != len(names):
             raise ValueError("invalid action fingerprint input")
         for name, value in self.canonical_arguments:
-            if name is SemanticArgumentName.ATTEMPT_LIMIT and (
-                not isinstance(value, int) or isinstance(value, bool) or value < 0
-            ):
-                raise ValueError("invalid action fingerprint input")
-            _validate_scalar(value)
+            _validate_argument_value(name, value)
         return self
 
 
@@ -259,9 +259,9 @@ class SemanticCheckpoint(_PublicContract):
     @model_validator(mode="after")
     def validate_failure_shape(self) -> SemanticCheckpoint:
         fields = (self.failure_context_hash, self.failure_dependency_hash, self.model_route)
-        if self.normalized_failure is None and any(item is not None for item in fields):
+        if self.normalized_failure is None and (self.worker_id is not None or any(item is not None for item in fields)):
             raise ValueError("failure metadata requires a normalized failure")
-        if self.normalized_failure is not None and any(item is None for item in fields):
+        if self.normalized_failure is not None and (self.worker_id is None or any(item is None for item in fields)):
             raise ValueError("normalized failure requires complete semantic route metadata")
         return self
 
@@ -328,9 +328,33 @@ def _validate_scalar(value: object) -> None:
     raise ValueError("invalid action fingerprint input")
 
 
+def _validate_argument_value(name: SemanticArgumentName, value: object) -> None:
+    if name in {SemanticArgumentName.ATTEMPT_LIMIT, SemanticArgumentName.LIMIT}:
+        if type(value) is not int or not 0 <= value <= 1_000_000:
+            raise ValueError("invalid action fingerprint input")
+        return
+    if type(value) is not str or not _safe_code(value):
+        raise ValueError("invalid action fingerprint input")
+    if name is SemanticArgumentName.SYMBOL:
+        if not _SYMBOL_RE.fullmatch(value):
+            raise ValueError("invalid action fingerprint input")
+    elif not _CODE_RE.fullmatch(value):
+        raise ValueError("invalid action fingerprint input")
+
+
 def _looks_sensitive(value: str) -> bool:
     lower = value.lower()
-    return any(marker in lower for marker in ("sk-", "secret", "password", "credential", "api_key", "token", "bearer", "private reasoning"))
+    return any(marker in lower for marker in ("sk-", "ghp_", "akia", "secret", "password", "credential", "api_key", "token", "bearer", "private reasoning", "-----begin")) or lower.count(".") == 2
+
+
+def _safe_code(value: str) -> bool:
+    return len(value) <= 64 and not _looks_sensitive(value)
+
+
+def _bounded_sequence(value: object, limit: int, message: str) -> tuple[object, ...]:
+    if not isinstance(value, (tuple, list)) or len(value) > limit:
+        raise ValueError(message)
+    return tuple(value)
 
 
 def _arguments(value: object) -> tuple[tuple[SemanticArgumentName, object], ...]:
@@ -342,7 +366,16 @@ def _arguments(value: object) -> tuple[tuple[SemanticArgumentName, object], ...]
     if any(isinstance(item, (dict, list, tuple)) for item in value.values()):
         raise ValueError("invalid action fingerprint input")
     try:
-        return tuple(sorted(((SemanticArgumentName(name), item) for name, item in value.items()), key=lambda item: item[0].value))
+        normalized = []
+        for name, item in value.items():
+            semantic_name = SemanticArgumentName(name)
+            _validate_argument_value(semantic_name, item)
+            if semantic_name is SemanticArgumentName.SYMBOL:
+                item = item.upper()
+            elif isinstance(item, str):
+                item = item.lower()
+            normalized.append((semantic_name, item))
+        return tuple(sorted(normalized, key=lambda item: item[0].value))
     except ValueError:
         raise ValueError("invalid action fingerprint input") from None
 
@@ -351,6 +384,8 @@ def build_action_fingerprint(*, worker_id: str, worker_version: str, action_kind
     """Hash only the fixed semantic action schema; reject all undeclared inputs."""
     try:
         _reject_extra(extra, "invalid action fingerprint input")
+        if not all(_IDENTIFIER_RE.fullmatch(value) and _safe_code(value) for value in (worker_id, worker_version, action_kind, model_route)):
+            raise ValueError("invalid action fingerprint input")
         values = _ActionFingerprintInput(worker_id=worker_id, worker_version=worker_version, action_kind=action_kind, canonical_arguments=_arguments(canonical_arguments), context_hash=context_hash, dependency_hash=dependency_hash, plan_revision=plan_revision, prompt_hash=prompt_hash, tool_hash=tool_hash, output_schema_hash=output_schema_hash, model_route=model_route, correction_ordinal=correction_ordinal)
     except Exception:
         raise ValueError("invalid action fingerprint input") from None
@@ -360,7 +395,15 @@ def build_action_fingerprint(*, worker_id: str, worker_version: str, action_kind
 def build_result_fingerprint(*, outcome_kind: str, validated_output_hash: str | None, normalized_error_class: str | None, normalized_error_code: str | None, accepted_evidence_ids: Sequence[str] = (), tool_result_hashes: Sequence[str] = (), result_schema_version: str, **extra: object) -> ResultFingerprint:
     try:
         _reject_extra(extra, "invalid result fingerprint input")
-        values = _ResultFingerprintInput(outcome_kind=outcome_kind, validated_output_hash=validated_output_hash, normalized_error_class=normalized_error_class, normalized_error_code=normalized_error_code, accepted_evidence_ids=tuple(sorted(accepted_evidence_ids)), tool_result_hashes=tuple(sorted(tool_result_hashes)), result_schema_version=result_schema_version)
+        evidence = _bounded_sequence(accepted_evidence_ids, 64, "invalid result fingerprint input")
+        tool_hashes = _bounded_sequence(tool_result_hashes, 64, "invalid result fingerprint input")
+        if not all(isinstance(item, str) and _IDENTIFIER_RE.fullmatch(item) and _safe_code(item) for item in evidence):
+            raise ValueError("invalid result fingerprint input")
+        if not all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item) for item in tool_hashes):
+            raise ValueError("invalid result fingerprint input")
+        if not all(value is None or (isinstance(value, str) and _CODE_RE.fullmatch(value) and _safe_code(value)) for value in (outcome_kind, normalized_error_class, normalized_error_code, result_schema_version)):
+            raise ValueError("invalid result fingerprint input")
+        values = _ResultFingerprintInput(outcome_kind=outcome_kind, validated_output_hash=validated_output_hash, normalized_error_class=normalized_error_class, normalized_error_code=normalized_error_code, accepted_evidence_ids=tuple(sorted(evidence)), tool_result_hashes=tuple(sorted(tool_hashes)), result_schema_version=result_schema_version)
     except Exception:
         raise ValueError("invalid result fingerprint input") from None
     return ResultFingerprint(digest=_digest({**values.model_dump(mode="json"), "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION}))
@@ -369,7 +412,15 @@ def build_result_fingerprint(*, outcome_kind: str, validated_output_hash: str | 
 def build_state_fingerprint(*, run_state: str, work_item_state: str, attempt_state: str, stage_id: str, plan_revision: int, unresolved_work_ids: Sequence[str], dependency_versions: Sequence[tuple[str, int]], progress: ProgressVector, normalized_error_class: str | None, **extra: object) -> StateFingerprint:
     try:
         _reject_extra(extra, "invalid state fingerprint input")
-        values = _StateFingerprintInput(run_state=run_state, work_item_state=work_item_state, attempt_state=attempt_state, stage_id=stage_id, plan_revision=plan_revision, unresolved_work_ids=tuple(sorted(unresolved_work_ids)), dependency_versions=tuple(sorted(dependency_versions)), progress=progress, normalized_error_class=normalized_error_class)
+        unresolved = _bounded_sequence(unresolved_work_ids, 64, "invalid state fingerprint input")
+        dependencies = _bounded_sequence(dependency_versions, 64, "invalid state fingerprint input")
+        if not all(isinstance(item, str) and _IDENTIFIER_RE.fullmatch(item) and _safe_code(item) for item in unresolved):
+            raise ValueError("invalid state fingerprint input")
+        if not all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) and _IDENTIFIER_RE.fullmatch(item[0]) and _safe_code(item[0]) and type(item[1]) is int and item[1] >= 0 for item in dependencies):
+            raise ValueError("invalid state fingerprint input")
+        if not all(isinstance(value, str) and _CODE_RE.fullmatch(value) and _safe_code(value) for value in (run_state, work_item_state, attempt_state, stage_id)) or (normalized_error_class is not None and (not isinstance(normalized_error_class, str) or not _CODE_RE.fullmatch(normalized_error_class) or not _safe_code(normalized_error_class))):
+            raise ValueError("invalid state fingerprint input")
+        values = _StateFingerprintInput(run_state=run_state, work_item_state=work_item_state, attempt_state=attempt_state, stage_id=stage_id, plan_revision=plan_revision, unresolved_work_ids=tuple(sorted(unresolved)), dependency_versions=tuple(sorted(dependencies)), progress=progress, normalized_error_class=normalized_error_class)
     except Exception:
         raise ValueError("invalid state fingerprint input") from None
     return StateFingerprint(digest=_digest({**values.model_dump(mode="json"), "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION}))
