@@ -389,8 +389,12 @@ class TransitionAuthorityRecord(ContractModel):
     trace_id: ShortText
     entity_kind: Literal["run", "work_item", "attempt"]
     entity_id: ShortText
+    from_state: ShortText
+    to_state: ShortText
     expected_state_revision: NonNegativeInt
     plan_revision: NonNegativeInt
+    reason_code: ShortText
+    idempotency_key: ShortText
     dependency_versions: tuple[tuple[ShortText, NonNegativeInt], ...] = ()
     reservation_id: ShortText | None = None
     grant_id: ShortText | None = None

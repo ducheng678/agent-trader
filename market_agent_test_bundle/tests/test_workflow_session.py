@@ -153,7 +153,19 @@ def rehash(event: HarnessEvent) -> HarnessEvent:
     return unsigned.model_copy(
         update={
             "event_hash": canonical_event_hash(
-                unsigned.model_dump(mode="json", exclude={"event_hash"})
+                {
+                    key: value
+                    for key, value in unsigned.model_dump(
+                        mode="json", exclude={"event_hash"}
+                    ).items()
+                    if key
+                    not in {
+                        "transition_authority",
+                        "attempt_ownership",
+                        "reconciliation_resolution",
+                    }
+                    or key in unsigned.model_fields_set
+                }
             )
         }
     )
@@ -817,8 +829,12 @@ def test_allowlisted_authority_events_fold_durable_transition_relationships(stor
         trace_id="trace-1",
         entity_kind="work_item",
         entity_id="work-1",
+        from_state="none",
+        to_state="leased",
         expected_state_revision=1,
         plan_revision=0,
+        reason_code="lease_acquired",
+        idempotency_key="authority-1",
         dependency_versions=(),
         reservation_id="reservation-1",
         grant_id="grant-1",
@@ -870,3 +886,126 @@ def test_generic_audit_payload_cannot_be_interpreted_as_authority(store):
     )
 
     assert store.snapshot("run-1").transition_authorities == ()
+
+
+def test_pre_authority_v1_event_hash_replays_without_rewriting_its_bytes():
+    legacy = run_event("pre-authority")
+    unsigned = legacy.model_copy(
+        update={"sequence": 1, "state_revision": 1, "event_hash": None}
+    )
+    old_values = unsigned.model_dump(
+        mode="json",
+        exclude={
+            "event_hash",
+            "transition_authority",
+            "attempt_ownership",
+            "reconciliation_resolution",
+        },
+    )
+    historical = unsigned.model_copy(
+        update={"event_hash": canonical_event_hash(old_values)}
+    )
+
+    assert fold_events((historical,)).run_state is RunState.CREATED
+
+
+def test_pre_authority_v1_event_reopens_from_omitted_authority_json(tmp_path):
+    database_path = tmp_path / "pre-authority.sqlite3"
+    store = SQLiteHarnessEventStore(database_path)
+    legacy = run_event("pre-authority-reopen")
+    unsigned = legacy.model_copy(
+        update={"sequence": 1, "state_revision": 1, "event_hash": None}
+    )
+    old_values = unsigned.model_dump(
+        mode="json",
+        exclude={
+            "event_hash",
+            "transition_authority",
+            "attempt_ownership",
+            "reconciliation_resolution",
+        },
+    )
+    event_hash = canonical_event_hash(old_values)
+    rendered = json.dumps(
+        {**old_values, "event_hash": event_hash}, sort_keys=True, separators=(",", ":")
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO harness_runs VALUES (?, ?, ?, ?, ?)",
+            ("run-1", "trace-1", 1, 1, event_hash),
+        )
+        connection.execute(
+            "INSERT INTO harness_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "pre-authority-reopen",
+                "run-1",
+                "trace-1",
+                1,
+                1,
+                event_hash,
+                None,
+                rendered,
+            ),
+        )
+
+    reopened = SQLiteHarnessEventStore(database_path)
+    assert reopened.snapshot("run-1").run_state is RunState.CREATED
+
+
+def test_authority_records_reject_sensitive_values_even_after_model_copy(store):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    authority = TransitionAuthorityRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="work_item",
+        entity_id="work-1",
+        from_state="none",
+        to_state="leased",
+        expected_state_revision=1,
+        plan_revision=0,
+        reason_code="lease_acquired",
+        idempotency_key="authority-1",
+        reservation_id="reservation-1",
+        grant_id="grant-1",
+        lease_epoch=1,
+        fencing_token_digest="a" * 64,
+    )
+    bypassed = authority_event("sensitive-authority", transition_authority=authority).model_copy(
+        update={"transition_authority": authority.model_copy(update={"grant_id": "sk-live-secret"})}
+    )
+
+    with pytest.raises(EventIntegrityError, match="sensitive"):
+        store.append(bypassed, expected_sequence=1, expected_state_revision=1)
+
+
+def test_fold_rejects_conflicting_authority_records_at_one_revision(store):
+    store.append(run_event("run-created"), expected_sequence=0, expected_state_revision=0)
+    first = TransitionAuthorityRecord(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="work_item",
+        entity_id="work-1",
+        from_state="none",
+        to_state="leased",
+        expected_state_revision=1,
+        plan_revision=0,
+        reason_code="lease_acquired",
+        idempotency_key="authority-1",
+        reservation_id="reservation-1",
+        grant_id="grant-1",
+        lease_epoch=1,
+        fencing_token_digest="a" * 64,
+    )
+    conflicting = first.model_copy(update={"grant_id": "grant-2"})
+    store.append(
+        authority_event("first-authority", transition_authority=first),
+        expected_sequence=1,
+        expected_state_revision=1,
+    )
+
+    with pytest.raises(EventIntegrityError, match="authority"):
+        store.append(
+            authority_event("conflicting-authority", transition_authority=conflicting),
+            expected_sequence=2,
+            expected_state_revision=1,
+        )

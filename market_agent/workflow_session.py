@@ -136,6 +136,13 @@ class HarnessEvent(ContractModel):
         _reject_sensitive_payload(self.payload)
         if self.transition is not None:
             _reject_sensitive_values(self.transition.model_dump(mode="python"))
+        for authority in (
+            self.transition_authority,
+            self.attempt_ownership,
+            self.reconciliation_resolution,
+        ):
+            if authority is not None:
+                _reject_sensitive_values(authority.model_dump(mode="python"))
         for value in (
             self.event_id,
             self.trace_id,
@@ -224,14 +231,24 @@ def canonical_event_hash(values: Mapping[str, object]) -> str:
 
 
 def _event_hash_values(event: HarnessEvent) -> dict[str, object]:
-    return event.model_dump(mode="json", exclude={"event_hash"})
+    values = event.model_dump(mode="json", exclude={"event_hash"})
+    for field in (
+        "transition_authority",
+        "attempt_ownership",
+        "reconciliation_resolution",
+    ):
+        if field not in event.model_fields_set:
+            values.pop(field)
+    return values
 
 
 def _validated_event(event: HarnessEvent) -> HarnessEvent:
     try:
-        return HarnessEvent.model_validate(event.model_dump(mode="python"))
+        return HarnessEvent.model_validate(
+            event.model_dump(mode="python", exclude_unset=True)
+        )
     except Exception as error:
-        raise EventIntegrityError("schema mismatch or invalid harness event") from error
+        raise EventIntegrityError(f"schema mismatch or invalid harness event: {error}") from error
 
 
 def _replace_state(
@@ -240,6 +257,17 @@ def _replace_state(
     by_id = dict(values)
     by_id[identifier] = state
     return tuple(sorted(by_id.items()))
+
+
+def _validated_view(
+    view: HarnessSessionView, updates: Mapping[str, object]
+) -> HarnessSessionView:
+    try:
+        return HarnessSessionView.model_validate(
+            view.model_copy(update=updates).model_dump(mode="python")
+        )
+    except Exception as error:
+        raise EventIntegrityError("invalid or conflicting folded authority") from error
 
 
 def _apply_committed_event(
@@ -256,19 +284,21 @@ def _apply_committed_event(
 
     if event.transition_authority is not None:
         record = event.transition_authority
-        return view.model_copy(
-            update={
+        return _validated_view(
+            view,
+            {
                 "sequence": event.sequence,
                 "run_id": run_id,
                 "trace_id": trace_id,
                 "transition_authorities": (*view.transition_authorities, record),
                 "last_event_hash": event.event_hash,
-            }
+            },
         )
     if event.attempt_ownership is not None:
         record = event.attempt_ownership
-        return view.model_copy(
-            update={
+        return _validated_view(
+            view,
+            {
                 "sequence": event.sequence,
                 "run_id": run_id,
                 "trace_id": trace_id,
@@ -277,12 +307,13 @@ def _apply_committed_event(
                     record,
                 ),
                 "last_event_hash": event.event_hash,
-            }
+            },
         )
     if event.reconciliation_resolution is not None:
         record = event.reconciliation_resolution
-        return view.model_copy(
-            update={
+        return _validated_view(
+            view,
+            {
                 "sequence": event.sequence,
                 "run_id": run_id,
                 "trace_id": trace_id,
@@ -291,7 +322,7 @@ def _apply_committed_event(
                     record,
                 ),
                 "last_event_hash": event.event_hash,
-            }
+            },
         )
 
     transition = event.transition
@@ -674,7 +705,7 @@ class SQLiteHarnessEventStore:
             prior_events = self._load_in_transaction(connection, event.run_id)
             fold_events((*prior_events, committed))
             rendered = json.dumps(
-                committed.model_dump(mode="json"),
+                committed.model_dump(mode="json", exclude_unset=True),
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,

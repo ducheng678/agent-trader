@@ -210,8 +210,12 @@ def folded_authority_view(
         "trace_id": authorization.trace_id,
         "entity_kind": candidate.entity_kind,
         "entity_id": authorization.entity_id,
+        "from_state": candidate.from_state,
+        "to_state": candidate.to_state,
         "expected_state_revision": authorization.expected_state_revision,
         "plan_revision": authorization.plan_revision,
+        "reason_code": candidate.reason_code,
+        "idempotency_key": candidate.idempotency_key,
         "dependency_versions": authorization.dependency_versions,
     }
     if candidate.entity_kind != "run":
@@ -792,3 +796,56 @@ def test_orphan_nonrun_transition_fails_even_for_initial_none_state(machine):
     )
 
     assert not machine.validate(candidate, view, authorization=evidence).allowed
+
+
+@pytest.mark.parametrize(
+    "run_state",
+    [RunState.SUCCEEDED, RunState.DEGRADED, RunState.FAILED, RunState.CANCELLED],
+)
+def test_terminal_run_rejects_every_nonrun_transition_including_initialization(
+    machine, run_state
+):
+    view = HarnessSessionView(
+        run_id="run-1", trace_id="trace-1", run_state=run_state
+    )
+    candidate = work_transition("none", WorkItemState.PENDING, expected_state_revision=0, plan_revision=0)
+    evidence = WorkItemTransitionAuthorization(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_id="work-1",
+        expected_state_revision=0,
+        plan_revision=0,
+        dependency_versions=(),
+        reservation_id="reservation-1",
+        grant_id="grant-1",
+        lease_epoch=4,
+        fencing_token_digest=HASH,
+    )
+    authoritative = folded_authority_view(view, candidate, evidence)
+
+    assert not machine.validate(
+        candidate, authoritative, authorization=evidence
+    ).allowed
+
+
+def test_authority_cannot_authorize_another_branch_reason_or_idempotency(machine):
+    view = run_view(RunState.RUNNING)
+    authorized = run_transition(RunState.RUNNING, RunState.SUMMARIZING)
+    authority = authorization_for(authorized, view)
+    folded = folded_authority_view(view, authorized, authority)
+    for candidate in (
+        run_transition(RunState.RUNNING, RunState.RECONCILING),
+        run_transition(
+            RunState.RUNNING,
+            RunState.SUMMARIZING,
+            reason_code="another_reason",
+        ),
+        run_transition(
+            RunState.RUNNING,
+            RunState.SUMMARIZING,
+            idempotency_key="another-idempotency-key",
+        ),
+    ):
+        assert not machine.validate(
+            candidate, folded, authorization=authorization_for(candidate, folded)
+        ).allowed

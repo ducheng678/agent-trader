@@ -346,6 +346,8 @@ class GlobalTaskStateMachine:
             view.run_id is None or view.trace_id is None or view.run_state is None
         ):
             return TransitionValidation(False, "non-run transition requires active run")
+        if transition.entity_kind != "run" and view.run_state in RUN_TERMINAL_STATES:
+            return TransitionValidation(False, "non-run transition requires nonterminal run")
         if type(authorization) is not expected_type:
             return TransitionValidation(False, "transition evidence type is incompatible")
         if authorization.run_id != transition.run_id or (
@@ -599,8 +601,12 @@ def _authority_record(
         "trace_id": authorization.trace_id,
         "entity_kind": transition.entity_kind,
         "entity_id": authorization.entity_id,
+        "from_state": transition.from_state,
+        "to_state": transition.to_state,
         "expected_state_revision": authorization.expected_state_revision,
         "plan_revision": authorization.plan_revision,
+        "reason_code": transition.reason_code,
+        "idempotency_key": transition.idempotency_key,
         "dependency_versions": authorization.dependency_versions,
     }
     if isinstance(authorization, _LeasedTransitionAuthorization):
