@@ -98,3 +98,20 @@ def test_success_reason_and_vector_pin_cannot_be_forged():
     a=art(); v=ConfidenceFeatureVector(artifact_hash="9"*64,features=tuple(ConfidenceFeatureValue(feature_name=n,value=Decimal(1)) for n in FEATURE_ORDER))
     with pytest.raises(ValidationError): ConfidenceDecision(score=Decimal(".9"),feature_vector=v,artifact_hash=v.artifact_hash,may_succeed=True,next_action="succeed",reason_code="hard_gate_blocked")
     assert not gate(a)._decide(score=Decimal(".9"),recovered=False,feature_vector=v).may_succeed
+
+def test_truthy_or_raising_verifier_permanently_seals_gate():
+    class TruthyVerifier:
+        def verify(self, key_id, payload, signature): return "verified"
+    class WrongArityVerifier:
+        def verify(self): return True
+    a=art()
+    for verifier in (TruthyVerifier(), WrongArityVerifier()):
+        g=ConfidenceGate(trusted_policy=gate(a)._policy,signature_verifier=verifier,request_context=gate(a)._context)
+        assert g.evaluate(obs(),a).next_action=="degrade_no_trade"
+        assert g.evaluate(obs(),a).next_action=="degrade_no_trade"
+
+def test_private_decide_rejects_malformed_vector_without_raising():
+    a=art()
+    decision=gate(a)._decide(score=Decimal(".9"),recovered=False,feature_vector=None)
+    assert not decision.may_succeed
+    assert decision.next_action=="safe_retrieval"

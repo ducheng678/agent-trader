@@ -150,7 +150,15 @@ class ConfidenceGate:
         try:
             o=ConfidenceObservation.model_validate(observation.model_dump(mode="python",round_trip=True));a=ConfidenceCalibratorArtifact.model_validate(artifact.model_dump(mode="python",round_trip=True));p=self._policy;g=self._context.hard_gates
             if not all((g.permission,g.risk,g.budget,g.loop,g.evidence,g.audit_integrity)) or g.policy_hash!=p.policy_hash:return _fallback(c,"hard_gate_blocked")
-            if (a.artifact_id,a.artifact_version,a.artifact_hash,a.schema_hash,a.policy_hash,a.dataset_hash,a.key_id,tuple(a.feature_specs[i].feature_name for i in range(3)),a.issued_epoch,a.expires_epoch)!=(p.artifact_id,p.artifact_version,p.artifact_hash,p.schema_hash,p.policy_hash,p.dataset_hash,p.key_id,p.feature_order,p.issued_epoch,p.expires_epoch) or o.applicability_domain!=p.applicability_domain or o.applicability_domain not in a.applicability_domains or confidence_snapshot_hashes(o)!=(o.accepted_record_snapshot_hash,o.provenance_snapshot_hash) or o.accepted_record_snapshot_hash!=p.accepted_record_snapshot_hash or o.provenance_snapshot_hash!=p.provenance_snapshot_hash or not a.issued_epoch<=self._context.evaluation_epoch<=a.expires_epoch or not self._verifier.verify(a.key_id,artifact_payload(a),a.signature):raise CalibrationError("untrusted artifact")
+            try:
+                signature_valid = self._verifier.verify(a.key_id, artifact_payload(a), a.signature)
+            except Exception:
+                self._sealed = True
+                return _fallback(None)
+            if type(signature_valid) is not bool:
+                self._sealed = True
+                return _fallback(None)
+            if (a.artifact_id,a.artifact_version,a.artifact_hash,a.schema_hash,a.policy_hash,a.dataset_hash,a.key_id,tuple(a.feature_specs[i].feature_name for i in range(3)),a.issued_epoch,a.expires_epoch)!=(p.artifact_id,p.artifact_version,p.artifact_hash,p.schema_hash,p.policy_hash,p.dataset_hash,p.key_id,p.feature_order,p.issued_epoch,p.expires_epoch) or o.applicability_domain!=p.applicability_domain or o.applicability_domain not in a.applicability_domains or confidence_snapshot_hashes(o)!=(o.accepted_record_snapshot_hash,o.provenance_snapshot_hash) or o.accepted_record_snapshot_hash!=p.accepted_record_snapshot_hash or o.provenance_snapshot_hash!=p.provenance_snapshot_hash or not a.issued_epoch<=self._context.evaluation_epoch<=a.expires_epoch or not signature_valid:raise CalibrationError("untrusted artifact")
             es={x.evidence_id:x for x in o.accepted_evidence}; slots={x.required_slot_id:x for x in o.accepted_evidence}; rs={x.source_id:x for x in o.source_registry}; cs={x.conflict_id:x for x in o.conflicts}
             if len(es)!=len(o.accepted_evidence) or len(slots)!=len(o.accepted_evidence) or len(rs)!=len(o.source_registry) or len(cs)!=len(o.conflicts) or any(not r.enabled for r in rs.values()) or any(x.source_id not in rs for x in o.accepted_evidence) or set(slots)!=set(o.targets.required_evidence_slot_ids) or set(rs)!=set(o.targets.required_source_ids) or {slots[s].source_id for s in o.targets.required_evidence_slot_ids}!=set(o.targets.required_source_ids) or set(o.targets.known_conflict_slot_ids)!=set(cs) or any(not x.resolved or not set(x.evidence_ids)<=set(es) for x in cs.values()) or not set(o.targets.required_dependency_ids)<=set(o.folded_state.completed_dependency_ids) or not set(o.targets.required_output_field_paths)<=set(o.folded_state.valid_output_field_paths) or not set(o.targets.risk_invariant_ids)<=set(o.folded_state.satisfied_risk_invariant_ids):raise CalibrationError("incomplete host metadata")
             v=ConfidenceFeatureVector(artifact_hash=a.artifact_hash,features=tuple(ConfidenceFeatureValue(feature_name=n,value=Decimal(1)) for n in FEATURE_ORDER))
@@ -162,9 +170,13 @@ class ConfidenceGate:
         return _fallback(self._context.request_class)
 
     def _decide(self, *, score: object, recovered: object, feature_vector: ConfidenceFeatureVector) -> ConfidenceDecision:
-        if feature_vector.artifact_hash != self._policy.artifact_hash: return _fallback(self._context.request_class)
         try:
-            s=_dec(score);v=ConfidenceFeatureVector.model_validate(feature_vector.model_dump());
+            if type(feature_vector) is not ConfidenceFeatureVector:
+                raise CalibrationError("invalid feature vector")
+            v=ConfidenceFeatureVector.model_validate(feature_vector.model_dump())
+            if v.artifact_hash != self._policy.artifact_hash:
+                return _fallback(self._context.request_class)
+            s=_dec(score)
             if s>=SUCCESS:return ConfidenceDecision(score=s,feature_vector=v,artifact_hash=v.artifact_hash,may_succeed=True,next_action="succeed",reason_code="calibrated")
             if s>=RECOVERY and recovered is False:return ConfidenceDecision(score=s,feature_vector=v,artifact_hash=v.artifact_hash,may_succeed=False,next_action="one_recovery",reason_code="calibrated")
             return ConfidenceDecision(score=s,feature_vector=v,artifact_hash=v.artifact_hash,may_succeed=False,next_action="degrade_unknown" if self._context.request_class=="informational" else "degrade_no_trade",reason_code="calibrated")
