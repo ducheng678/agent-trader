@@ -34,7 +34,6 @@ from market_agent.workflow_execution_backend import (
     canonical_authority_signing_bytes,
     canonical_transition_digest,
     canonical_view_digest,
-    load_pinned_execution_receipt_verifier,
     route_committed_transition,
 )
 from market_agent.workflow_harness_contracts import (
@@ -75,12 +74,10 @@ class TrustedReceiptVerifier:
         modulus: int,
         private_exponent: int,
         key_id: str,
-        capability: ExecutionReceiptVerifier,
     ) -> None:
         self._modulus = modulus
         self._private_exponent = private_exponent
         self.key_id = key_id
-        self.capability = capability
 
     def approve(
         self, value: CommittedExecutionSnapshot | CommittedTransitionReceipt
@@ -138,7 +135,11 @@ def _generate_test_rsa_key() -> tuple[int, int, int]:
     while True:
         left = _generate_prime(1024)
         right = _generate_prime(1024)
-        if left != right and math.gcd(exponent, (left - 1) * (right - 1)) == 1:
+        if (
+            left != right
+            and (left * right).bit_length() == 2048
+            and math.gcd(exponent, (left - 1) * (right - 1)) == 1
+        ):
             modulus = left * right
             private = pow(exponent, -1, (left - 1) * (right - 1))
             return modulus, exponent, private
@@ -279,7 +280,6 @@ def verifier(monkeypatch, test_rsa_key: tuple[int, int, int]) -> TrustedReceiptV
         modulus=modulus,
         private_exponent=private,
         key_id=key_id,
-        capability=load_pinned_execution_receipt_verifier(),
     )
 
 
@@ -288,7 +288,7 @@ _BACKEND_VERIFIERS: dict[LangGraphExecutionBackend, TrustedReceiptVerifier] = {}
 
 @pytest.fixture
 def backend(verifier: TrustedReceiptVerifier) -> LangGraphExecutionBackend:
-    value = LangGraphExecutionBackend(authority_verifier=verifier.capability)
+    value = LangGraphExecutionBackend()
     _BACKEND_VERIFIERS[value] = verifier
     return value
 
@@ -1312,22 +1312,57 @@ def test_backend_rejects_arbitrary_callable_as_receipt_verifier():
 
 
 def test_verifier_has_no_public_callback_or_constructor(
-    verifier: TrustedReceiptVerifier,
+    backend: LangGraphExecutionBackend,
 ):
     with pytest.raises(TypeError):
         ExecutionReceiptVerifier(lambda _: True)  # type: ignore[arg-type]
-    assert not hasattr(verifier.capability, "_verify_bytes")
+    assert not hasattr(backend._authority_verifier, "_verify_bytes")
 
 
-def test_backend_rejects_non_factory_verifier_forgery():
+def test_backend_cannot_inject_forged_verifier_or_attacker_signed_snapshot(
+    backend: LangGraphExecutionBackend,
+    verifier: TrustedReceiptVerifier,
+    test_rsa_key: tuple[int, int, int],
+):
+    modulus, exponent, private = test_rsa_key
     forged = object.__new__(ExecutionReceiptVerifier)
+    object.__setattr__(
+        forged,
+        "_factory_capability",
+        execution_backend_module._VERIFIER_FACTORY_CAPABILITY,
+    )
     object.__setattr__(
         forged,
         "_config_digest",
         execution_backend_module._EXPECTED_TRUST_CONFIG_DIGEST,
     )
+    object.__setattr__(forged, "_keys", {"attacker": (modulus, exponent)})
     with pytest.raises(InvalidExecutionInputError):
         LangGraphExecutionBackend(authority_verifier=forged)
+
+    attacker = TrustedReceiptVerifier(
+        modulus=modulus,
+        private_exponent=private,
+        key_id="attacker",
+    )
+    plan_value = plan()
+    view_value = view()
+    snapshot = CommittedExecutionSnapshot(
+        run_id=plan_value.run_id,
+        trace_id=plan_value.trace_id,
+        plan_id=plan_value.plan_id,
+        plan_digest=canonical_plan_digest(plan_value),
+        plan_revision=plan_value.revision,
+        sequence=view_value.sequence,
+        state_revision=view_value.state_revision,
+        view_digest=canonical_view_digest(view_value),
+        event_head_hash=view_value.last_event_hash,
+        trust_key_id="attacker",
+        signature="0" * 512,
+    )
+    snapshot = cast(CommittedExecutionSnapshot, attacker.approve(snapshot))
+    with pytest.raises(UnverifiedExecutionReceiptError):
+        backend.register(plan_value, view_value, snapshot)
 
 
 def test_cancel_during_verification_cannot_publish_uncancelled_projection(
@@ -1435,7 +1470,52 @@ def test_pinned_verifier_factory_rejects_attacker_selected_key(monkeypatch):
         {"attacker": ((1 << 2047) + 1, 65537)},
     )
     with pytest.raises(InvalidExecutionInputError):
-        load_pinned_execution_receipt_verifier()
+        execution_backend_module._load_pinned_execution_receipt_verifier()
+
+
+@pytest.mark.parametrize(
+    ("key_id", "key"),
+    (
+        ("weak-bits", ((1 << 2040) | 1, 65537)),
+        ("even-modulus", ((1 << 2047) + 2, 65537)),
+        ("weak-exponent", ((1 << 2047) + 1, 3)),
+        ("bool-modulus", (True, 65537)),
+        ("bool-exponent", ((1 << 2047) + 1, True)),
+        (" Noncanonical ", ((1 << 2047) + 1, 65537)),
+    ),
+)
+def test_pinned_factory_rejects_invalid_key_entries(
+    monkeypatch,
+    key_id: str,
+    key: tuple[object, object],
+):
+    keys = {key_id: key}
+    monkeypatch.setattr(execution_backend_module, "_PINNED_PUBLIC_KEYS", keys)
+    monkeypatch.setattr(
+        execution_backend_module,
+        "_EXPECTED_TRUST_CONFIG_DIGEST",
+        execution_backend_module._trust_config_digest(keys),
+    )
+    with pytest.raises(InvalidExecutionInputError):
+        execution_backend_module._load_pinned_execution_receipt_verifier()
+
+
+def test_pinned_factory_rejects_duplicate_key_ids(monkeypatch):
+    key = ((1 << 2047) + 1, 65537)
+
+    class DuplicatePinnedKeys(dict):
+        def items(self):
+            return (("duplicate", key), ("duplicate", key))
+
+    keys = DuplicatePinnedKeys({"duplicate": key})
+    monkeypatch.setattr(execution_backend_module, "_PINNED_PUBLIC_KEYS", keys)
+    monkeypatch.setattr(
+        execution_backend_module,
+        "_EXPECTED_TRUST_CONFIG_DIGEST",
+        execution_backend_module._trust_config_digest(keys),
+    )
+    with pytest.raises(InvalidExecutionInputError):
+        execution_backend_module._load_pinned_execution_receipt_verifier()
 
 
 def test_scalar_normalization_is_rejected_before_snapshot_verification(

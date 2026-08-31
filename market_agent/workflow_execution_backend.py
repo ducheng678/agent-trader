@@ -6,6 +6,7 @@ from collections.abc import Mapping
 import hmac
 import hashlib
 import json
+import re
 from threading import RLock
 from types import MappingProxyType
 from typing import Annotated, Protocol, TypedDict, cast, final, runtime_checkable
@@ -179,6 +180,7 @@ _EXPECTED_TRUST_CONFIG_DIGEST = (
 )
 _VERIFIER_FACTORY_CAPABILITY = object()
 _SHA256_DIGEST_INFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+_CANONICAL_KEY_ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 
 
 def _trust_config_digest(keys: Mapping[str, tuple[int, int]]) -> str:
@@ -194,6 +196,47 @@ def _trust_config_digest(keys: Mapping[str, tuple[int, int]]) -> str:
     ).hexdigest()
 
 
+def _validated_pinned_public_keys(
+    keys: Mapping[str, tuple[int, int]],
+) -> Mapping[str, tuple[int, int]]:
+    if not isinstance(keys, Mapping):
+        raise InvalidExecutionInputError("pinned execution keys must be a mapping")
+    try:
+        entries = tuple(keys.items())
+    except Exception as error:
+        raise InvalidExecutionInputError("pinned execution keys are unreadable") from error
+    if not entries:
+        raise InvalidExecutionInputError("pinned execution keys cannot be empty")
+    identifiers: list[str] = []
+    validated: dict[str, tuple[int, int]] = {}
+    for entry in entries:
+        if type(entry) is not tuple or len(entry) != 2:
+            raise InvalidExecutionInputError("pinned execution key entry is malformed")
+        key_id, public_key = entry
+        if (
+            type(key_id) is not str
+            or len(key_id) > 64
+            or _CANONICAL_KEY_ID.fullmatch(key_id) is None
+        ):
+            raise InvalidExecutionInputError("pinned execution key ID is noncanonical")
+        if type(public_key) is not tuple or len(public_key) != 2:
+            raise InvalidExecutionInputError("pinned RSA public key is malformed")
+        modulus, exponent = public_key
+        if type(modulus) is not int or type(exponent) is not int:
+            raise InvalidExecutionInputError("pinned RSA values must be exact integers")
+        if modulus <= 0 or modulus % 2 == 0 or modulus.bit_length() != 2048:
+            raise InvalidExecutionInputError(
+                "pinned RSA modulus must be an odd positive 2048-bit integer"
+            )
+        if exponent != 65537 or not 1 < exponent < modulus:
+            raise InvalidExecutionInputError("pinned RSA exponent must be 65537")
+        identifiers.append(key_id)
+        validated[key_id] = (modulus, exponent)
+    if len(identifiers) != len(set(identifiers)):
+        raise InvalidExecutionInputError("pinned execution key IDs must be unique")
+    return MappingProxyType(validated)
+
+
 @final
 class ExecutionReceiptVerifier:
     """Pure verifier bound to the module-pinned versioned public-key set."""
@@ -203,13 +246,14 @@ class ExecutionReceiptVerifier:
     def __init__(self, capability: object = None) -> None:
         if capability is not _VERIFIER_FACTORY_CAPABILITY:
             raise TypeError("receipt verifiers are created only by the pinned factory")
-        actual = _trust_config_digest(_PINNED_PUBLIC_KEYS)
+        keys = _validated_pinned_public_keys(_PINNED_PUBLIC_KEYS)
+        actual = _trust_config_digest(keys)
         if actual != _EXPECTED_TRUST_CONFIG_DIGEST:
             raise InvalidExecutionInputError("pinned execution trust config mismatch")
         object.__setattr__(self, "_version", _TRUST_VERSION)
         object.__setattr__(self, "_config_digest", actual)
         object.__setattr__(self, "_factory_capability", _VERIFIER_FACTORY_CAPABILITY)
-        object.__setattr__(self, "_keys", MappingProxyType(dict(_PINNED_PUBLIC_KEYS)))
+        object.__setattr__(self, "_keys", keys)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise TypeError("receipt verifier is immutable")
@@ -231,7 +275,7 @@ class ExecutionReceiptVerifier:
             return False
         modulus, exponent = key
         size = (modulus.bit_length() + 7) // 8
-        if size != 256 or exponent != 65537 or len(value.signature) != size * 2:
+        if exponent != 65537 or len(value.signature) != size * 2:
             return False
         signature = int(value.signature, 16)
         if signature >= modulus:
@@ -245,8 +289,8 @@ class ExecutionReceiptVerifier:
         return hmac.compare_digest(actual, expected)
 
 
-def load_pinned_execution_receipt_verifier() -> ExecutionReceiptVerifier:
-    """Create an exact verifier for the compiled trust-config pin."""
+def _load_pinned_execution_receipt_verifier() -> ExecutionReceiptVerifier:
+    """Create a fresh verifier for the compiled module-private trust pin."""
 
     return ExecutionReceiptVerifier(_VERIFIER_FACTORY_CAPABILITY)
 
@@ -522,18 +566,27 @@ def _is_same_revision_authority_extension(
 class LangGraphExecutionBackend:
     """Disposable projection driven only by verified committed Harness state."""
 
-    def __init__(self, *, authority_verifier: ExecutionReceiptVerifier) -> None:
+    def __init__(self, **legacy_trust_arguments: object) -> None:
+        if legacy_trust_arguments:
+            raise InvalidExecutionInputError(
+                "execution trust is module-pinned and accepts no constructor arguments"
+            )
+        pinned_keys = _validated_pinned_public_keys(_PINNED_PUBLIC_KEYS)
+        pinned_digest = _trust_config_digest(pinned_keys)
+        if pinned_digest != _EXPECTED_TRUST_CONFIG_DIGEST:
+            raise InvalidExecutionInputError("pinned execution trust config mismatch")
+        verifier = _load_pinned_execution_receipt_verifier()
         if (
-            type(authority_verifier) is not ExecutionReceiptVerifier
-            or getattr(authority_verifier, "_factory_capability", None)
+            type(verifier) is not ExecutionReceiptVerifier
+            or getattr(verifier, "_factory_capability", None)
             is not _VERIFIER_FACTORY_CAPABILITY
-            or getattr(authority_verifier, "_config_digest", None)
-            != _EXPECTED_TRUST_CONFIG_DIGEST
+            or getattr(verifier, "_config_digest", None) != pinned_digest
+            or dict(getattr(verifier, "_keys", {})) != dict(pinned_keys)
         ):
             raise InvalidExecutionInputError(
-                "authority verifier must be an exact ExecutionReceiptVerifier"
+                "module-pinned execution verifier provenance is invalid"
             )
-        self._authority_verifier = authority_verifier
+        self._authority_verifier = verifier
         self._graph = _build_projection_graph()
         self._state_machine = GlobalTaskStateMachine()
         self._lock = RLock()
