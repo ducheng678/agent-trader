@@ -1350,9 +1350,8 @@ def test_real_budget_authority_is_complete_and_survives_restart(tmp_path):
         if event.event_type == "transition_authorized"
         and "budget_before_attempts" in event.payload
     )
-    assert {
-        key for key in authority.payload if key.startswith("budget_")
-    } == set(harness_module._BUDGET_FIELDS)
+    assert set(harness_module._BUDGET_FIELDS).issubset(authority.payload)
+    assert "budget_settlement_evidence" in authority.payload
     restarted, _, _, _ = _kernel(tmp_path)
     restarted.resume(handle.run_id)
     assert restarted._budget_state(
@@ -1363,6 +1362,83 @@ def test_real_budget_authority_is_complete_and_survives_restart(tmp_path):
         Decimal(authority.payload["budget_remaining_cost"]),
         authority.payload["budget_remaining_tokens"],
     )
+
+
+def _tampered_budget_authority(
+    authority: HarnessEvent, mutate: callable
+) -> HarnessEvent:
+    payload = dict(authority.payload)
+    evidence = dict(payload["budget_settlement_evidence"])
+    settlement = dict(evidence["settlement"])
+    settlement["usage"] = dict(settlement["usage"])
+    settlement["projection"] = dict(settlement["projection"])
+    mutate(payload, evidence, settlement)
+    settlement_unsigned = {
+        key: value for key, value in settlement.items() if key != "settlement_digest"
+    }
+    settlement["settlement_digest"] = HarnessKernel._canonical_digest(settlement_unsigned)
+    evidence["settlement"] = settlement
+    evidence_unsigned = {
+        key: value for key, value in evidence.items() if key != "binding_digest"
+    }
+    evidence["binding_digest"] = HarnessKernel._canonical_digest(evidence_unsigned)
+    payload["budget_settlement_evidence"] = evidence
+    return authority.model_copy(update={"payload": payload})
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda payload, evidence, settlement: (
+            payload.update(
+                budget_delta_attempts=0,
+                budget_remaining_attempts=10,
+                budget_delta_seconds="0.0",
+                budget_remaining_seconds="130.0",
+                budget_delta_cost="0.0",
+                budget_remaining_cost="0.30",
+                budget_delta_tokens=0,
+                budget_remaining_tokens=800,
+            ),
+            settlement["projection"].update(
+                budget_delta_attempts=0,
+                budget_remaining_attempts=10,
+                budget_delta_seconds="0.0",
+                budget_remaining_seconds="130.0",
+                budget_delta_cost="0.0",
+                budget_remaining_cost="0.30",
+                budget_delta_tokens=0,
+                budget_remaining_tokens=800,
+            ),
+        ),
+        lambda payload, evidence, settlement: settlement["usage"].update(output_tokens=0),
+        lambda payload, evidence, settlement: settlement.update(charged_cost="0.0"),
+        lambda payload, evidence, settlement: settlement.update(reservation_id="forged-reservation"),
+        lambda payload, evidence, settlement: evidence.update(settlement_event_hash="0" * 64),
+    ),
+)
+def test_budget_settlement_evidence_tampering_fails_before_restart_or_backend(
+    tmp_path, mutate
+):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    kernel.advance(handle.run_id, candidate={})
+    events = tuple(store.load(handle.run_id))
+    plan = HarnessPlan.model_validate_json(events[0].payload["plan_json"])
+    index, authority = next(
+        (index, event)
+        for index, event in enumerate(events)
+        if event.event_type == "transition_authorized"
+        and "budget_before_attempts" in event.payload
+    )
+    tampered = _tampered_budget_authority(authority, mutate)
+    with pytest.raises(HarnessDependencyError):
+        HarnessKernel._budget_state(
+            (*events[:index], tampered, *events[index + 1 :]),
+            plan,
+            WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0).snapshot(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1434,7 +1510,7 @@ def test_budget_projection_rejects_wrong_authority_and_zero_cannot_recover(tmp_p
             budget_before_tokens=798,
         ),
     )
-    with pytest.raises(HarnessDependencyError, match="monotonic"):
+    with pytest.raises(HarnessDependencyError, match="monotonic|evidence"):
         HarnessKernel._budget_state(
             (*events, zero, recovered),
             plan,
@@ -1651,6 +1727,34 @@ def test_decision_rejects_unknown_reason_and_running_no_trade_even_on_copy():
     )
     with pytest.raises(ValidationError, match="no-trade"):
         running.model_copy(update={"no_trade": True})
+
+
+@pytest.mark.parametrize("reason_code", ("stale_revision", "candidate_rejected", "terminal_state"))
+def test_observation_decisions_cannot_be_upgraded_to_transitions(reason_code):
+    state = RunState.SUCCEEDED if reason_code == "terminal_state" else RunState.RUNNING
+    transition = HarnessTransition(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="run",
+        entity_id="run-1",
+        from_state=state.value,
+        to_state=state.value,
+        expected_state_revision=0,
+        plan_revision=0,
+        reason_code=reason_code,
+        idempotency_key=f"run-0-{state.value}",
+    )
+    with pytest.raises(ValidationError, match="non-committing"):
+        HarnessDecision(
+            run_id="run-1",
+            trace_id="trace-1",
+            sequence=1,
+            state_revision=1,
+            run_state=state,
+            reason_code=reason_code,
+            no_trade=False,
+            transition=transition,
+        )
 
 
 def test_store_aliases_share_coordination_lock_and_lock_table_is_reclaimed(tmp_path, monkeypatch):

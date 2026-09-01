@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from functools import wraps
 from threading import RLock
-from typing import Any, Callable, Protocol, cast
+from typing import Any, Callable, Mapping, Protocol, cast
 from weakref import WeakValueDictionary
 
 from pydantic import StrictBool, model_validator
@@ -19,7 +19,9 @@ from pydantic import StrictBool, model_validator
 from market_agent.openai_usage import UsageTokens, estimate_workflow_usage_cost
 from market_agent.workflow_budget import (
     BudgetExceededError,
+    BudgetReservation,
     BudgetSnapshot,
+    BudgetSettlement,
     WorkflowBudgetLedger,
 )
 from market_agent.workflow_confidence_calibration import (
@@ -179,6 +181,11 @@ class HarnessDecision(_StrictOutput):
         allowed_states = _DECISION_REASON_STATES.get(self.reason_code)
         if allowed_states is None or self.run_state not in allowed_states:
             raise ValueError("decision reason and run state are inconsistent")
+        if (
+            self.transition is not None
+            and self.reason_code not in _COMMITTED_DECISION_REASONS
+        ):
+            raise ValueError("non-committing decisions cannot carry a transition")
         if self.transition is not None and (
             self.transition.run_id != self.run_id
             or self.transition.trace_id != self.trace_id
@@ -277,6 +284,8 @@ _BUDGET_DECIMAL_FIELDS = frozenset(
     }
 )
 _BUDGET_FIELDS = _BUDGET_INTEGER_FIELDS | _BUDGET_DECIMAL_FIELDS
+_BUDGET_SETTLEMENT_EVIDENCE_KEY = "budget_settlement_evidence"
+_BUDGET_SETTLEMENT_SCHEMA = "budget-settlement-evidence-v1"
 _BUDGET_AUTHORITY_TARGETS = {
     "budget_exhausted": RunState.DEGRADING,
     "loop_guard_stopped": RunState.DEGRADING,
@@ -285,6 +294,29 @@ _BUDGET_AUTHORITY_TARGETS = {
     "confidence_fail_closed": RunState.DEGRADING,
     "confidence_sufficient": RunState.SUMMARIZING,
 }
+
+# A decision is an observation unless it is one of these explicitly committed
+# state-machine outcomes.  Keeping this closed makes it impossible for callers
+# to manufacture a transition-shaped response for stale/terminal/rejected
+# requests by using ``model_copy``.
+_COMMITTED_DECISION_REASONS = frozenset(
+    {
+        "request_admitted",
+        "plan_committed",
+        "dependencies_ready",
+        "execution_started",
+        "safe_no_trade_summary",
+        "confidence_sufficient",
+        "completed",
+        "budget_exhausted",
+        "loop_guard_stopped",
+        "loop_checkpoint_binding_mismatch",
+        "confidence_context_mismatch",
+        "confidence_fail_closed",
+        "safe_no_trade_due_to_degradation",
+        "cancellation_completed",
+    }
+)
 
 _RUN_LOCKS_GUARD = RLock()
 _RUN_LOCKS: WeakValueDictionary[tuple[object, str], RLock] = WeakValueDictionary()
@@ -541,9 +573,7 @@ class HarnessKernel:
         self._ensure_runtime_dependencies(plan)
         current_snapshot = self._issued_snapshot(plan, view)
         handle = self._execution.resume(plan, view, current_snapshot)
-        target, reason, no_trade, payload = self._policy_decision(
-            events, plan, view, parsed
-        )
+        target, reason, no_trade, payload = self._policy_decision(events, plan, view, parsed)
         payload["no_trade"] = no_trade
         if candidate_digest is not None:
             payload["candidate_digest"] = candidate_digest
@@ -823,13 +853,23 @@ class HarnessKernel:
                 band="short",
                 usage=usage,
             )
-            ledger.settle(reservation, usage)
+            settlement = ledger.settle(reservation, usage)
         except BudgetExceededError:
             return RunState.DEGRADING, "budget_exhausted", True, {
                 "policy": "budget"
             }
         budget = ledger.snapshot()
-        payload.update(self._budget_payload(events, plan, before, budget, usage))
+        payload.update(
+            self._budget_payload(
+                events,
+                plan,
+                before,
+                budget,
+                usage,
+                reservation,
+                settlement,
+            )
+        )
 
         guard: LoopGuard | None = None
         if candidate.action_observation is not None:
@@ -1014,6 +1054,8 @@ class HarnessKernel:
         before: BudgetSnapshot,
         after: BudgetSnapshot,
         usage: UsageTokens,
+        reservation: BudgetReservation,
+        settlement: BudgetSettlement,
     ) -> dict[str, object]:
         attempts, seconds, cost, tokens = HarnessKernel._budget_state(
             events, plan, before
@@ -1034,7 +1076,7 @@ class HarnessKernel:
             remaining_seconds, remaining_cost
         ) < 0:
             raise HarnessDependencyError("runtime budget exceeded durable authority")
-        return {
+        projection: dict[str, object] = {
             "budget_before_attempts": attempts,
             "budget_delta_attempts": attempt_delta,
             "budget_remaining_attempts": remaining_attempts,
@@ -1048,6 +1090,40 @@ class HarnessKernel:
             "budget_delta_tokens": token_delta,
             "budget_remaining_tokens": remaining_tokens,
         }
+        if (
+            settlement.reservation_id != reservation.reservation_id
+            or settlement.timeout
+            or settlement.charged_cost != cost_delta
+            or attempt_delta != 1
+        ):
+            raise HarnessDependencyError("budget settlement does not bind runtime usage")
+        settlement_core: dict[str, object] = {
+            "schema_version": _BUDGET_SETTLEMENT_SCHEMA,
+            "reservation_id": reservation.reservation_id,
+            "charged_cost": format(settlement.charged_cost, "f"),
+            "timeout": settlement.timeout,
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+                "output_tokens": usage.output_tokens,
+                "web_search_tool_calls": usage.web_search_tool_calls,
+            },
+            "projection": projection,
+        }
+        settlement_evidence = {
+            **settlement_core,
+            "settlement_digest": HarnessKernel._canonical_digest(settlement_core),
+        }
+        return {**projection, _BUDGET_SETTLEMENT_EVIDENCE_KEY: settlement_evidence}
+
+    @staticmethod
+    def _canonical_digest(value: object) -> str:
+        return sha256(
+            json.dumps(
+                value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
     def _budget_decimal(value: object) -> Decimal:
@@ -1072,11 +1148,21 @@ class HarnessKernel:
         event: HarnessEvent,
         plan: HarnessPlan,
         current: tuple[int, Decimal, Decimal, int],
+        prior_events: tuple[HarnessEvent, ...],
     ) -> tuple[int, Decimal, Decimal, int]:
-        budget_keys = frozenset(
-            key for key in event.payload if str(key).startswith("budget_")
+        budget_keys = frozenset(key for key in event.payload if key in _BUDGET_FIELDS)
+        unknown_budget_keys = frozenset(
+            key
+            for key in event.payload
+            if str(key).startswith("budget_")
+            and key not in _BUDGET_FIELDS
+            and key != _BUDGET_SETTLEMENT_EVIDENCE_KEY
         )
-        if budget_keys != _BUDGET_FIELDS or event.event_type != "transition_authorized":
+        if (
+            budget_keys != _BUDGET_FIELDS
+            or unknown_budget_keys
+            or event.event_type != "transition_authorized"
+        ):
             raise HarnessDependencyError("committed budget projection is not canonical")
         authority = event.transition_authority
         expected_target = (
@@ -1135,7 +1221,149 @@ class HarnessKernel:
             before[index] - delta[index] for index in range(4)
         ) != after:
             raise HarnessDependencyError("committed budget projection breaks monotonic chain")
+        HarnessKernel._validated_budget_settlement_evidence(
+            event, plan, prior_events=prior_events, projection={
+                "budget_before_attempts": before[0],
+                "budget_delta_attempts": delta[0],
+                "budget_remaining_attempts": after[0],
+                "budget_before_seconds": format(before[1], "f"),
+                "budget_delta_seconds": format(delta[1], "f"),
+                "budget_remaining_seconds": format(after[1], "f"),
+                "budget_before_cost": format(before[2], "f"),
+                "budget_delta_cost": format(delta[2], "f"),
+                "budget_remaining_cost": format(after[2], "f"),
+                "budget_before_tokens": before[3],
+                "budget_delta_tokens": delta[3],
+                "budget_remaining_tokens": after[3],
+            },
+        )
         return after
+
+    @staticmethod
+    def _validated_budget_settlement_evidence(
+        event: HarnessEvent,
+        plan: HarnessPlan,
+        *,
+        prior_events: tuple[HarnessEvent, ...],
+        projection: dict[str, object],
+    ) -> None:
+        """Require a durable host snapshot and exact settlement facts.
+
+        Budget numbers in an authority event are projections, not authority by
+        themselves.  This companion evidence binds each projection to the
+        immediately preceding issuer snapshot, an actual reservation, and the
+        fixed Phase-1 usage contract.  It is intentionally checked during
+        replay, before any backend registration/resume can occur.
+        """
+        evidence = event.payload.get(_BUDGET_SETTLEMENT_EVIDENCE_KEY)
+        if not isinstance(evidence, Mapping):
+            raise HarnessDependencyError("budget settlement evidence is missing")
+        expected_keys = {
+            "settlement",
+            "settlement_event_hash",
+            "settlement_event_sequence",
+            "host_receipt",
+            "binding_digest",
+        }
+        if set(evidence) != expected_keys:
+            raise HarnessDependencyError("budget settlement evidence is not canonical")
+        digest = evidence.get("binding_digest")
+        unsigned = {key: value for key, value in evidence.items() if key != "binding_digest"}
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or digest != HarnessKernel._canonical_digest(unsigned)
+        ):
+            raise HarnessDependencyError("budget settlement evidence digest is invalid")
+        settlement = evidence.get("settlement")
+        if not isinstance(settlement, Mapping):
+            raise HarnessDependencyError("budget settlement evidence is invalid")
+        expected_settlement_keys = {
+            "schema_version",
+            "reservation_id",
+            "charged_cost",
+            "timeout",
+            "usage",
+            "projection",
+            "settlement_digest",
+        }
+        if set(settlement) != expected_settlement_keys:
+            raise HarnessDependencyError("budget settlement evidence is not canonical")
+        settlement_unsigned = {
+            key: value for key, value in settlement.items() if key != "settlement_digest"
+        }
+        if (
+            settlement.get("schema_version") != _BUDGET_SETTLEMENT_SCHEMA
+            or settlement.get("projection") != projection
+            or settlement.get("settlement_digest")
+            != HarnessKernel._canonical_digest(settlement_unsigned)
+        ):
+            raise HarnessDependencyError("budget settlement evidence digest is invalid")
+        reservation_id = settlement.get("reservation_id")
+        if (
+            type(reservation_id) is not str
+            or not reservation_id
+            or reservation_id != reservation_id.strip()
+            or len(reservation_id) > 256
+            or settlement.get("timeout") is not False
+        ):
+            raise HarnessDependencyError("budget settlement evidence is invalid")
+        usage_value = settlement.get("usage")
+        if not isinstance(usage_value, Mapping) or set(usage_value) != {
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_tokens",
+            "output_tokens",
+            "web_search_tool_calls",
+        }:
+            raise HarnessDependencyError("budget settlement usage is invalid")
+        try:
+            usage = UsageTokens(**usage_value)
+        except Exception as error:
+            raise HarnessDependencyError("budget settlement usage is invalid") from error
+        # Phase 1 performs precisely one bounded event-filter attempt.  This
+        # rejects self-consistent all-zero projections and any synthetic usage
+        # that cannot have been settled by the runtime.
+        expected_usage = UsageTokens(input_tokens=1, output_tokens=1)
+        if usage != expected_usage or projection["budget_delta_attempts"] != 1:
+            raise HarnessDependencyError("budget settlement has no real attempt")
+        expected_tokens = usage.input_tokens + usage.cache_write_tokens + usage.output_tokens
+        if projection["budget_delta_tokens"] != expected_tokens:
+            raise HarnessDependencyError("budget settlement token total is inconsistent")
+        charged_cost = HarnessKernel._budget_decimal(settlement.get("charged_cost"))
+        expected_cost = estimate_workflow_usage_cost("gpt-5.6-luna", "short", usage)
+        if charged_cost != expected_cost or charged_cost != Decimal(
+            cast(str, projection["budget_delta_cost"])
+        ):
+            raise HarnessDependencyError("budget settlement cost is inconsistent")
+        try:
+            pre = CommittedExecutionSnapshot.model_validate(evidence.get("host_receipt"))
+        except Exception as error:
+            raise HarnessDependencyError("budget settlement receipt is invalid") from error
+        if (
+            pre.run_id != plan.run_id
+            or pre.trace_id != plan.trace_id
+            or pre.plan_id != plan.plan_id
+            or pre.plan_digest != canonical_plan_digest(plan)
+            or pre.plan_revision != plan.revision
+            or pre.sequence != event.sequence - 1
+            or pre.state_revision != event.state_revision
+            or pre.event_head_hash != event.previous_event_hash
+            or evidence.get("settlement_event_hash") != event.previous_event_hash
+            or evidence.get("settlement_event_sequence") != event.sequence - 1
+        ):
+            raise HarnessDependencyError("budget settlement receipt does not bind authority")
+        if not prior_events:
+            raise HarnessDependencyError("budget settlement record is missing")
+        settlement_event = prior_events[-1]
+        if (
+            settlement_event.event_type != "budget_settlement_recorded"
+            or settlement_event.sequence != event.sequence - 1
+            or settlement_event.state_revision != event.state_revision
+            or settlement_event.event_hash != event.previous_event_hash
+            or settlement_event.payload != {"budget_settlement": settlement}
+        ):
+            raise HarnessDependencyError("budget settlement record does not bind authority")
 
     @staticmethod
     def _budget_state(
@@ -1166,14 +1394,12 @@ class HarnessKernel:
         cost = initial.remaining_cost
         tokens = sum(worker.context_token_budget for worker in plan.workers)
         current = (attempts, seconds, cost, tokens)
-        for event in events:
-            budget_keys = frozenset(
-                key for key in event.payload if str(key).startswith("budget_")
-            )
+        for index, event in enumerate(events):
+            budget_keys = frozenset(key for key in event.payload if key in _BUDGET_FIELDS)
             if not budget_keys:
                 continue
             current = HarnessKernel._validated_budget_projection(
-                event, plan, current
+                event, plan, current, events[:index]
             )
         return current
 
@@ -1307,6 +1533,39 @@ class HarnessKernel:
             )
             return self.snapshot(plan.run_id), transition, True
 
+        authority_view = view
+        if (
+            not authority_already_committed
+            and _BUDGET_SETTLEMENT_EVIDENCE_KEY in event_payload
+        ):
+            settlement = event_payload[_BUDGET_SETTLEMENT_EVIDENCE_KEY]
+            settlement_event = self._event(
+                plan,
+                "budget_settlement_recorded",
+                payload={"budget_settlement": settlement},
+            )
+            self.event_store.append(
+                settlement_event,
+                expected_sequence=view.sequence,
+                expected_state_revision=view.state_revision,
+            )
+            authority_view = self.snapshot(plan.run_id)
+            host_receipt = self._issued_snapshot(plan, authority_view)
+            evidence_core = {
+                "settlement": settlement,
+                "settlement_event_hash": authority_view.last_event_hash,
+                "settlement_event_sequence": authority_view.sequence,
+                "host_receipt": host_receipt.model_dump(
+                    mode="json", exclude={"folded_view"}
+                ),
+            }
+            event_payload = {
+                **event_payload,
+                _BUDGET_SETTLEMENT_EVIDENCE_KEY: {
+                    **evidence_core,
+                    "binding_digest": self._canonical_digest(evidence_core),
+                },
+            }
         if authority_already_committed:
             pre_view = view
         else:
@@ -1318,8 +1577,8 @@ class HarnessKernel:
             )
             self.event_store.append(
                 authority_event,
-                expected_sequence=view.sequence,
-                expected_state_revision=view.state_revision,
+                expected_sequence=authority_view.sequence,
+                expected_state_revision=authority_view.state_revision,
             )
             pre_view = self.snapshot(plan.run_id)
         pre_snapshot = self._issued_snapshot(plan, pre_view)
@@ -1334,6 +1593,7 @@ class HarnessKernel:
                     key: value
                     for key, value in event_payload.items()
                     if key not in _BUDGET_FIELDS
+                    and key != _BUDGET_SETTLEMENT_EVIDENCE_KEY
                 },
                 "reason_code": reason_code,
             },
