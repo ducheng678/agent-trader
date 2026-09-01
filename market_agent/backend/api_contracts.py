@@ -20,6 +20,8 @@ class TaskSubmissionRequest(ApiModel):
 
 
 class GeneratePlaybookPayload(ApiModel):
+    trace_id: str | None = None
+    tenant_id: str = "default"
     user_query: NonEmptyText
     event_tape: list[dict[str, Any]]
     trigger_reason: NonEmptyText

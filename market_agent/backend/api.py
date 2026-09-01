@@ -237,17 +237,21 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
         tags=["tasks"],
     )
     def submit_task(
+        request: Request,
         task_name: str,
         body: TaskSubmissionRequest,
         idempotency_key_header: str | None = Header(default=None, alias="Idempotency-Key"),
         _: None = Depends(require_api_token),
     ) -> TaskAcceptedResponse:
         idempotency_key = _resolve_idempotency_key(body.idempotency_key, idempotency_key_header)
+        task_payload = dict(body.payload)
+        if task_name == "generate_playbook":
+            task_payload["trace_id"] = get_request_trace(request).trace_id
         submission = resolved_container.task_queue.submit(
             task_name,
-            body.payload,
+            task_payload,
             idempotency_key=idempotency_key,
-            request_id=current_request_id(),
+            request_id=get_request_trace(request).trace_id,
         )
         return TaskAcceptedResponse(
             job_id=submission.job.job_id,
