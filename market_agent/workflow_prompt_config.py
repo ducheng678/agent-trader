@@ -15,6 +15,7 @@ from typing import Callable, Iterator, Protocol
 
 from pydantic import Field, model_validator
 
+from market_agent.workflow_agent_contracts import ModelTier
 from market_agent.workflow_contracts import ContractModel, Digest, ShortText
 from market_agent.workflow_prompt_release import PromptRelease, canonical_json
 
@@ -86,6 +87,18 @@ def load_git_tracked_releases(*, prompts_root: Path, git_root: Path) -> tuple[Pr
             raise PromptConfigurationError(f"prompt manifest is not git tracked: {relative}")
         try:
             decoded = json.loads(path.read_text(encoding="utf-8"))
+            release = decoded.get("release") if isinstance(decoded, dict) else None
+            if isinstance(release, dict):
+                for field_name in ("supported_task_kinds", "supported_model_tiers", "temperature_profile"):
+                    if isinstance(release.get(field_name), list):
+                        release[field_name] = tuple(
+                            tuple(item) if field_name == "temperature_profile" and isinstance(item, list) else item
+                            for item in release[field_name]
+                        )
+                if isinstance(release.get("supported_model_tiers"), tuple):
+                    release["supported_model_tiers"] = tuple(ModelTier(item) for item in release["supported_model_tiers"])
+                if isinstance(release.get("temperature_profile"), tuple):
+                    release["temperature_profile"] = tuple((ModelTier(item[0]), item[1]) for item in release["temperature_profile"])
             manifests.append(PromptReleaseManifest.model_validate(decoded))
         except Exception as error:
             raise PromptConfigurationError(f"invalid prompt manifest: {relative}") from error
@@ -233,3 +246,25 @@ class PromptReleaseManager:
                     hook(activation, pin)
                 except Exception:
                     continue
+
+
+def default_prompt_manager(*, registry_path: Path, git_root: Path | None = None,
+                           release_gate: ReleaseGate | None = None,
+                           audit_hook: ReleaseHook | None = None,
+                           metric_hook: ReleaseHook | None = None) -> PromptReleaseManager:
+    root = (git_root or Path(__file__).resolve().parents[1]).resolve()
+    manager = PromptReleaseManager.from_git(
+        prompts_root=root / "prompts",
+        git_root=root,
+        registry_path=registry_path,
+        release_gate=release_gate,
+        audit_hook=audit_hook,
+        metric_hook=metric_hook,
+    )
+    try:
+        manager.current()
+    except PromptConfigurationError as error:
+        if str(error) != "no active prompt release":
+            raise
+        manager.activate("default-v1")
+    return manager
