@@ -1,0 +1,328 @@
+{
+  "$defs": {
+    "CaseProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "license": {
+          "enum": [
+            "CC0-1.0",
+            "internal-approved"
+          ],
+          "title": "License",
+          "type": "string"
+        },
+        "provenance_hash": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provenance Hash"
+        },
+        "reference": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Reference",
+          "type": "string"
+        },
+        "sanitized": {
+          "const": true,
+          "title": "Sanitized",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "synthetic",
+            "sanitized_recording"
+          ],
+          "title": "Source Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_kind",
+        "reference",
+        "license",
+        "sanitized",
+        "description"
+      ],
+      "title": "CaseProvenance",
+      "type": "object"
+    },
+    "ExpectedBehavior": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "default": "no_trade",
+          "enum": [
+            "no_trade",
+            "long",
+            "short"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "allowed_facts": {
+          "items": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Allowed Facts",
+          "type": "array"
+        },
+        "conclusion": {
+          "enum": [
+            "answer",
+            "��֪��",
+            "no_trade"
+          ],
+          "title": "Conclusion",
+          "type": "string"
+        },
+        "forbidden_facts": {
+          "items": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Forbidden Facts",
+          "type": "array"
+        },
+        "maximum_cost_usd": {
+          "default": 0.1,
+          "minimum": 0.0,
+          "title": "Maximum Cost Usd",
+          "type": "number"
+        },
+        "maximum_latency_seconds": {
+          "default": 30.0,
+          "minimum": 0.0,
+          "title": "Maximum Latency Seconds",
+          "type": "number"
+        },
+        "maximum_tokens": {
+          "default": 4096,
+          "exclusiveMinimum": 0,
+          "title": "Maximum Tokens",
+          "type": "integer"
+        },
+        "required_evidence_ids": {
+          "items": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Required Evidence Ids",
+          "type": "array"
+        },
+        "required_facts": {
+          "items": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Required Facts",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "conclusion"
+      ],
+      "title": "ExpectedBehavior",
+      "type": "object"
+    },
+    "RecordedObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "cost_usd": {
+          "minimum": 0.0,
+          "title": "Cost Usd",
+          "type": "number"
+        },
+        "input_tokens": {
+          "minimum": 0,
+          "title": "Input Tokens",
+          "type": "integer"
+        },
+        "latency_seconds": {
+          "minimum": 0.0,
+          "title": "Latency Seconds",
+          "type": "number"
+        },
+        "observed_violations": {
+          "default": [],
+          "items": {
+            "enum": [
+              "order_execution",
+              "risk_bypass",
+              "cross_trace",
+              "permission_bypass",
+              "secret_exposure",
+              "unsupported_claim",
+              "unsafe_cache",
+              "missing_reflection",
+              "invalid_schema",
+              "evidence_fabrication"
+            ],
+            "type": "string"
+          },
+          "title": "Observed Violations",
+          "type": "array"
+        },
+        "output": {
+          "title": "Output"
+        },
+        "output_tokens": {
+          "minimum": 0,
+          "title": "Output Tokens",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "output",
+        "latency_seconds",
+        "input_tokens",
+        "output_tokens",
+        "cost_usd"
+      ],
+      "title": "RecordedObservation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "allowed_evidence_ids": {
+      "items": {
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Allowed Evidence Ids",
+      "type": "array"
+    },
+    "case_hash": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Case Hash"
+    },
+    "case_id": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "Case Id",
+      "type": "string"
+    },
+    "expected": {
+      "$ref": "#/$defs/ExpectedBehavior"
+    },
+    "input_fingerprint": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Input Fingerprint"
+    },
+    "leakage_group": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "Leakage Group",
+      "type": "string"
+    },
+    "provenance": {
+      "$ref": "#/$defs/CaseProvenance"
+    },
+    "recording": {
+      "$ref": "#/$defs/RecordedObservation"
+    },
+    "schema_version": {
+      "const": "evaluation-case-v1",
+      "default": "evaluation-case-v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "suite": {
+      "enum": [
+        "regression",
+        "abstention",
+        "security",
+        "resilience",
+        "cache",
+        "retrieval",
+        "memory",
+        "reflection",
+        "permission",
+        "trace"
+      ],
+      "title": "Suite",
+      "type": "string"
+    },
+    "task_input": {
+      "title": "Task Input"
+    },
+    "trace_id": {
+      "pattern": "^[0-9a-f]{32}$",
+      "title": "Trace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "case_id",
+    "suite",
+    "leakage_group",
+    "trace_id",
+    "task_input",
+    "provenance",
+    "expected",
+    "recording"
+  ],
+  "title": "EvaluationCase",
+  "type": "object"
+}
