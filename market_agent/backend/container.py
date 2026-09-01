@@ -26,6 +26,7 @@ class BackendContainer:
     memory_maintenance: Any = None
     governed_memory_repository: Any = None
     semantic_response_cache: Any = None
+    historical_answer_cache: Any = None
 
     def __post_init__(self) -> None:
         if self.observability is None:
@@ -91,14 +92,9 @@ class BackendContainer:
             resolved_settings.memory_database_path.parent.mkdir(parents=True, exist_ok=True)
             container.memory_repository = SQLiteMemoryRepository(
                 resolved_settings.memory_database_path, writer_authority=memory_authority)
-            container.memory_maintenance = MemoryMaintenanceScheduler(
-                LifecycleWorker(container.memory_repository), tenant_id=resolved_settings.tenant_id,
-                authority=memory_authority,
-                interval_seconds=resolved_settings.memory_maintenance_interval_seconds)
-            container.memory_maintenance.start()
-
             if resolved_settings.postgres_dsn:
                 import psycopg
+                from market_agent.workflow_historical_answer_cache import PostgresHistoricalAnswerCache
                 from market_agent.workflow_memory_postgres import PostgresMemoryRepository
                 from market_agent.workflow_semantic_cache_postgres import PostgresSemanticRequestCache
 
@@ -110,6 +106,24 @@ class BackendContainer:
                 container.semantic_response_cache = PostgresSemanticRequestCache(
                     connection_factory, embedding_dimension=resolved_settings.embedding_dimension)
                 container.semantic_response_cache.migrate()
+                container.historical_answer_cache = PostgresHistoricalAnswerCache(
+                    connection_factory, embedding_dimension=resolved_settings.embedding_dimension)
+                container.historical_answer_cache.migrate()
+
+            cleanup_callbacks = []
+            if container.semantic_response_cache is not None:
+                cleanup_callbacks.append(lambda now: container.semantic_response_cache.cleanup(now=now))
+            if container.historical_answer_cache is not None:
+                cleanup_callbacks.append(lambda now: container.historical_answer_cache.cleanup(now=now))
+            container.memory_maintenance = MemoryMaintenanceScheduler(
+                LifecycleWorker(container.memory_repository), tenant_id=resolved_settings.tenant_id,
+                authority=memory_authority,
+                interval_seconds=resolved_settings.memory_maintenance_interval_seconds,
+                cleanup_callbacks=cleanup_callbacks,
+                error_observer=lambda event, error: container.metrics.increment(
+                    "market_agent_maintenance_errors_total", labels={"event": event, "kind": type(error).__name__}),
+            )
+            container.memory_maintenance.start()
 
             def application_factory():
                 from market_agent.workflow_production_application import ProductionWorkflowApplication
