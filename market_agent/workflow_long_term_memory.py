@@ -10,7 +10,7 @@ import math
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Protocol, Self, TypedDict, Unpack
 
-from pydantic import AwareDatetime, BeforeValidator, ConfigDict, Field, PlainSerializer, model_validator
+from pydantic import AwareDatetime, BeforeValidator, ConfigDict, Field, PlainSerializer, StrictFloat, model_validator
 
 from market_agent.workflow_contracts import ContractModel, Digest, FiniteUnit, NonNegativeInt, PositiveInt, ShortText, Text
 
@@ -69,6 +69,7 @@ def content_hash(value: Any) -> str:
 
 FrozenPayload = Annotated[Any, BeforeValidator(_payload), PlainSerializer(thaw_json)]
 Ids = Annotated[tuple[ShortText, ...], Field(max_length=128)]
+Embedding = Annotated[tuple[StrictFloat, ...], Field(max_length=4096)]
 
 
 class MemoryContract(ContractModel):
@@ -117,6 +118,11 @@ class MemoryRecord(MemoryContract):
     scope: ShortText = "default"
     retention_class: Literal["standard", "short", "permanent"] = "standard"
     legal_hold: bool = False
+    # Defaults preserve pre-retrieval stored JSON. Unknown versions never match
+    # a query requesting a concrete embedding/model release.
+    model_version: ShortText = "none"
+    vector_version: ShortText = "none"
+    embedding: Embedding = ()
 
     @model_validator(mode="after")
     def validate_times_and_links(self) -> Self:
