@@ -294,6 +294,10 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
         idempotency_key_header: str | None = Header(default=None, alias="Idempotency-Key"),
         _: None = Depends(require_api_token),
     ) -> TaskAcceptedResponse:
+        if task_name == "execute_harness_workflow":
+            raise AuthorizationError(
+                "execute_harness_workflow is an internal dispatcher task; use /v1/workflows"
+            )
         idempotency_key = _resolve_idempotency_key(body.idempotency_key, idempotency_key_header)
         task_payload = dict(body.payload)
         if task_name == "generate_playbook":

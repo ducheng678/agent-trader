@@ -83,6 +83,8 @@ operations. Idempotent API replays return the original run trace; requests witho
 an idempotency key are independent runs. Tenant scope is checked at the workflow
 API boundary before a run is admitted. Creation responses also include the durable
 queue job ID and task-status URL used to retrieve the final structured result.
+`execute_harness_workflow` is an internal queue task and is deliberately not
+available through the generic public task-submission endpoint.
 
 ## Running Locally
 
