@@ -60,6 +60,7 @@ class BackendSettings:
             "MARKET_AGENT_LEGACY_PLAYBOOK_API_ENABLED", _legacy_playbook_default()
         )
     )
+    harness_host_factory: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_HARNESS_HOST_FACTORY"))
     trace_event_capacity: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TRACE_EVENT_CAPACITY", 10000))
     trace_query_limit: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TRACE_QUERY_LIMIT", 100))
     workflow_metric_series_limit: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_METRIC_SERIES_LIMIT", 2048))
@@ -126,6 +127,10 @@ class BackendSettings:
             raise ConfigurationError("MARKET_AGENT_EMBEDDING_DIMENSION must be between 1 and 2000")
         if environment in {"production", "prod", "staging"} and (not self.redis_url or not self.postgres_dsn):
             raise ConfigurationError("Redis and PostgreSQL are required in staging and production")
+        if environment in {"production", "prod", "staging"}:
+            module_name, separator, attribute = self.harness_host_factory.rpartition(":")
+            if not separator or not module_name or not attribute:
+                raise ConfigurationError("MARKET_AGENT_HARNESS_HOST_FACTORY must be module:callable in staging and production")
         if not math.isfinite(self.memory_maintenance_interval_seconds) or self.memory_maintenance_interval_seconds <= 0:
             raise ConfigurationError("memory maintenance interval must be finite and positive")
         expected_models = {
