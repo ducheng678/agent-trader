@@ -116,3 +116,12 @@ if record.legal_hold or record.referenced_by or record.lifecycle is Lifecycle.AC
 - [ ] **Step 4: Add decay, holds, cleanup idempotency, expired-evidence gap, trace audit, and driver forbidden-import tests; run all three Task suites.**
 
 - [ ] **Step 5: Commit `feat: add governed memory forgetting lifecycle`; run compileall, memory-targeted pytest, and `git diff --check`.**
+
+## PostgreSQL / pgvector Adapter Note
+
+`workflow_memory_postgres.py` provides a production DB-API boundary without a
+mandatory driver dependency. It uses tenant predicates and parameterized SQL for
+immutable records, knowledge heads, idempotency, and audit rows; migrations
+require pgvector, and vector candidates stay repository-side. The injected
+connection factory is private to the host service, so agents receive only
+validated summaries rather than database handles.
