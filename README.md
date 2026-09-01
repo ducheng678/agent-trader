@@ -252,3 +252,5 @@ does not fabricate the production signing authority. In staging or production,
 set `MARKET_AGENT_HARNESS_HOST_FACTORY=your_package.host:create_bindings`; the
 factory returns `HarnessHostBindings(kernel=..., completion_candidate_factory=...)`
 and owns all HSM/KMS signing integration.
+See [the host factory contract](docs/harness-host-factory.md) for the required
+trust and evidence boundaries.
