@@ -73,9 +73,19 @@ class HarnessWorkflowApplication:
         except ExecutionRegistrationError as error:
             if str(error) != "run already exists":
                 raise
-            # Queue recovery must continue the same durable run, not create a
-            # second workflow because a worker restarted after admission.
-            handle = self._kernel.resume(request.workflow_id)
+            existing = self._kernel.snapshot(request.workflow_id)
+            # A cancelled/terminal run must not re-enter the execution backend
+            # merely because a queued delivery arrived after cancellation.
+            handle = (
+                self._kernel.handle(request.workflow_id)
+                if existing.run_state in {
+                    RunState.SUCCEEDED,
+                    RunState.DEGRADED,
+                    RunState.FAILED,
+                    RunState.CANCELLED,
+                }
+                else self._kernel.resume(request.workflow_id)
+            )
         decisions: list[HarnessDecision] = []
         view = self._kernel.snapshot(handle.run_id)
         for _ in range(4):

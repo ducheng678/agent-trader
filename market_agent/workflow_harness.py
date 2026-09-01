@@ -504,6 +504,12 @@ class HarnessKernel:
             raise UnknownHarnessRunError("unknown Harness run")
         return fold_events(events)
 
+    def handle(self, run_id: str) -> RunHandle:
+        """Return a durable run projection without resuming the execution backend."""
+        run_id = _strict_run_id(run_id)
+        _, plan, view = self._load(run_id)
+        return self._handle(plan, view, False)
+
     @_serialized_run
     def advance(
         self,
