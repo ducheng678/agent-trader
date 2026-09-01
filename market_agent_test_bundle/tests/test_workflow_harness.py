@@ -89,6 +89,35 @@ SIGNATURE = "0" * 512
 NOW = datetime(2026, 8, 31, tzinfo=timezone.utc)
 
 
+_HARNESS_RECEIPT_SIGNER = None
+_HARNESS_RECEIPT_KEYS = None
+
+
+@pytest.fixture(autouse=True)
+def _pin_signed_harness_receipts(monkeypatch):
+    """Give the test-only host issuer a key matching the public backend pin."""
+    global _HARNESS_RECEIPT_SIGNER, _HARNESS_RECEIPT_KEYS
+    if _HARNESS_RECEIPT_SIGNER is None:
+        from market_agent_test_bundle.tests.test_workflow_execution_backend import (
+            TrustedReceiptVerifier,
+            _generate_test_rsa_key,
+        )
+
+        modulus, exponent, private = _generate_test_rsa_key()
+        _HARNESS_RECEIPT_KEYS = {"test-host-rsa": (modulus, exponent)}
+        _HARNESS_RECEIPT_SIGNER = TrustedReceiptVerifier(
+            modulus=modulus, private_exponent=private, key_id="test-host-rsa"
+        )
+    monkeypatch.setattr(
+        execution_backend_module, "_PINNED_PUBLIC_KEYS", _HARNESS_RECEIPT_KEYS
+    )
+    monkeypatch.setattr(
+        execution_backend_module,
+        "_EXPECTED_TRUST_CONFIG_DIGEST",
+        execution_backend_module._trust_config_digest(_HARNESS_RECEIPT_KEYS),
+    )
+
+
 class ConfidenceVerifier:
     def verify(self, key_id: str, payload: bytes, signature: str) -> bool:
         return key_id == "host-key" and signature == sha256(
@@ -329,9 +358,9 @@ class StoreBackedIssuer:
 
     def trust_descriptor(self) -> IssuerTrustDescriptor:
         return IssuerTrustDescriptor(
-            trust_version="test-trust-v1",
-            trust_config_digest=HASH,
-            key_id="test-host",
+            trust_version=execution_backend_module._TRUST_VERSION,
+            trust_config_digest=execution_backend_module._EXPECTED_TRUST_CONFIG_DIGEST,
+            key_id=_HARNESS_RECEIPT_SIGNER.key_id,
         )
 
     def _snapshot(self, plan: HarnessPlan, sequence: int | None = None) -> CommittedExecutionSnapshot:
@@ -352,9 +381,10 @@ class StoreBackedIssuer:
             view_digest=canonical_view_digest(view),
             event_head_hash=view.last_event_hash,
             folded_view=view,
-            trust_key_id="test-host",
+            trust_key_id=_HARNESS_RECEIPT_SIGNER.key_id,
             signature=SIGNATURE,
         )
+        snapshot = _HARNESS_RECEIPT_SIGNER.approve(snapshot)
         self.snapshots.append(snapshot)
         return snapshot
 
@@ -368,9 +398,10 @@ class StoreBackedIssuer:
             pre=self._snapshot(plan, pre_sequence),
             post=self._snapshot(plan),
             transition_digest=canonical_transition_digest(transition),
-            trust_key_id="test-host",
+            trust_key_id=_HARNESS_RECEIPT_SIGNER.key_id,
             signature=SIGNATURE,
         )
+        receipt = _HARNESS_RECEIPT_SIGNER.approve(receipt)
         self.receipts.append(receipt)
         return receipt
 
@@ -676,7 +707,7 @@ def test_create_publishes_only_after_all_dependencies_are_ready(tmp_path):
 def test_bad_issuer_is_rejected_before_create_publishes_any_event(tmp_path):
     class TrustCheckingBackend(RecordingBackend):
         def prepare_registration(self, plan, provisional_view, issuer_trust_descriptor):
-            if issuer_trust_descriptor.key_id != "test-host":
+            if issuer_trust_descriptor.key_id != _HARNESS_RECEIPT_SIGNER.key_id:
                 raise ExecutionRegistrationError("issuer not pinned")
             return super().prepare_registration(
                 plan, provisional_view, issuer_trust_descriptor
@@ -1442,6 +1473,75 @@ def test_budget_settlement_evidence_tampering_fails_before_restart_or_backend(
 
 
 @pytest.mark.parametrize(
+    "mutate_receipt",
+    (
+        lambda receipt: receipt.update(signature="0" * 512),
+        lambda receipt: receipt.update(trust_key_id="untrusted-host"),
+        lambda receipt: receipt.update(plan_digest="0" * 64),
+        lambda receipt: receipt.update(event_head_hash="0" * 64),
+    ),
+)
+def test_budget_settlement_receipt_tampering_fails_before_backend(
+    tmp_path, mutate_receipt
+):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    kernel.advance(handle.run_id, candidate={})
+    events = tuple(store.load(handle.run_id))
+    plan = HarnessPlan.model_validate_json(events[0].payload["plan_json"])
+    index, authority = next(
+        (index, event)
+        for index, event in enumerate(events)
+        if event.event_type == "transition_authorized"
+        and "budget_before_attempts" in event.payload
+    )
+    payload = dict(authority.payload)
+    evidence = dict(payload["budget_settlement_evidence"])
+    receipt = dict(evidence["host_receipt"])
+    mutate_receipt(receipt)
+    evidence["host_receipt"] = receipt
+    unsigned = {key: value for key, value in evidence.items() if key != "binding_digest"}
+    evidence["binding_digest"] = HarnessKernel._canonical_digest(unsigned)
+    payload["budget_settlement_evidence"] = evidence
+    tampered = authority.model_copy(update={"payload": payload})
+
+    with pytest.raises(HarnessDependencyError, match="receipt"):
+        HarnessKernel._budget_state(
+            (*events[:index], tampered, *events[index + 1 :]),
+            plan,
+            WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0).snapshot(),
+        )
+
+
+def test_budget_settlement_outer_evidence_digest_tampering_fails_before_backend(tmp_path):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    kernel.advance(handle.run_id, candidate={})
+    events = tuple(store.load(handle.run_id))
+    plan = HarnessPlan.model_validate_json(events[0].payload["plan_json"])
+    index, authority = next(
+        (index, event)
+        for index, event in enumerate(events)
+        if event.event_type == "transition_authorized"
+        and "budget_before_attempts" in event.payload
+    )
+    payload = dict(authority.payload)
+    evidence = dict(payload["budget_settlement_evidence"])
+    evidence["binding_digest"] = "0" * 64
+    payload["budget_settlement_evidence"] = evidence
+    tampered = authority.model_copy(update={"payload": payload})
+
+    with pytest.raises(HarnessDependencyError, match="digest"):
+        HarnessKernel._budget_state(
+            (*events[:index], tampered, *events[index + 1 :]),
+            plan,
+            WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0).snapshot(),
+        )
+
+
+@pytest.mark.parametrize(
     "updates",
     (
         {"budget_before_attempts": 11},
@@ -1692,6 +1792,7 @@ def test_decision_reason_codes_have_closed_state_mapping(reason_code, allowed_st
             "sequence": 1,
             "state_revision": 1,
             "run_state": state,
+            "plan_revision": 0,
             "reason_code": reason_code,
             "no_trade": state in {
                 RunState.DEGRADING,
@@ -1715,6 +1816,7 @@ def test_decision_rejects_unknown_reason_and_running_no_trade_even_on_copy():
             sequence=1,
             state_revision=1,
             run_state=RunState.RUNNING,
+            plan_revision=0,
             reason_code="invented_reason",
         )
     running = HarnessDecision(
@@ -1723,6 +1825,7 @@ def test_decision_rejects_unknown_reason_and_running_no_trade_even_on_copy():
         sequence=1,
         state_revision=1,
         run_state=RunState.RUNNING,
+        plan_revision=0,
         reason_code="execution_started",
     )
     with pytest.raises(ValidationError, match="no-trade"):
@@ -1751,10 +1854,61 @@ def test_observation_decisions_cannot_be_upgraded_to_transitions(reason_code):
             sequence=1,
             state_revision=1,
             run_state=state,
+            plan_revision=0,
             reason_code=reason_code,
             no_trade=False,
             transition=transition,
         )
+
+
+def test_decision_transition_is_bound_to_the_exact_committed_run_transition():
+    transition = HarnessTransition(
+        run_id="run-1",
+        trace_id="trace-1",
+        entity_kind="run",
+        entity_id="run-1",
+        from_state=RunState.RUNNING.value,
+        to_state=RunState.SUMMARIZING.value,
+        expected_state_revision=5,
+        plan_revision=3,
+        reason_code="safe_no_trade_summary",
+        idempotency_key="run-5-summarizing",
+    )
+    decision = HarnessDecision(
+        run_id="run-1",
+        trace_id="trace-1",
+        sequence=12,
+        state_revision=6,
+        run_state=RunState.SUMMARIZING,
+        previous_run_state=RunState.RUNNING,
+        plan_revision=3,
+        reason_code="safe_no_trade_summary",
+        no_trade=True,
+        transition=transition,
+    )
+
+    for forged in (
+        {"previous_run_state": RunState.CREATED},
+        {"plan_revision": 4},
+        {"transition": transition.model_copy(update={"entity_id": "other-run"})},
+        {"transition": transition.model_copy(update={"from_state": "created"})},
+        {"transition": transition.model_copy(update={"plan_revision": 4})},
+        {"transition": transition.model_copy(update={"idempotency_key": "forged"})},
+    ):
+        with pytest.raises(ValidationError, match="committed transition"):
+            decision.model_copy(update=forged)
+
+    observation = HarnessDecision(
+        run_id="run-1",
+        trace_id="trace-1",
+        sequence=12,
+        state_revision=6,
+        run_state=RunState.RUNNING,
+        plan_revision=3,
+        reason_code="candidate_rejected",
+    )
+    with pytest.raises(ValidationError, match="prior state"):
+        observation.model_copy(update={"previous_run_state": RunState.RUNNING})
 
 
 def test_store_aliases_share_coordination_lock_and_lock_table_is_reclaimed(tmp_path, monkeypatch):

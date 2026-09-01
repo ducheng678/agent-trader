@@ -41,6 +41,7 @@ from market_agent.workflow_execution_backend import (
     canonical_transition_digest,
     canonical_view_digest,
     route_committed_transition,
+    verify_committed_execution_snapshot,
 )
 from market_agent.workflow_harness_contracts import (
     AttemptState,
@@ -321,6 +322,21 @@ def committed_snapshot(
         signature="0" * 512,
     )
     return cast(CommittedExecutionSnapshot, verifier.approve(snapshot))
+
+
+def test_public_snapshot_verifier_accepts_only_exact_pinned_authority(
+    verifier: TrustedReceiptVerifier,
+):
+    snapshot = committed_snapshot(verifier)
+
+    assert verify_committed_execution_snapshot(snapshot) is True
+    assert verify_committed_execution_snapshot(
+        snapshot.model_copy(update={"event_head_hash": "0" * 64})
+    ) is False
+    assert verify_committed_execution_snapshot(
+        snapshot.model_copy(update={"trust_key_id": "untrusted-host"})
+    ) is False
+    assert verify_committed_execution_snapshot(None) is False
 
 
 def issuer_descriptor(verifier: TrustedReceiptVerifier) -> IssuerTrustDescriptor:

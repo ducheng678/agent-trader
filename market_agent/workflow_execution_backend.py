@@ -332,6 +332,28 @@ def _load_pinned_execution_receipt_verifier() -> ExecutionReceiptVerifier:
     return ExecutionReceiptVerifier(_VERIFIER_FACTORY_CAPABILITY)
 
 
+def verify_committed_execution_snapshot(snapshot: object) -> bool:
+    """Verify one exact host snapshot against the compiled public trust root.
+
+    This is deliberately a narrow, stateless public boundary: callers cannot
+    supply a verifier, a key, or any signing capability.  It is suitable for
+    durable evidence checks outside the disposable execution backend.
+    """
+
+    try:
+        before = _fresh_snapshot(snapshot)
+        payload = _canonical_bytes(before)
+        verified = _load_pinned_execution_receipt_verifier().verify(before)
+        after = _fresh_snapshot(before)
+        return (
+            type(verified) is bool
+            and verified
+            and _canonical_bytes(after) == payload
+        )
+    except Exception:
+        return False
+
+
 _ROUTE_CAPABILITY = object()
 
 
@@ -502,8 +524,14 @@ def canonical_authority_signing_bytes(
         raise UnverifiedExecutionReceiptError(
             "only exact execution authority contracts can be signed"
         )
+    exclusions = {"signature"}
+    if type(fresh) is CommittedExecutionSnapshot:
+        # The folded view is host-local replay material.  Its digest is signed
+        # with the snapshot, while omitting the full view lets an audit event
+        # retain the public receipt without persisting lease/fencing metadata.
+        exclusions.add("folded_view")
     return json.dumps(
-        fresh.model_dump(mode="json", exclude={"signature"}),
+        fresh.model_dump(mode="json", exclude=exclusions),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

@@ -50,6 +50,7 @@ from market_agent.workflow_execution_backend import (
     canonical_plan_digest,
     canonical_transition_digest,
     canonical_view_digest,
+    verify_committed_execution_snapshot,
 )
 from market_agent.workflow_harness_contracts import (
     HarnessPlan,
@@ -148,7 +149,9 @@ class HarnessDecision(_StrictOutput):
     sequence: NonNegativeInt
     state_revision: NonNegativeInt
     run_state: RunState
+    plan_revision: NonNegativeInt
     reason_code: ShortText
+    previous_run_state: RunState | None = None
     transition: HarnessTransition | None = None
     retry_authorized: StrictBool = False
     no_trade: StrictBool = False
@@ -186,12 +189,24 @@ class HarnessDecision(_StrictOutput):
             and self.reason_code not in _COMMITTED_DECISION_REASONS
         ):
             raise ValueError("non-committing decisions cannot carry a transition")
-        if self.transition is not None and (
-            self.transition.run_id != self.run_id
-            or self.transition.trace_id != self.trace_id
-            or self.transition.to_state != self.run_state.value
-            or self.transition.expected_state_revision + 1 != self.state_revision
-            or self.transition.reason_code != self.reason_code
+        if self.transition is None:
+            if self.previous_run_state is not None:
+                raise ValueError("non-transition decisions cannot claim a prior state")
+            return self
+        transition = self.transition
+        if (
+            self.previous_run_state is None
+            or transition.entity_kind != "run"
+            or transition.entity_id != self.run_id
+            or transition.run_id != self.run_id
+            or transition.trace_id != self.trace_id
+            or transition.from_state != self.previous_run_state.value
+            or transition.to_state != self.run_state.value
+            or transition.expected_state_revision + 1 != self.state_revision
+            or transition.plan_revision != self.plan_revision
+            or transition.reason_code != self.reason_code
+            or transition.idempotency_key
+            != f"run-{transition.expected_state_revision}-{self.run_state.value}"
         ):
             raise ValueError("decision and committed transition are inconsistent")
         return self
@@ -1340,6 +1355,12 @@ class HarnessKernel:
             pre = CommittedExecutionSnapshot.model_validate(evidence.get("host_receipt"))
         except Exception as error:
             raise HarnessDependencyError("budget settlement receipt is invalid") from error
+        if not verify_committed_execution_snapshot(pre):
+            raise HarnessDependencyError("budget settlement receipt is not host verified")
+        try:
+            receipt_view = fold_events(prior_events)
+        except Exception as error:
+            raise HarnessDependencyError("budget settlement receipt cannot fold authority") from error
         if (
             pre.run_id != plan.run_id
             or pre.trace_id != plan.trace_id
@@ -1348,6 +1369,7 @@ class HarnessKernel:
             or pre.plan_revision != plan.revision
             or pre.sequence != event.sequence - 1
             or pre.state_revision != event.state_revision
+            or pre.view_digest != canonical_view_digest(receipt_view)
             or pre.event_head_hash != event.previous_event_hash
             or evidence.get("settlement_event_hash") != event.previous_event_hash
             or evidence.get("settlement_event_sequence") != event.sequence - 1
@@ -1833,7 +1855,11 @@ class HarnessKernel:
             sequence=view.sequence,
             state_revision=view.state_revision,
             run_state=view.run_state,
+            plan_revision=plan.revision,
             reason_code=reason,
+            previous_run_state=(
+                RunState(transition.from_state) if transition is not None else None
+            ),
             transition=transition,
             retry_authorized=False,
             no_trade=no_trade,
