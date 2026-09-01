@@ -77,6 +77,10 @@ passes the trusted kernel and optional host completion-evidence factory. The
 default command-line backend remains a development compatibility launcher; it
 never manufactures a signing authority from environment text.
 
+In staging and production, `/health/ready` includes a `harness` component. It
+is failed unless both the trusted kernel and its paired workflow application
+are present, so orchestration cannot mark an unguided legacy process ready.
+
 Every workflow request carries the middleware-generated W3C trace through the
 queue payload, Harness stream, coordinated agents, audit events, cache and memory
 operations. Idempotent API replays return the original run trace; requests without

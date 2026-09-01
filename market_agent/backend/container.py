@@ -214,6 +214,12 @@ class BackendContainer:
                       "cache": cache_status, "message_bus": bus_status}
         if self.settings.postgres_dsn:
             components["postgres"] = "ok" if self.governed_memory_repository is not None else "failed"
+        if self.settings.environment in {"production", "prod", "staging"}:
+            components["harness"] = (
+                "ok"
+                if self.harness_kernel is not None and self.harness_application is not None
+                else "failed"
+            )
         return components
 
     def shutdown(self) -> None:
