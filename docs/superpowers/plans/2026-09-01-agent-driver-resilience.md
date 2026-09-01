@@ -26,6 +26,14 @@ rollback to the immediately preceding release. Calls pin an immutable release
 before dispatch, so an in-flight request is unaffected by later activation.
 Optional gate, audit, and metric hooks receive immutable metadata only.
 
+## Redis Adapter Note
+
+`backend/redis_adapters.py` keeps Redis optional and injected. Tenant-qualified
+cache keys use bounded, redacted JSON plus TTL and idempotent `SET NX`; stream
+messages preserve trace identity and support explicit consume, acknowledgement,
+and dead-letter paths. Backend failures are surfaced as unavailable rather than
+silently falling back to cross-tenant or in-memory data.
+
 ---
 
 ### Task 1: Contracts and Prompt Releases
