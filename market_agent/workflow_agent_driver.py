@@ -23,9 +23,6 @@ from market_agent.workflow_semantic_request_cache import SemanticRequestCache
 
 
 _TIERS = (ModelTier.LUNA, ModelTier.TERRA, ModelTier.SOL)
-_PERMANENT_PROVIDER_CODES = frozenset({
-    "authentication", "authorization", "validation", "schema", "safety", "malformed_output",
-})
 _TASK_TIERS = {
     "extract": ModelTier.LUNA, "validate": ModelTier.LUNA, "validation": ModelTier.LUNA,
     "analyze": ModelTier.TERRA, "analysis": ModelTier.TERRA,
@@ -344,8 +341,7 @@ class AgentDriver:
             try:
                 response = self._client.invoke(request)
             except Exception as error:
-                retryable = (getattr(error, "code", None) not in _PERMANENT_PROVIDER_CODES
-                             and self._retry.is_retryable(error))
+                retryable = self._retry.is_retryable(error)
                 self._record_circuit(run, success=not retryable, probe=circuit.kind == "probe")
                 if not retryable:
                     return self._fail(run, "provider_error")
@@ -367,7 +363,7 @@ class AgentDriver:
                     raise ValueError("provider usage exceeded the reserved model policy")
                 run.spent += Decimal(str(usage.cost_usd)) - reservation
                 output = schema.validate(_strict_object(response.content))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 return self._fail(run, "malformed_output")
             if self._clock.now() >= invocation.deadline_epoch:
                 return None

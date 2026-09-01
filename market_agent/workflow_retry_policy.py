@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from typing import Callable, Literal, Protocol
 
 
+_PERMANENT_PROVIDER_CODES = frozenset({
+    "authentication", "authorization", "validation", "schema", "safety", "malformed_output",
+})
+
+
 class UniformRandom(Protocol):
     def uniform(self, lower: float, upper: float, /) -> float: ...
 
@@ -75,6 +80,8 @@ class RetryPolicy:
 
     @staticmethod
     def is_retryable(error: BaseException) -> bool:
+        if getattr(error, "code", None) in _PERMANENT_PROVIDER_CODES:
+            return False
         if isinstance(error, (TimeoutError, ConnectionError)):
             return True
         status_code = getattr(error, "status_code", None)

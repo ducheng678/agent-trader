@@ -75,10 +75,21 @@ def schema(model=Answer, **overrides):
     return api().OutputSchema(schema_id="answer-v1", model=model, **overrides)
 
 
+def prompt_release():
+    content = dict(
+        schema_version="v1", release_id="release-v1", stable_system_prefix="Stable released prefix.",
+        supported_task_kinds=("extract", "analyze", "coordinator"),
+        supported_model_tiers=(ModelTier.SOL, ModelTier.TERRA, ModelTier.LUNA),
+        temperature_profile=((ModelTier.SOL, 0.0), (ModelTier.TERRA, 0.2), (ModelTier.LUNA, 0.0)),
+    )
+    encoded = json.dumps(content, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return PromptRelease(digest=sha256(encoded.encode("utf-8")).hexdigest(), **content)
+
+
 def invocation(output_schema=None, **overrides):
     values = dict(
         trace_id="trace-1", run_id="run-1", task_id="task-1", task_kind="extract",
-        prompt_release_id="release-v1", prompt_release_digest="a" * 64,
+        prompt_release_id="release-v1", prompt_release_digest=prompt_release().digest,
         allowed_model_tier=ModelTier.LUNA, deadline_epoch=100.0,
         max_attempts=6, cost_limit_usd=1.0, output_schema_id="answer-v1",
         output_schema_digest=(output_schema or schema()).digest,
@@ -97,7 +108,7 @@ def response(content='{"answer":"known"}', tier=ModelTier.LUNA, cost=0.01):
 
 def metadata(output_schema=None, **overrides):
     values = dict(
-        tenant_scope="tenant-a", prompt_release_digest="a" * 64,
+        tenant_scope="tenant-a", prompt_release_digest=prompt_release().digest,
         output_schema_digest=(output_schema or schema()).digest,
         model_compatibility_key="luna-v1", category="reference", expires_at=50.0,
         vector_version="vector-v1", model_version="luna-v1",
@@ -109,12 +120,7 @@ def metadata(output_schema=None, **overrides):
 def make_driver(client, *, output_schema=None, **overrides):
     output_schema = output_schema or schema()
     clock, observer = Clock(), Observer()
-    release = PromptRelease(
-        release_id="release-v1", digest="a" * 64, stable_system_prefix="Stable released prefix.",
-        supported_task_kinds=("extract", "analyze", "coordinator"),
-        supported_model_tiers=(ModelTier.SOL, ModelTier.TERRA, ModelTier.LUNA),
-        temperature_profile=((ModelTier.SOL, 0.0), (ModelTier.TERRA, 0.2), (ModelTier.LUNA, 0.0)),
-    )
+    release = prompt_release()
     values = dict(
         model_client=client, audit_observer=observer, clock=clock, random=lambda low, high: high,
         prompt_releases=PromptReleaseRegistry(releases=(release,)), output_schemas=(output_schema,),
@@ -185,6 +191,25 @@ def test_driver_rejects_malformed_provider_output_without_retry_or_fallback(cont
     assert len(client.requests) == 1
     assert clock.waits == []
     assert "fallback_selected" not in [event.event_type for event in observer.events]
+
+
+@pytest.mark.parametrize("depth", [3000, 10000])
+def test_deep_json_returns_typed_malformed_output_and_terminal_audit(depth):
+    """Parsing and later result freezing must not leak recursion failures or lose the trace."""
+    content = '{"answer":' + '[' * depth + '0' + ']' * depth + '}'
+    client = Client(response(content))
+    driver, observer, clock = make_driver(client)
+    result = driver.execute(invocation())
+
+    assert result.failure is not None
+    assert result.failure.code == "malformed_output"
+    assert result.failure.retryable is False
+    assert result.output is None
+    assert len(client.requests) == 1
+    assert clock.waits == []
+    assert observer.events[-1].event_type == "task_failed"
+    assert {event.trace_id for event in observer.events} == {result.trace_id} == {"trace-1"}
+    assert not {"fallback_selected", "task_completed", "retry_scheduled"} & {event.event_type for event in observer.events}
 
 
 def test_model_request_has_stable_prefix_then_canonical_user_context():
@@ -287,7 +312,7 @@ def test_exhausted_limits_never_schedule_an_unfunded_or_late_retry(limits, want_
 
 def test_local_knowledge_is_cited_and_never_promoted_to_cache():
     output_schema = schema(CitedAnswer)
-    knowledge = LocalKnowledgeBase([KnowledgeDocument("doc-policy", "supported answer", "stable knowledge")])
+    knowledge = LocalKnowledgeBase([KnowledgeDocument("doc-policy", "The supported answer is stable knowledge.", "stable knowledge")])
     fallback = FallbackPolicy((ModelTier.LUNA,), knowledge_base=knowledge)
     semantic = SemanticRequestCache()
     driver, observer, _ = make_driver(Client(TimeoutError()), output_schema=output_schema, fallback_policy=fallback, semantic_cache=semantic)
@@ -296,6 +321,19 @@ def test_local_knowledge_is_cited_and_never_promoted_to_cache():
     assert result.output == {"answer": "stable knowledge", "citations": ("doc-policy",)}
     assert "local_knowledge_retrieved" in [e.event_type for e in observer.events]
     assert semantic.lookup((1.0, 0.0), metadata(output_schema), 1.0) is None
+
+
+def test_unrelated_local_document_falls_through_to_exact_unknown():
+    output_schema = schema(CitedAnswer)
+    knowledge = LocalKnowledgeBase([KnowledgeDocument("doc-policy", "The supported answer is stable.", "stable")])
+    fallback = FallbackPolicy((ModelTier.LUNA,), knowledge_base=knowledge)
+    driver, observer, _ = make_driver(Client(TimeoutError()), output_schema=output_schema, fallback_policy=fallback)
+    result = driver.execute(invocation(output_schema, max_attempts=1, user_payload={"query": "What is the capital of France?"}))
+
+    assert result.origin == "abstention"
+    assert result.output == {"answer": "不知道", "citations": ()}
+    assert "local_knowledge_retrieved" not in [event.event_type for event in observer.events]
+    assert "abstained" in [event.event_type for event in observer.events]
 
 
 def test_knowledge_missing_citations_or_wrong_schema_falls_back_to_exact_unknown():

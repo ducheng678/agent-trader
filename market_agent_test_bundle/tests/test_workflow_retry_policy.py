@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from market_agent.workflow_retry_policy import ProviderError, RetryPolicy
 
 
@@ -69,3 +71,22 @@ def test_retry_denies_auth_and_schema_errors_and_insufficient_cost():
     assert policy.decide(ProviderError(status_code=401), 0, 2.0, 1.0, 0.0, lambda low, high: high).reason == "non_retryable"
     assert policy.decide(ProviderError(code="schema"), 0, 2.0, 1.0, 0.0, lambda low, high: high).reason == "non_retryable"
     assert policy.decide(TimeoutError(), 0, 2.0, 0.19, 0.0, lambda low, high: high).reason == "cost"
+
+
+@pytest.mark.parametrize("code", ["authentication", "authorization", "validation", "schema", "safety", "malformed_output"])
+@pytest.mark.parametrize("status", [408, 409, 429, 503])
+def test_permanent_provider_code_overrides_transient_status_in_public_policy(code, status):
+    """Permanent facts must stop retries at the public policy boundary itself."""
+    policy = RetryPolicy()
+    error = ProviderError(status_code=status, code=code)
+    assert policy.is_retryable(error) is False
+    decision = policy.decide(error, 0, 2.0, 1.0, 0.0, lambda low, high: high)
+    assert decision.terminal
+    assert decision.reason == "non_retryable"
+    assert decision.delay is None
+
+
+def test_permanent_provider_code_overrides_transport_exception_type():
+    error = TimeoutError()
+    error.code = "safety"
+    assert RetryPolicy.is_retryable(error) is False

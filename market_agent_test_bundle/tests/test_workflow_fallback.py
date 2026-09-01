@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from market_agent.local_knowledge_base import KnowledgeDocument, LocalKnowledgeBase
 from market_agent.workflow_agent_contracts import ModelTier
 from market_agent.workflow_fallback import Abstain, Downgrade, FallbackPolicy, UseLocalKnowledge
@@ -32,3 +34,23 @@ def test_fallback_ends_with_the_exact_abstention_when_no_tier_remains():
     fallback = FallbackPolicy(())
 
     assert fallback.next(None, "unavailable") == Abstain("不知道")
+
+
+@pytest.mark.parametrize("query", ["What is the capital of France?", "the is", "supported refund deadline"])
+def test_local_knowledge_rejects_stopword_and_partial_topic_overlap(query):
+    """A shared filler word or unrelated topic must not become claimed evidence."""
+    knowledge = LocalKnowledgeBase([KnowledgeDocument("policy-1", "The supported answer is stable.", "stable")])
+    assert knowledge.lookup(query) is None
+
+
+def test_local_knowledge_rejects_answer_not_supported_by_document_text():
+    knowledge = LocalKnowledgeBase([KnowledgeDocument("policy-1", "The supported answer is stable.", "refunds are guaranteed")])
+    assert knowledge.lookup("supported answer") is None
+
+
+def test_local_knowledge_ignores_question_stopwords_when_topic_is_fully_supported():
+    knowledge = LocalKnowledgeBase([KnowledgeDocument("policy-1", "The supported answer is stable.", "stable")])
+    answer = knowledge.lookup("What is the supported answer?")
+    assert answer is not None
+    assert answer.answer == "stable"
+    assert answer.citations == ("policy-1",)

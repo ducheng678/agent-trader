@@ -7,6 +7,14 @@ import re
 from typing import Iterable
 
 
+_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "been", "by", "do", "does", "for",
+    "from", "how", "i", "in", "is", "it", "me", "of", "on", "or", "that", "the",
+    "their", "these", "this", "those", "to", "was", "were", "what", "when", "where",
+    "which", "who", "why", "with", "you", "your",
+})
+
+
 @dataclass(frozen=True, slots=True)
 class KnowledgeDocument:
     document_id: str
@@ -33,7 +41,12 @@ class LocalKnowledgeAnswer:
 
 
 class LocalKnowledgeBase:
-    """Small local document collection; it never calls a model or external index."""
+    """Conservative lexical lookup for a local document collection.
+
+    Every substantive query token must occur in one document, and configured
+    answers must be extracts of that document. This intentionally abstains on
+    paraphrases that would require semantic inference.
+    """
 
     def __init__(self, documents: Iterable[KnowledgeDocument] = ()) -> None:
         self._documents = tuple(documents)
@@ -47,19 +60,27 @@ class LocalKnowledgeBase:
             return None
         ranked = sorted(
             (
-                (-len(query_tokens & _tokens(document.text)), document.document_id, document)
+                document
                 for document in self._documents
-                if query_tokens & _tokens(document.text)
+                if query_tokens <= _tokens(document.text) and _has_supported_answer(document)
             ),
-            key=lambda candidate: (candidate[0], candidate[1]),
+            key=lambda document: document.document_id,
         )
         if not ranked:
             return None
-        document = ranked[0][2]
+        document = ranked[0]
         return LocalKnowledgeAnswer(answer=document.answer or document.text, citations=(document.document_id,))
 
 
 def _tokens(value: str) -> frozenset[str]:
     if not isinstance(value, str):
         raise ValueError("knowledge queries must be text")
-    return frozenset(re.findall(r"[a-z0-9]+", value.lower()))
+    return frozenset(re.findall(r"[a-z0-9]+", value.lower())) - _STOPWORDS
+
+
+def _has_supported_answer(document: KnowledgeDocument) -> bool:
+    if document.answer is None:
+        return True
+    answer = " ".join(document.answer.split()).casefold()
+    text = " ".join(document.text.split()).casefold()
+    return re.search(r"(?<!\w)" + re.escape(answer) + r"(?!\w)", text) is not None

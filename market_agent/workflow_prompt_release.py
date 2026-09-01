@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from typing import Annotated
 
 from pydantic import Field, StrictFloat, ValidationError, model_validator
@@ -35,6 +36,11 @@ class PromptRelease(StrictModel):
             raise ValueError("temperature profile cannot repeat a model tier")
         if set(temperatures) != set(self.supported_model_tiers):
             raise ValueError("temperature profile must cover exactly the supported model tiers")
+        # Pin every immutable release field, including schema/version and routing
+        # policy. A caller-supplied label cannot authorize different prompt content.
+        content = self.model_dump(mode="json", exclude={"digest"})
+        if self.digest != sha256(canonical_json(content).encode("utf-8")).hexdigest():
+            raise ValueError("prompt release digest does not match canonical release content")
         return self
 
     def temperature_for(self, tier: ModelTier) -> float:
@@ -62,6 +68,7 @@ class PromptReleaseRegistry(StrictModel):
                 "PromptReleaseRegistry",
                 [{"type": "value_error", "loc": ("prompt_release_id",), "input": invocation.prompt_release_id, "ctx": {"error": ValueError("unknown prompt release")}}],
             )
+        release = PromptRelease.model_validate(release)
         if release.digest != invocation.prompt_release_digest:
             raise ValidationError.from_exception_data(
                 "PromptReleaseRegistry",
