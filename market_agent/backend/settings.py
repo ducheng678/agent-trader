@@ -28,6 +28,20 @@ def _float_value(name: str, default: float) -> float:
         raise ConfigurationError(f"{name} must be a number") from exc
 
 
+def _boolean_value(name: str, default: bool) -> bool:
+    value = _environment_value(name, "true" if default else "false").casefold()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be a boolean")
+
+
+def _legacy_playbook_default() -> bool:
+    environment = _environment_value("MARKET_AGENT_ENVIRONMENT", "development").casefold()
+    return environment not in {"production", "prod", "staging"}
+
+
 @dataclass(frozen=True)
 class BackendSettings:
     database_path: Path = field(default_factory=lambda: Path(_environment_value("MARKET_AGENT_DATABASE_PATH", "runtime/market_agent_backend.sqlite3")))
@@ -41,6 +55,11 @@ class BackendSettings:
     api_host: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_API_HOST", "127.0.0.1"))
     api_port: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_API_PORT", 8080))
     environment: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_ENVIRONMENT", "development").lower())
+    legacy_playbook_api_enabled: bool = field(
+        default_factory=lambda: _boolean_value(
+            "MARKET_AGENT_LEGACY_PLAYBOOK_API_ENABLED", _legacy_playbook_default()
+        )
+    )
     trace_event_capacity: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TRACE_EVENT_CAPACITY", 10000))
     trace_query_limit: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TRACE_QUERY_LIMIT", 100))
     workflow_metric_series_limit: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_METRIC_SERIES_LIMIT", 2048))
@@ -97,6 +116,8 @@ class BackendSettings:
             raise ConfigurationError("api_host must be non-empty and cannot contain surrounding whitespace")
         local_hosts = {"127.0.0.1", "localhost", "::1"}
         environment = str(self.environment).strip().lower()
+        if type(self.legacy_playbook_api_enabled) is not bool:
+            raise ConfigurationError("legacy_playbook_api_enabled must be a boolean")
         if (environment in {"production", "prod", "staging"} or normalized_host not in local_hosts) and not str(self.api_token).strip():
             raise ConfigurationError("MARKET_AGENT_API_TOKEN is required outside local-only development")
         if not self.tenant_id or any(character.isspace() for character in self.tenant_id):

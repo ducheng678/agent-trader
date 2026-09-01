@@ -67,6 +67,11 @@ supplies `harness_completion_candidate_factory`, which derives the signed,
 independently verified confidence/evidence candidate from the validated workflow
 result. In its absence the state machine intentionally degrades to no-trade.
 
+The legacy `generate_playbook` queue route is development-compatible only. It
+is disabled by default in staging and production through
+`MARKET_AGENT_LEGACY_PLAYBOOK_API_ENABLED=false`, preventing an unaudited
+compatibility request from bypassing Harness control.
+
 Every workflow request carries the middleware-generated W3C trace through the
 queue payload, Harness stream, coordinated agents, audit events, cache and memory
 operations. Idempotent API replays return the original run trace; requests without

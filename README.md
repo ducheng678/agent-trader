@@ -237,3 +237,8 @@ also supplies `harness_completion_candidate_factory`. It receives the immutable
 request, validated workflow result, and current Harness view, and must return
 the independently signed confidence/evidence candidate expected by the kernel.
 Without it, the default is intentional fail-closed degradation to no-trade.
+
+In staging and production, the legacy `POST /v1/tasks/generate_playbook`
+compatibility route is disabled by default so it cannot bypass Harness control.
+Set `MARKET_AGENT_LEGACY_PLAYBOOK_API_ENABLED=true` only for a deliberately
+isolated compatibility deployment.

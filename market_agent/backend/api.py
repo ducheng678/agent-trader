@@ -297,6 +297,10 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
         idempotency_key = _resolve_idempotency_key(body.idempotency_key, idempotency_key_header)
         task_payload = dict(body.payload)
         if task_name == "generate_playbook":
+            if not resolved_container.settings.legacy_playbook_api_enabled:
+                raise DependencyUnavailableError(
+                    "legacy generate_playbook API is disabled; use /v1/workflows"
+                )
             task_payload["trace_id"] = get_request_trace(request).trace_id
         submission = resolved_container.task_queue.submit(
             task_name,
