@@ -120,6 +120,41 @@ def test_vector_ranking_requires_matching_dimensions_and_versions(repo):
     assert [match.record_id for match in result.matches] == ["z-vector"]
 
 
+@pytest.mark.parametrize("query_vector,record_vector", [
+    ((1.0, 0.0), (1.0,)),
+    ((1.0, 0.0), ()),
+    ((1.0, 0.0), (0.0, 0.0)),
+    ((0.0, 0.0), (1.0, 0.0)),
+    ((), (1.0, 0.0)),
+    ((), ()),
+    ((1.0, 0.0), (1.7e308, 1.7e308)),
+])
+def test_incomparable_vectors_never_match_even_at_zero_threshold(repo, query_vector, record_vector):
+    seed_rule(repo, embedding=record_vector, model_version="m1", vector_version="v1")
+    result = retrieve_memory(query(embedding=query_vector, model_version="m1", vector_version="v1",
+                                   min_similarity=0.0), repo)
+    assert result.status == "miss"
+    assert result.omitted_count == 1
+    assert build_core_experience_summary(result, 1400).as_dynamic_context() == ""
+
+
+@pytest.mark.parametrize("record_vector", [(0.0, 1.0), (1e308, 1e308)])
+def test_comparable_vectors_remain_eligible_at_zero_threshold(repo, record_vector):
+    seed_rule(repo, embedding=record_vector, model_version="m1", vector_version="v1")
+    result = retrieve_memory(query(embedding=(1.0, 0.0), model_version="m1", vector_version="v1",
+                                   min_similarity=0.0), repo)
+    assert result.status == "hit"
+    assert result.matches[0].record_id == "rule-a"
+
+
+def test_explicit_unversioned_text_query_still_matches_deterministically(repo):
+    seed_rule(repo)
+    request = query(embedding=(), model_version="none", vector_version="none", min_similarity=0.0)
+    result = retrieve_memory(request, repo)
+    assert result.status == "hit"
+    assert result == retrieve_memory(request, repo)
+
+
 @pytest.mark.parametrize("replacement", [
     {"lifecycle": Lifecycle.ARCHIVED},
     {"expires_at": NOW + timedelta(seconds=1)},
@@ -155,6 +190,83 @@ def test_conflict_detected_before_top_k_preserves_citations_without_advice(repo)
     assert summary.evidence_ids and summary.summary_hash
     assert not summary.rules and not summary.lessons
     assert summary.as_dynamic_context() == ""
+
+
+@pytest.mark.parametrize("target_kind", ["event", "rule"])
+@pytest.mark.parametrize("ineligibility", [
+    "missing", "foreign", "scope", "private", "archived", "tombstoned",
+    "expired", "stale", "future",
+])
+def test_contradiction_references_are_redacted_when_target_is_ineligible(repo, target_kind, ineligibility):
+    source = seed_rule(repo)
+    target_id = "restricted-reference"
+    tenant = "tenant-b" if ineligibility == "foreign" else "tenant-a"
+    if ineligibility != "missing":
+        if target_kind == "rule":
+            target = seed_rule(repo, target_id, tenant=tenant, rule="Unrelated observation.")
+        else:
+            target = repo.append_event(EventRecord(
+                record_id=target_id, tenant_id=tenant, observed_at=NOW,
+                source="exchange", payload={"observation": "contradiction"},
+                provenance=Provenance(source_id="exchange", source_kind="external", independent_group="exchange")),
+                **write(repo, target_id, tenant))
+        updates = {
+            "scope": {"scope": "other"}, "private": {"visibility": "private"},
+            "archived": {"lifecycle": Lifecycle.ARCHIVED},
+            "tombstoned": {"lifecycle": Lifecycle.TOMBSTONED},
+            "expired": {"expires_at": NOW + timedelta(seconds=1)},
+            "stale": {"observed_at": NOW - timedelta(days=2)},
+            "future": {"observed_at": NOW + timedelta(seconds=3)},
+        }
+        if ineligibility in updates:
+            replace_stored(repo, target.model_copy(update=updates[ineligibility]))
+    replace_stored(repo, source.model_copy(update={"contradicting_ids": (target_id,)}))
+    result = retrieve_memory(query(now=NOW + timedelta(seconds=2)), repo)
+    summary = build_core_experience_summary(result, 2000)
+    assert result.status == "miss"
+    assert "evidence_gap" in result.omissions and result.omitted_count >= 1
+    assert target_id not in result.model_dump_json()
+    assert target_id not in summary.model_dump_json()
+    assert summary.as_dynamic_context() == ""
+
+
+@pytest.mark.parametrize("changes", [
+    {"model_version": "m2"}, {"vector_version": "v2"},
+    {"effective_at": NOW + timedelta(seconds=3)},
+])
+def test_contradicting_rule_requires_eligible_version_and_effective_time(repo, changes):
+    source = seed_rule(repo)
+    target = seed_rule(repo, "restricted-reference", rule="Unrelated observation.")
+    replace_stored(repo, target.model_copy(update=changes))
+    replace_stored(repo, source.model_copy(update={"contradicting_ids": (target.record_id,)}))
+    result = retrieve_memory(query(now=NOW + timedelta(seconds=2)), repo)
+    assert result.status == "miss" and "evidence_gap" in result.omissions
+    assert "restricted-reference" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("reference_kind", ["event", "rule"])
+def test_contradiction_expansion_rejects_ineligible_transitive_evidence(repo, reference_kind):
+    source = seed_rule(repo)
+    target = seed_rule(repo, "contradiction", rule="Unrelated observation.")
+    evidence = repo.get_by_id("contradiction-exchange", tenant_id="tenant-a")
+    replace_stored(repo, evidence.model_copy(update={"provenance": evidence.provenance.model_copy(
+        update={"derived_from": ("restricted-ancestor",)})}))
+    reference = evidence.record_id if reference_kind == "event" else target.record_id
+    replace_stored(repo, source.model_copy(update={"contradicting_ids": (reference,)}))
+    result = retrieve_memory(query(), repo)
+    assert result.status == "miss" and "evidence_gap" in result.omissions
+    assert "restricted-ancestor" not in result.model_dump_json()
+    assert not result.matches
+
+
+def test_eligible_contradicting_rule_expands_only_resolved_event_citations(repo):
+    source = seed_rule(repo)
+    target = seed_rule(repo, "contradiction", rule="Unrelated observation.")
+    replace_stored(repo, source.model_copy(update={"contradicting_ids": (target.record_id,)}))
+    result = retrieve_memory(query(), repo)
+    assert result.status == "conflict"
+    assert result.matches[0].contradicting_evidence_ids == ("contradiction-exchange", "contradiction-independent")
+    assert build_core_experience_summary(result, 2000).as_dynamic_context() == ""
 
 
 def test_memory_injection_is_quoted_data_and_never_includes_raw_event_payload(repo):
@@ -247,6 +359,41 @@ def test_invalid_outcome_chain_cannot_supply_lesson_advice(repo, break_link):
     result = retrieve_memory(query(now=NOW + timedelta(seconds=2)), repo)
     assert "lesson" not in [match.record_id for match in result.matches]
     assert "evidence_gap" in result.omissions
+
+
+@pytest.mark.parametrize("ancestry", ["direct", "transitive"])
+@pytest.mark.parametrize("observation_seconds,expected", [(-1, "hit"), (0, "hit"), (1, "miss")])
+def test_outcome_evidence_must_exist_by_outcome_observation(repo, ancestry, observation_seconds, expected):
+    seed_lesson(repo)
+    rule = repo.get_by_id("rule-a", tenant_id="tenant-a")
+    replace_stored(repo, rule.model_copy(update={"evidence_ids": ("rule-a-exchange",), "outcome_id": "outcome"}))
+    event = repo.get_by_id("rule-a-exchange", tenant_id="tenant-a")
+    observed_at = NOW + timedelta(seconds=observation_seconds)
+    if ancestry == "direct":
+        replace_stored(repo, event.model_copy(update={"observed_at": observed_at}))
+    else:
+        repo.append_event(EventRecord(
+            record_id="ancestor", tenant_id="tenant-a", observed_at=observed_at,
+            source="exchange", payload={"observation": "original"},
+            provenance=Provenance(source_id="exchange", source_kind="external", independent_group="exchange")),
+            **write(repo, "ancestor"))
+        replace_stored(repo, event.model_copy(update={"provenance": event.provenance.model_copy(
+            update={"derived_from": ("ancestor",)})}))
+    result = retrieve_memory(query(now=NOW + timedelta(seconds=2)), repo)
+    assert result.status == expected
+    if expected == "miss":
+        assert "evidence_gap" in result.omissions and result.omitted_count == 2
+        assert build_core_experience_summary(result, 2000).as_dynamic_context() == ""
+    else:
+        assert {match.record_id for match in result.matches} == {"rule-a", "lesson"}
+
+
+def test_outcome_ancestry_must_remain_fresh_at_query_time(repo):
+    seed_lesson(repo)
+    event = repo.get_by_id("rule-a-exchange", tenant_id="tenant-a")
+    replace_stored(repo, event.model_copy(update={"observed_at": NOW - timedelta(seconds=9)}))
+    result = retrieve_memory(query(now=NOW + timedelta(seconds=2), max_age_seconds=10), repo)
+    assert result.status == "miss" and "evidence_gap" in result.omissions
 
 
 def test_summary_freshness_reports_oldest_supporting_observation(repo):

@@ -1,7 +1,7 @@
 """Deterministic retrieval and bounded untrusted data for the agent boundary.
 
 No model or external embedding service runs here. A versioned query embedding
-may be supplied by trusted composition; otherwise ranking uses normalized text.
+may be supplied by trusted composition; unversioned queries use normalized text.
 Conflicts are explicit provenance links, not guessed semantic contradictions.
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import re
 import sqlite3
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
@@ -118,8 +119,16 @@ def _fresh(record: Record, query: MemoryQuery) -> bool:
             and (record.expires_at is None or record.expires_at > query.now))
 
 
+def _eligible_memory(record: KnowledgeRevision | DecisionLesson, query: MemoryQuery) -> bool:
+    return (_fresh(record, query) and record.model_version == query.model_version
+            and record.vector_version == query.vector_version
+            and (not isinstance(record, KnowledgeRevision) or record.effective_at <= query.now)
+            and {tag.casefold() for tag in record.applicability}.issubset(
+                {tag.casefold() for tag in query.applicability}))
+
+
 def _event_evidence(identifiers: tuple[str, ...], records: dict[str, Record],
-                    query: MemoryQuery) -> tuple[set[str], set[str]]:
+                    query: MemoryQuery, *, observed_by: datetime | None = None) -> tuple[set[str], set[str]]:
     """Validate fresh event ancestry and collect original independent groups."""
     visiting: set[str] = set()
     roots: dict[str, set[str]] = {}
@@ -127,7 +136,8 @@ def _event_evidence(identifiers: tuple[str, ...], records: dict[str, Record],
     while pending:
         identifier, expanded = pending.pop()
         evidence = records.get(identifier)
-        if not isinstance(evidence, EventRecord) or not _fresh(evidence, query):
+        if (not isinstance(evidence, EventRecord) or not _fresh(evidence, query)
+                or (observed_by is not None and evidence.observed_at > observed_by)):
             raise MemoryIntegrityError("missing or ineligible evidence")
         if expanded:
             visiting.remove(identifier)
@@ -150,22 +160,32 @@ def _event_evidence(identifiers: tuple[str, ...], records: dict[str, Record],
     return set(roots), set().union(*(roots[identifier] for identifier in identifiers))
 
 
+def _outcome_evidence(outcome: Record | None, records: dict[str, Record],
+                      query: MemoryQuery) -> set[str]:
+    if not isinstance(outcome, OutcomeRecord) or not outcome.verified or not _fresh(outcome, query):
+        raise MemoryIntegrityError("outcome is not verifiable")
+    decision = records.get(outcome.decision_id)
+    if (not isinstance(decision, DecisionRecord) or not _fresh(decision, query)
+            or decision.status != "final" or decision.observed_at > outcome.observed_at):
+        raise MemoryIntegrityError("outcome decision is missing or mismatched")
+    # Evidence must already exist when the outcome was verified and remain fresh
+    # at retrieval time. Applying the bound during traversal includes ancestors.
+    identifiers, roots = _event_evidence(outcome.evidence_ids, records, query,
+                                        observed_by=outcome.observed_at)
+    if not roots:
+        raise MemoryIntegrityError("outcome has no independent observation")
+    return identifiers
+
+
 def _support(record: KnowledgeRevision | DecisionLesson, records: dict[str, Record],
              query: MemoryQuery) -> tuple[tuple[str, ...], float, bool]:
     identifiers, roots = _event_evidence(record.evidence_ids, records, query)
     verified = False
     if record.outcome_id is not None:
         outcome = records.get(record.outcome_id)
-        if not isinstance(outcome, OutcomeRecord) or not outcome.verified or not _fresh(outcome, query):
-            raise MemoryIntegrityError("outcome is not verifiable")
-        decision = records.get(outcome.decision_id)
-        if (not isinstance(decision, DecisionRecord) or not _fresh(decision, query)
-                or decision.status != "final" or decision.observed_at > outcome.observed_at
-                or (isinstance(record, DecisionLesson) and record.decision_id != decision.record_id)):
+        outcome_ids = _outcome_evidence(outcome, records, query)
+        if isinstance(record, DecisionLesson) and record.decision_id != outcome.decision_id:
             raise MemoryIntegrityError("outcome decision is missing or mismatched")
-        outcome_ids, outcome_roots = _event_evidence(outcome.evidence_ids, records, query)
-        if not outcome_roots:
-            raise MemoryIntegrityError("outcome has no independent observation")
         if isinstance(record, KnowledgeRevision) and not set(outcome.evidence_ids) & set(record.evidence_ids):
             raise MemoryIntegrityError("outcome does not support candidate evidence")
         identifiers.update(outcome_ids)
@@ -179,6 +199,27 @@ def _support(record: KnowledgeRevision | DecisionLesson, records: dict[str, Reco
     return tuple(sorted(identifiers)), authority, verified
 
 
+def _contradicting_evidence(record: KnowledgeRevision | DecisionLesson, records: dict[str, Record],
+                            query: MemoryQuery) -> tuple[str, ...]:
+    identifiers: set[str] = set()
+    for identifier in getattr(record, "contradicting_ids", ()):
+        target = records.get(identifier)
+        if target is None or not _fresh(target, query):
+            raise MemoryIntegrityError("missing or ineligible contradiction")
+        if isinstance(target, EventRecord):
+            evidence_ids, _ = _event_evidence((identifier,), records, query)
+        elif isinstance(target, (KnowledgeRevision, DecisionLesson)):
+            if not _eligible_memory(target, query):
+                raise MemoryIntegrityError("ineligible contradiction")
+            evidence_ids, _, _ = _support(target, records, query)
+        elif isinstance(target, OutcomeRecord):
+            evidence_ids = _outcome_evidence(target, records, query)
+        else:
+            raise MemoryIntegrityError("unsupported contradiction")
+        identifiers.update(evidence_ids)
+    return tuple(sorted(identifiers))
+
+
 def _tokens(text: str) -> set[str]:
     return set(re.findall(r"\w+", text.casefold()))
 
@@ -188,15 +229,17 @@ def _text_similarity(left: str, right: str) -> float:
     return len(a & b) / len(a | b) if a or b else 0.0
 
 
-def _similarity(query: MemoryQuery, record: KnowledgeRevision | DecisionLesson, text: str) -> float:
+def _similarity(query: MemoryQuery, record: KnowledgeRevision | DecisionLesson, text: str) -> float | None:
     if not query.embedding:
+        if query.model_version != "none" or query.vector_version != "none":
+            return None
         return _text_similarity(query.task, text)
     if len(query.embedding) != len(record.embedding):
-        return 0.0
+        return None
     # Normalize before multiplying to avoid overflowing finite large embeddings.
     norm_a, norm_b = math.hypot(*query.embedding), math.hypot(*record.embedding)
     if not norm_a or not norm_b or not math.isfinite(norm_a) or not math.isfinite(norm_b):
-        return 0.0
+        return None
     return max(0.0, min(1.0, math.fsum((a / norm_a) * (b / norm_b)
                                        for a, b in zip(query.embedding, record.embedding))))
 
@@ -217,35 +260,23 @@ def retrieve_memory(query: MemoryQuery, repository: MemoryRepository) -> Retriev
     for record in records.values():
         if not isinstance(record, (KnowledgeRevision, DecisionLesson)):
             continue
-        if (not _fresh(record, query) or record.model_version != query.model_version
-                or record.vector_version != query.vector_version
-                or (isinstance(record, KnowledgeRevision) and record.effective_at > query.now)
-                or not {tag.casefold() for tag in record.applicability}.issubset(
-                    {tag.casefold() for tag in query.applicability})):
+        if not _eligible_memory(record, query):
             omissions.add("ineligible")
             omitted_count += 1
             continue
         text = record.rule if isinstance(record, KnowledgeRevision) else record.lesson
         similarity = _similarity(query, record, text)
-        if record.confidence < query.min_confidence or similarity < query.min_similarity:
+        if similarity is None or record.confidence < query.min_confidence or similarity < query.min_similarity:
             omissions.add("weak_match")
             omitted_count += 1
             continue
         try:
             evidence_ids, authority, verified = _support(record, records, query)
+            contradicting = _contradicting_evidence(record, records, query)
         except MemoryIntegrityError:
             omissions.add("evidence_gap")
             omitted_count += 1
             continue
-        contradicting: set[str] = set()
-        for identifier in getattr(record, "contradicting_ids", ()):
-            target = records.get(identifier)
-            if isinstance(target, EventRecord):
-                contradicting.add(identifier)
-            elif isinstance(target, (KnowledgeRevision, DecisionLesson, OutcomeRecord)):
-                contradicting.update(target.evidence_ids)
-            else:
-                contradicting.add(identifier)
         oldest = min(record.observed_at, *(records[identifier].observed_at for identifier in evidence_ids))
         age = int((query.now - oldest).total_seconds())
         exact = query.task == " ".join(text.split()).casefold()
@@ -255,7 +286,7 @@ def retrieve_memory(query: MemoryQuery, repository: MemoryRepository) -> Retriev
         matches.append(MemoryMatch(record_id=record.record_id,
                                     kind="rule" if isinstance(record, KnowledgeRevision) else "lesson",
                                     text=text, evidence_ids=evidence_ids,
-                                    contradicting_evidence_ids=tuple(sorted(contradicting)),
+                                    contradicting_evidence_ids=contradicting,
                                     confidence=record.confidence, freshness_seconds=age, score=round(score, 12)))
     # Inspect the full eligible set before Top-K so truncation cannot hide a
     # strong contradiction behind a higher ranked piece of advice.
