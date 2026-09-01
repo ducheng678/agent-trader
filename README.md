@@ -248,4 +248,7 @@ isolated compatibility deployment.
 Deployment code should construct the trusted `HarnessKernel` and then call
 `market_agent.backend.governed_app.create_governed_app(...)`. The normal
 `python -m market_agent.backend` launcher is a development/legacy launcher and
-does not fabricate the production signing authority.
+does not fabricate the production signing authority. In staging or production,
+set `MARKET_AGENT_HARNESS_HOST_FACTORY=your_package.host:create_bindings`; the
+factory returns `HarnessHostBindings(kernel=..., completion_candidate_factory=...)`
+and owns all HSM/KMS signing integration.
