@@ -8,7 +8,6 @@ import math
 import random
 import re
 import threading
-import uuid
 from typing import Any, Protocol
 
 from market_agent.backend.message_bus import MessageEnvelope
@@ -32,9 +31,14 @@ class RedisLike(Protocol):
     def xreadgroup(self, groupname: str, consumername: str, streams: dict[str, str], count: int = 1, block: int | None = None) -> object: ...
     def xack(self, name: str, groupname: str, *ids: str) -> object: ...
     def xgroup_create(self, name: str, groupname: str, id: str = "0", mkstream: bool = False) -> object: ...
+    def xautoclaim(self, name: str, groupname: str, consumername: str, min_idle_time: int,
+                   start_id: str = "0-0", count: int | None = None) -> object: ...
 
 
 _SENSITIVE = frozenset({"authorization", "credential", "password", "secret", "token", "api_key", "access_key"})
+_TRACE_ID = re.compile(r"^[0-9a-fA-F]{32}$")
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_STREAM_ID = re.compile(r"^[0-9]+-[0-9]+$")
 
 
 def _sensitive_key(key: str) -> bool:
@@ -47,6 +51,18 @@ def _tenant_namespace(namespace: str, tenant_id: str, kind: str) -> str:
     if type(namespace) is not str or type(tenant_id) is not str or not namespace.strip() or not tenant_id.strip():
         raise ValueError("Redis namespace and tenant are required")
     return f"{namespace}:tenant:{sha256(tenant_id.encode('utf-8')).hexdigest()}:{kind}:"
+
+
+def _require_trace_id(value: object) -> str:
+    if type(value) is not str or not _TRACE_ID.fullmatch(value) or not int(value, 16):
+        raise ValueError("Redis messages require a nonzero W3C trace_id")
+    return value
+
+
+def _require_request_id(value: object) -> str:
+    if type(value) is not str or not _REQUEST_ID.fullmatch(value):
+        raise ValueError("Redis messages require a compact nonempty request_id")
+    return value
 
 
 def _safe_value(value: Any) -> Any:
@@ -209,10 +225,9 @@ class RedisStreamMessageBus:
         if type(message) is not MessageEnvelope or not message.topic.strip():
             raise ValueError("a concrete message envelope with topic is required")
         payload = dict(message.payload)
-        trace_id = str(payload.get("trace_id") or message.request_id).strip()
-        if not trace_id:
-            raise ValueError("messages require a trace_id or request_id")
-        encoded = _encode({"topic": message.topic, "payload": payload, "request_id": message.request_id, "job_id": message.job_id, "message_id": message.message_id, "occurred_at": message.occurred_at, "trace_id": trace_id}, self._maximum_message_bytes)
+        trace_id = _require_trace_id(payload.get("trace_id"))
+        request_id = _require_request_id(message.request_id)
+        encoded = _encode({"topic": message.topic, "payload": payload, "request_id": request_id, "job_id": message.job_id, "message_id": message.message_id, "occurred_at": message.occurred_at, "trace_id": trace_id}, self._maximum_message_bytes)
         try:
             identifier = self._client.xadd(self._stream(message.topic), {"envelope": encoded, "trace_id": trace_id})
             return identifier.decode("utf-8") if isinstance(identifier, bytes) else str(identifier)
@@ -230,6 +245,34 @@ class RedisStreamMessageBus:
             raise
         except Exception as error:
             raise RedisUnavailableError("Redis stream consume failed") from error
+
+    def recover_pending(self, *, topic: str, group: str, consumer: str, min_idle_ms: int,
+                        start_id: str = "0-0", count: int = 1) -> tuple[str, tuple[StreamDelivery, ...]]:
+        if (not all(type(value) is str and value.strip() for value in (topic, group, consumer, start_id))
+                or not _STREAM_ID.fullmatch(start_id) or min_idle_ms < 1 or count < 1):
+            raise ValueError("stream pending recovery arguments are invalid")
+        stream = self._stream(topic)
+        try:
+            result = self._client.xautoclaim(
+                stream,
+                group,
+                consumer,
+                min_idle_ms,
+                start_id=start_id,
+                count=count,
+            )
+            if not isinstance(result, (list, tuple)) or len(result) < 2:
+                raise RedisUnavailableError("Redis stream returned invalid pending recovery")
+            next_start, messages = result[0], result[1]
+            if isinstance(next_start, bytes):
+                next_start = next_start.decode("utf-8")
+            if type(next_start) is not str or not _STREAM_ID.fullmatch(next_start):
+                raise RedisUnavailableError("Redis stream returned invalid pending cursor")
+            return next_start, tuple(self._deliveries(stream, ((stream, messages),)))
+        except RedisUnavailableError:
+            raise
+        except Exception as error:
+            raise RedisUnavailableError("Redis stream pending recovery failed") from error
 
     def ack(self, delivery: StreamDelivery, *, group: str) -> None:
         if type(delivery) is not StreamDelivery or not group.strip():
@@ -283,12 +326,15 @@ class RedisMessageBusAdapter:
 
     _RETRY_BASE_SECONDS = 0.25
     _RETRY_MAX_SECONDS = 5.0
+    _PENDING_IDLE_MS = 60_000
+    _PENDING_BATCH_SIZE = 10
 
     def __init__(self, stream_bus: RedisStreamMessageBus, *, group: str = "market-agent-workers") -> None:
         if type(stream_bus) is not RedisStreamMessageBus or not group.strip():
             raise ValueError("Redis message adapter requires a stream bus and consumer group")
         self._bus = stream_bus
         self._group = group
+        self._consumer = "consumer-" + sha256(f"{stream_bus._prefix}:{group}".encode("utf-8")).hexdigest()[:24]
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._health_lock = threading.Lock()
@@ -300,7 +346,8 @@ class RedisMessageBusAdapter:
     def subscribe(self, topic: str, handler: Any):
         if not callable(handler):
             raise TypeError("message handler must be callable")
-        consumer = "consumer-" + uuid.uuid4().hex
+        consumer = self._consumer
+        health_key = consumer + ":" + topic
         stream = self._bus._stream(topic)
         try:
             self._bus._client.xgroup_create(stream, self._group, id="0", mkstream=True)
@@ -311,46 +358,49 @@ class RedisMessageBusAdapter:
 
         def consume() -> None:
             failures = 0
+            pending_cursor = "0-0"
             try:
                 while not self._stop.is_set() and not local_stop.is_set():
                     try:
-                        deliveries = self._bus.consume(
+                        pending_cursor, pending = self._bus.recover_pending(
                             topic=topic,
                             group=self._group,
                             consumer=consumer,
-                            count=10,
+                            min_idle_ms=self._PENDING_IDLE_MS,
+                            start_id=pending_cursor,
+                            count=self._PENDING_BATCH_SIZE,
+                        )
+                        deliveries = pending or self._bus.consume(
+                            topic=topic,
+                            group=self._group,
+                            consumer=consumer,
+                            count=self._PENDING_BATCH_SIZE,
                             block_ms=1000,
                         )
-                    except RedisUnavailableError as error:
-                        failures += 1
-                        self._mark_consumer_degraded(consumer, error)
-                        if self._wait_for_retry(local_stop, self._retry_delay(failures)):
-                            return
-                        continue
-
-                    failures = 0
-                    self._mark_consumer_healthy(consumer)
-                    for delivery in deliveries:
-                        if self._stop.is_set() or local_stop.is_set():
-                            return
-                        try:
-                            handler(delivery.envelope)
-                        except Exception as error:
+                        for delivery in deliveries:
+                            if self._stop.is_set() or local_stop.is_set():
+                                return
                             try:
+                                handler(delivery.envelope)
+                            except Exception as error:
                                 self._bus.dead_letter(
                                     delivery,
                                     group=self._group,
                                     reason=type(error).__name__[:128],
                                 )
-                            except RedisUnavailableError as dead_letter_error:
-                                self._mark_consumer_degraded(consumer, dead_letter_error)
-                            continue
-                        try:
-                            self._bus.ack(delivery, group=self._group)
-                        except RedisUnavailableError as error:
-                            self._mark_consumer_degraded(consumer, error)
+                            else:
+                                self._bus.ack(delivery, group=self._group)
+                    except RedisUnavailableError as error:
+                        failures += 1
+                        self._mark_consumer_degraded(health_key, error)
+                        if self._wait_for_retry(local_stop, self._retry_delay(failures)):
+                            return
+                        continue
+
+                    failures = 0
+                    self._mark_consumer_healthy(health_key)
             finally:
-                self._mark_consumer_healthy(consumer)
+                self._mark_consumer_healthy(health_key)
 
         thread = threading.Thread(target=consume, name=consumer, daemon=True)
         self._threads.append(thread)
