@@ -68,9 +68,14 @@ Every workflow transition writes an append-only audit event. Required event cate
 - model route selected and changed;
 - prompt version and prompt-cache key used;
 - high-frequency answer cache lookup and result;
+- semantic request-cache embedding, filtered candidates, similarity, compatibility, expiry, model/schema metadata, and result;
 - tool call requested, allowed, completed, or denied;
 - structured output validation result;
+- reflection target/schema hashes, Luna attempt, format/field/conclusion-data checks, contradictions, disposition, and coordinator response;
+- correction-context/error codes, field paths, evidence references, targeted patch/application, fallback rewrite linkage, replacement output hash, and resolution;
+- correction guard before/after objective error tuples, output-hash cycle checks, regression stop reason, and safe terminal;
 - retry, timeout, cancellation, and cost reservation or settlement;
+- exponential-backoff ceiling, full-jitter/server delay, scheduled/actual wait, and circuit-breaker state/probe/rejection/recovery;
 - local knowledge lookup and evidence selected;
 - fallback tier entered and unknown returned;
 - specialist conflict detected and coordinator resolution selected;
@@ -104,7 +109,7 @@ Authentication, authorization, invalid configuration, audit persistence failure,
 
 The revised graph is:
 
-`request_normalizer -> seed_cache_lookup -> coordinator_plan -> context_select -> context_summarize -> dispatch_specialists -> collect_reports -> coordinator_reconcile`
+`request_normalizer -> seed_cache_lookup -> coordinator_plan -> context_select -> context_summarize -> dispatch_specialists -> collect_reports -> coordinator_reconcile -> decision_planner -> reflect_decision -> risk_or_escalation -> reflect_escalation_if_used -> coordinator_summary -> reflect_coordinator_summary`
 
 From `coordinator_reconcile`:
 
@@ -196,7 +201,9 @@ Administrative restore, legal hold, tenant erasure, and policy change operations
 
 Long-term memory retrieval and application follows four mandatory stages.
 
-Stage 1, receive the new task: the coordinator normalizes the user objective, immutable constraints, tenant/scope, locale, symbols, time horizon, task type, risk class, required evidence types, and maximum memory token budget. It creates a traceable `MemoryQuery` and checks the exact high-frequency seed cache first for safe informational intents. Live trading requests never terminate from a cached trading answer.
+Stage 1, receive the new task: the coordinator normalizes the user objective, immutable constraints, tenant/scope, locale, symbols, time horizon, task type, risk class, required evidence types, and maximum memory token budget. It creates a traceable `MemoryQuery` and checks the exact high-frequency seed cache first for safe informational intents. It then creates a `SemanticCacheQuery`, embeds the normalized historical-request projection, and asks the vector cache for the highest compatible unexpired result. A result is returned directly only when cosine similarity is strictly greater than `0.95` and tenant/scope, intent, locale, prompt, model policy, schema/hash, safety policy, knowledge/context fingerprint, and freshness gates all match. Live trading requests never terminate from a cached trading answer.
+
+The semantic-cache audit records the query hash, embedding model/version, threshold, filtered candidate IDs and scores, compatibility rejections, selected cache ID, original request/response timestamps, model ID/version, prompt and schema versions/hashes, TTL class, expiry, and hit/miss reason. Expired entries are removed from eligibility before similarity ranking and are never used by local-knowledge fallback. Vector cache failure is a cache miss, not a workflow failure.
 
 Stage 2, vector retrieval: the memory service embeds the normalized task with the configured embedding model/version and performs filtered Top-K retrieval. It first searches completed decision lessons for comparable situations and active knowledge revisions for reusable experience; it follows their evidence links into the event layer when raw support is required. Filters enforce tenant/scope, symbol/market applicability, lifecycle state, effective/expiry time, knowledge version, legal visibility, and maximum staleness before similarity search. Recommended defaults are configurable `decision_k=5`, `knowledge_k=8`, and `event_evidence_k=12`.
 
@@ -227,6 +234,7 @@ An agent `write` means returning its strict result for one allowed invocation-st
 | fundamental agent | event/market/core-experience summaries and evidence references | write `FundamentalAnalysis` | no chart pixels, execution values, tools, durable writes |
 | technical agent | bounded chart text/images, market snapshot, core-experience summary | write direction-neutral `TechnicalAnalysis` | no web tools, event reinterpretation, final direction, durable writes |
 | decision-planner agent | validated fundamental/technical reports and bounded summaries | write `DecisionDraft` | no tools, size/leverage, execution, durable writes |
+| reflection agent | one validated redacted target output, its schema identity/hash, bounded evidence summary, and deterministic validation result | Luna-only no-tool consistency review; write one `ReflectionResult` for the assigned target hash | no target mutation/repair, no coordinator planning, no web/exchange/filesystem/database/cache/queue/memory access, no durable writes, no reflection of reflection output |
 | escalation-reviewer agent | conflict bundle, cited summaries, deterministic rule result | write `EscalationReview` | no new facts/tools, symbol changes, risk bypass, execution, durable writes |
 | deterministic risk gate | validated graph state and budget/audit health | write `RiskAssessment` only | no model/tool calls, no durable writes, no policy override |
 | playbook assembler | accepted state and exact normalization/cap policy | write final invocation result | no model/tools, no execution or durable memory writes |
@@ -237,6 +245,36 @@ An agent `write` means returning its strict result for one allowed invocation-st
 Tool dispatch validates the capability at call time, not only task creation. Capability IDs are included in audit events; tokens themselves are never logged. A task reschedule receives a new capability and cannot reuse an expired or broader prior grant. Parallel agents receive isolated contexts.
 
 Static tests reject forbidden imports and direct client/repository calls. Runtime tests attempt unauthorized state keys, tools, tenant IDs, memory writes, SQL handles, and exchange operations and require a typed permission denial plus audit event. Permission failure is non-retryable at the same grant; the coordinator may only reschedule after deterministic policy issues a corrected narrower capability.
+
+### Structured Agent Output Enforcement
+
+Every coordinator and specialist invocation uses a versioned Pydantic contract rendered as an OpenAI strict JSON Schema. The request sets strict structured output, forbids additional properties, and supplies exactly one schema for the node. Free-form prose, Markdown fences, leading or trailing text, multiple JSON values, NaN/Infinity, unknown enums, missing required fields, excessive list/string lengths, and cross-field contradictions are invalid outputs.
+
+Every output includes `schema_version`, knowledge status, uncertainty reason, bounded evidence references, and only the concise conclusion/reason fields defined by its contract. It never includes hidden chain-of-thought. Prompt instructions to reason step by step affect internal analysis only; the response contains the validated result, key evidence, and uncertainty.
+
+`AgentRunner` parses the complete response once, validates it locally against the same Pydantic model, and rejects partial recovery or best-effort field dropping. A schema failure is an audited retryable attempt within the node's existing attempt/time/cost budget. Exhaustion follows the configured lower-model, local-knowledge, and explicit-unknown path. A malformed output can never reach a reducer, memory proposal, risk gate, cache, API response, or final playbook.
+
+After deterministic parsing, only three configured core outputs are reviewed by the Luna-only reflection agent: the decision planner's draft, the conditional Sol escalation review, and the coordinator's final summary. It checks the declared schema/required-field result and semantic consistency between conclusion, numbers, direction, cited evidence, uncertainty, and the bounded source summary. Its strict disposition is `accept`, `retry_original`, `return_to_coordinator`, or `safe_reject`. It cannot change the target payload. Non-accepted core targets remain outside their downstream state, cache, memory, risk, and API boundaries. Non-core Agent outputs receive deterministic validation without an LLM reflection call. Reflection unavailability for a core trading output fails closed; the reflection output itself receives deterministic validation only, preventing recursive reflection.
+
+For `retry_original`, the coordinator receives a deterministic `CorrectionContext` rather than raw reflection text. It carries only target and reflection hashes, typed error/invariant codes, affected field paths, contradiction/missing-evidence references, retry ordinal, and bounded summaries of the prior output and original task. The first retry receives this context in dynamic user content and returns a strict targeted `CorrectionPatch`. A deterministic service applies only allowlisted field replacements to a copy and fully revalidates the result. Only patch-generation/application failure, full-schema failure, or another rejected reflection may trigger one fallback full rewrite with bounded correction history. The rewritten result must be complete and strict. One patch plus one rewrite is the hard maximum; all attempts share existing time/retry/cost limits, and exhaustion fails closed.
+
+Reflection is objective-only. Luna emits allowlisted checks with `pass`, `fail`, or `not_verifiable`, field paths, evidence IDs, observed values/hashes, and expected constraints. It cannot judge strategy quality, market opinion, profitability, prose, or confidence and cannot choose the workflow disposition. Deterministic policy maps required checks to a disposition. A deterministic correction guard permits at most one targeted patch and one fallback rewrite, requires strict improvement of the objective error tuple, detects repeated/cycling hashes, and stops immediately on new critical errors, weakened risk rules, unsupported direction changes, or lost evidence.
+
+### Trace and Span Propagation
+
+Each ingress creates one fresh internal 128-bit trace ID and an initial span before normalization. The ID is immutable and is passed explicitly in every request, task, report, summary, capability, audit event, cache lookup, model/tool call, retry, queue message, memory operation, log, metric exemplar, and final response. Every operation creates a child span; trace mismatches fail closed. Upstream trace context and cached-result origin traces are links, never replacements for the current request trace. Trace IDs are unique correlation identifiers and grant no permission.
+
+### Logs, Metrics, Tool Traces, and Releases
+
+Structured logs are typed one-line JSON and always include UTC time, trace/span hierarchy, workflow/task/attempt, actor/event/status, latency, model/prompt/schema/release identity, token classes, cost, and retry/cache/fallback/circuit outcomes. Metrics cover business success, abstention, interfaces, queues, Agent/LLM/tools, caches, memory, tokens, and cost with bounded labels and trace exemplars. Tool spans record capability-checked typed arguments/results as redacted summaries plus hashes, sizes, schemas, status, duration, and artifact references. Canonical audit remains complete even when remote telemetry export is sampled.
+
+System prompts and generation parameters are immutable Git-tracked release files. Requests pin one release. Activation and rollback are atomic, authorized, hash/schema/model-capability/evaluation-gated, and fully audited. Rollback affects only new requests and returns to the immediately previous known-good release; dynamic values stay outside stable prefixes and unsupported temperature values are never sent.
+
+The versioned evaluation corpus measures end-to-end success and safety across normal, unknown, adversarial, cache, routing, retry/circuit, reflection/correction, memory/RAG, permission, and trace paths. Release results bind code, corpus, prompts, schemas, model versions, latency, tokens, and cost. Hard safety failures block release regardless of average success; candidate/baseline comparison uses paired cases and confidence bounds.
+
+Schema name/version and canonical schema hash are included in prompt-cache keys, response-cache keys, audit events, usage records, task contracts, and memory records derived from an output. Cache and memory reads require compatible versions; migrations are explicit deterministic transformations that retain the original payload/hash and audit linkage.
+
+Tool arguments and tool results use separate strict schemas and capability validation. The coordinator cannot reinterpret an invalid specialist payload as a valid result. Reducers accept only the output model assigned to that actor and state key. API serialization uses the validated final contract rather than raw model text.
 
 ## Acceptance Criteria
 
@@ -252,3 +290,10 @@ Static tests reject forbidden imports and direct client/repository calls. Runtim
 - Long-term memory is separated into immutable event material, distilled knowledge, and outcome-linked decision lessons.
 - No agent writes durable memory directly; every promotion is coordinator-reviewed, policy-validated, source-linked, and audited.
 - Retrieval returns versioned, freshness-aware records that are summarized before specialist handoff.
+- Every agent response is strict, versioned, fully parsed structured output; malformed or extra text is retried or degraded and never enters state or memory.
+- Decision drafts, conditional Sol escalation reviews, and coordinator final summaries pass exactly one Luna reflection gate; non-core outputs do not invoke reflection, reflection cannot mutate the target, and a reflection result is never recursively reflected.
+- Reflection emits only objective falsifiable checks; deterministic policy owns disposition and stops correction on regression, cycles, or the one-patch/one-rewrite limit.
+- Every ingress receives one fresh immutable internal trace ID that reaches every synchronous/asynchronous operation and final response; each operation has a unique parented span and cross-trace mutation is rejected.
+- JSON logs, bounded-cardinality metrics, and Agent/LLM/tool spans expose success, latency, token, cost, arguments/results metadata, and failure paths without secrets, raw prompts, private reasoning, or unrestricted content.
+- System prompts and supported generation parameters are immutable Git-tracked releases pinned per request; guarded atomic rollback restores the previous evaluated known-good release for new requests in one action.
+- A versioned leak-checked evaluation corpus reports reproducible end-to-end success and safety metrics; hard safety failures or configured confidence-bound regressions block release regardless of average score.
