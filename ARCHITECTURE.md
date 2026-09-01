@@ -81,6 +81,10 @@ In staging and production, `/health/ready` includes a `harness` component. It
 is failed unless both the trusted kernel and its paired workflow application
 are present, so orchestration cannot mark an unguided legacy process ready.
 
+Prompt release activations and rollbacks emit the low-cardinality
+`market_agent_prompt_release_actions_total` metric keyed only by action; release
+identifiers remain in the durable prompt audit rather than metric labels.
+
 Every workflow request carries the middleware-generated W3C trace through the
 queue payload, Harness stream, coordinated agents, audit events, cache and memory
 operations. Idempotent API replays return the original run trace; requests without
