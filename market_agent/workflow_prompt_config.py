@@ -58,6 +58,15 @@ class PromptActivation:
     action: str
 
 
+@dataclass(frozen=True, slots=True)
+class PendingPromptAudit:
+    sequence: int
+    activation: PromptActivation
+    release_id: str
+    release_digest: str
+    manifest_hash: str
+
+
 class ReleaseGate(Protocol):
     def __call__(self, pin: PromptPin, action: str) -> bool: ...
 
@@ -191,6 +200,8 @@ class PromptReleaseManager:
                 connection.commit()
                 return PromptActivation(active_release_id=pin.release_id, previous_release_id=active, action="activate_noop")
             connection.execute("UPDATE prompt_release_registry SET active_release_id = ?, previous_release_id = ? WHERE registry_id = 1", (pin.release_id, active))
+            self._record_activation(connection, PromptActivation(
+                active_release_id=pin.release_id, previous_release_id=active, action="activate"), pin)
             connection.commit()
         activation = PromptActivation(active_release_id=pin.release_id, previous_release_id=active, action="activate")
         self._emit(activation, pin)
@@ -206,15 +217,63 @@ class PromptReleaseManager:
             pin = self._pin(previous)
             self._require_gate(pin, "rollback")
             connection.execute("UPDATE prompt_release_registry SET active_release_id = ?, previous_release_id = NULL WHERE registry_id = 1", (previous,))
+            self._record_activation(connection, PromptActivation(
+                active_release_id=previous, previous_release_id=active, action="rollback"), pin)
             connection.commit()
         activation = PromptActivation(active_release_id=previous, previous_release_id=active, action="rollback")
         self._emit(activation, pin)
         return activation
 
+    def replay_pending_audit(self, *, limit: int = 100) -> int:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("prompt audit replay limit is invalid")
+        if self._audit_hook is None:
+            return 0
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT sequence,active_release_id,previous_release_id,action,release_digest,manifest_hash "
+                "FROM prompt_release_audit WHERE external_audit_delivered=0 ORDER BY sequence LIMIT ?",
+                (limit,),
+            ).fetchall()
+        delivered = 0
+        for sequence, active, previous, action, digest, manifest_hash in rows:
+            pin = self._pin(str(active))
+            if pin.release_digest != digest or pin.manifest_hash != manifest_hash:
+                raise PromptConfigurationError("pending prompt audit no longer matches Git release")
+            activation = PromptActivation(active_release_id=str(active), previous_release_id=previous, action=str(action))
+            try:
+                self._audit_hook(activation, pin)
+            except Exception:
+                continue
+            with self._lock, self._connection() as connection:
+                changed = connection.execute(
+                    "UPDATE prompt_release_audit SET external_audit_delivered=1 "
+                    "WHERE sequence=? AND external_audit_delivered=0",
+                    (sequence,),
+                ).rowcount
+            delivered += int(changed == 1)
+        return delivered
+
+    def pending_audits(self, *, limit: int = 100) -> tuple[PendingPromptAudit, ...]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("prompt pending audit limit is invalid")
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT sequence,active_release_id,previous_release_id,action,release_digest,manifest_hash "
+                "FROM prompt_release_audit WHERE external_audit_delivered=0 ORDER BY sequence LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(PendingPromptAudit(
+            sequence=int(sequence),
+            activation=PromptActivation(active_release_id=str(active), previous_release_id=previous, action=str(action)),
+            release_id=str(active), release_digest=str(digest), manifest_hash=str(manifest_hash),
+        ) for sequence, active, previous, action, digest, manifest_hash in rows)
+
     def _initialize_registry(self) -> None:
         with self._connection() as connection:
             connection.execute("CREATE TABLE IF NOT EXISTS prompt_release_registry (registry_id INTEGER PRIMARY KEY CHECK (registry_id = 1), active_release_id TEXT, previous_release_id TEXT)")
             connection.execute("INSERT OR IGNORE INTO prompt_release_registry (registry_id, active_release_id, previous_release_id) VALUES (1, NULL, NULL)")
+            connection.execute("CREATE TABLE IF NOT EXISTS prompt_release_audit (sequence INTEGER PRIMARY KEY AUTOINCREMENT, active_release_id TEXT NOT NULL, previous_release_id TEXT, action TEXT NOT NULL, release_digest TEXT NOT NULL, manifest_hash TEXT NOT NULL, external_audit_delivered INTEGER NOT NULL DEFAULT 0 CHECK (external_audit_delivered IN (0,1)))")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -253,12 +312,31 @@ class PromptReleaseManager:
             raise PromptConfigurationError("prompt release gate denied activation")
 
     def _emit(self, activation: PromptActivation, pin: PromptPin) -> None:
-        for hook in (self._audit_hook, self._metric_hook):
-            if hook is not None:
-                try:
-                    hook(activation, pin)
-                except Exception:
-                    continue
+        if self._audit_hook is not None:
+            try:
+                self._audit_hook(activation, pin)
+            except Exception:
+                pass
+            else:
+                with self._lock, self._connection() as connection:
+                    connection.execute(
+                        "UPDATE prompt_release_audit SET external_audit_delivered = 1 WHERE sequence = (SELECT MAX(sequence) FROM prompt_release_audit WHERE active_release_id = ? AND action = ?)",
+                        (activation.active_release_id, activation.action),
+                    )
+        if self._metric_hook is not None:
+            try:
+                self._metric_hook(activation, pin)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _record_activation(connection: sqlite3.Connection, activation: PromptActivation,
+                           pin: PromptPin) -> None:
+        connection.execute(
+            "INSERT INTO prompt_release_audit (active_release_id,previous_release_id,action,release_digest,manifest_hash) VALUES (?,?,?,?,?)",
+            (activation.active_release_id, activation.previous_release_id, activation.action,
+             pin.release_digest, pin.manifest_hash),
+        )
 
 
 def default_prompt_manager(*, registry_path: Path, git_root: Path | None = None,
