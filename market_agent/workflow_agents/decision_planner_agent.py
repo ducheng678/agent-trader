@@ -20,4 +20,3 @@ def build_invocation(task, context, **options):
 
 def run_node(task, context, driver, **options):
     return common.run_node(_checked(task), context, driver, **options)
-
