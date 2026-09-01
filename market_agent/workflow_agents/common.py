@@ -15,6 +15,7 @@ from market_agent.workflow_contracts import (
     MarketContextResult, ReportStatus, TaskType, TechnicalAnalysis,
 )
 from market_agent.workflow_context_summary import ContextHandoff
+from market_agent.workflow_memory_retrieval import CoreExperienceSummary
 from market_agent.workflow_prompt_release import PromptRelease, PromptReleaseRegistry, canonical_json
 
 
@@ -186,10 +187,18 @@ def report_result(task: AgentTask, context: ContextSummary | ContextHandoff, res
 
 
 def run_node(task: AgentTask, context: ContextSummary | ContextHandoff, driver: AgentDriver, *,
-             deadline_epoch: float, grant: object, authorize: Callable[[AgentTask, object], None]) -> AgentReport:
+             deadline_epoch: float, grant: object, authorize: Callable[[AgentTask, object], None],
+             memory_context: CoreExperienceSummary | None = None,
+             memory_tenant_id: str | None = None,
+             memory_scope: str | None = None) -> AgentReport:
     checked_context(task, context)
     if grant is None or not callable(authorize):
         raise PermissionError("specialist dispatch requires a host-issued grant and authorizer")
     authorize(task, grant)
     invocation = build_invocation(task, context, deadline_epoch=deadline_epoch)
-    return report_result(task, context, driver.execute(invocation))
+    return report_result(task, context, driver.execute(
+        invocation,
+        memory_context=memory_context,
+        memory_tenant_id=memory_tenant_id,
+        memory_scope=memory_scope,
+    ))

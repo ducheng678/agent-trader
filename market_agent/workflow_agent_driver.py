@@ -21,7 +21,7 @@ from market_agent.workflow_prompt_release import PromptReleaseRegistry, canonica
 from market_agent.workflow_prompt_config import PromptReleaseManager
 from market_agent.workflow_response_cache import CacheMetadata, ExactCacheKey, ExactResponseCache, require_cache_safe, snapshot_safe_answers
 from market_agent.workflow_retry_policy import RetryPolicy, UniformRandom
-from market_agent.workflow_semantic_request_cache import SemanticRequestCache
+from market_agent.workflow_semantic_request_cache import SemanticCacheEntry, SemanticRequestCache
 
 
 _TIERS = (ModelTier.LUNA, ModelTier.TERRA, ModelTier.SOL)
@@ -260,6 +260,8 @@ class AgentDriver:
                 result = self._models_and_fallback(run, schema)
             if result.failure is not None:
                 return result
+            if result.origin == "model" and run.memory_hash is None:
+                self._store_safe_response(run, schema, result.output)
             if schema.reflection_required:
                 # A response that was conditioned on a bounded summary stays a
                 # candidate until its memory authority survives every
@@ -389,6 +391,45 @@ class AgentDriver:
             output = schema.unknown()
             self._emit(run, "abstained", "completed", reason="missing_evidence", output=output)
             return self._success(run, output, "abstention")
+
+    def _store_safe_response(self, run: _Run, schema: OutputSchema,
+                             output: Mapping[str, object]) -> None:
+        if self._cache_context is None:
+            return
+        try:
+            context = self._cache_context(run.invocation)
+            if context is None:
+                return
+            metadata = context.metadata
+            require_cache_safe(metadata, output, self._safe_answers)
+            now = self._clock.now()
+            if metadata.expires_at <= now:
+                return
+            request_hash = _digest(run.invocation.user_payload)
+            if self._exact is not None:
+                key = ExactCacheKey.from_metadata(request_hash, metadata)
+                self._exact.put(key, output, metadata, now=now)
+                self._emit(run, "fixed_cache_write", "completed", outcome="stored")
+            if self._semantic is not None and context.vector is not None:
+                if metadata.vector_version is None or metadata.model_version is None:
+                    raise ValueError("semantic cache writes require model and vector versions")
+                self._semantic.put(SemanticCacheEntry(
+                    entry_id="semantic-" + _digest((metadata.tenant_scope, request_hash,
+                        metadata.prompt_release_digest, metadata.output_schema_digest))[:48],
+                    request_vector=context.vector,
+                    response=dict(output),
+                    metadata=metadata,
+                    created_at=now,
+                    vector_version=metadata.vector_version,
+                    model_version=metadata.model_version,
+                ))
+                self._emit(run, "semantic_cache_write", "completed", outcome="stored")
+        except _AuditFailure:
+            raise
+        except Exception:
+            # Cache admission is optional and must never change the selected
+            # model result. Rejections remain observable as a skipped write.
+            self._emit(run, "semantic_cache_write", "rejected", reason="unsafe_or_unavailable")
 
     def _model(self, run: _Run, schema: OutputSchema) -> AgentResult | None:
         per_tier_attempts = 0

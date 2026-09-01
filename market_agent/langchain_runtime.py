@@ -167,14 +167,16 @@ class LangChainResponsesRuntime:
         from langchain.chat_models import init_chat_model
 
         model_name = str(create_kwargs["model"])
-        model = init_chat_model(
-            f"openai:{model_name}",
-            api_key=self.api_key,
-            use_responses_api=True,
-            output_version="responses/v1",
-            timeout=float(timeout),
-            max_retries=0,
-        )
+        model_options: Dict[str, Any] = {
+            "api_key": self.api_key,
+            "use_responses_api": True,
+            "output_version": "responses/v1",
+            "timeout": float(timeout),
+            "max_retries": 0,
+        }
+        if "temperature" in create_kwargs:
+            model_options["temperature"] = float(create_kwargs["temperature"])
+        model = init_chat_model(f"openai:{model_name}", **model_options)
         invoke_kwargs: Dict[str, Any] = {}
         reasoning = dict(create_kwargs.get("reasoning") or {})
         text = dict(create_kwargs.get("text") or {})

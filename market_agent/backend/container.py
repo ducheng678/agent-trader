@@ -16,12 +16,16 @@ from market_agent.backend.trace_observability import BackendObservability
 class BackendContainer:
     settings: BackendSettings
     repository: JobRepository
-    cache: TTLCache
-    message_bus: InMemoryMessageBus
+    cache: Any
+    message_bus: Any
     metrics: MetricsRegistry
     task_queue: BackgroundTaskQueue
     agent_service: Any = None
     observability: BackendObservability | None = None
+    memory_repository: Any = None
+    memory_maintenance: Any = None
+    governed_memory_repository: Any = None
+    semantic_response_cache: Any = None
 
     def __post_init__(self) -> None:
         if self.observability is None:
@@ -36,9 +40,28 @@ class BackendContainer:
         resolved_settings = (settings or BackendSettings.from_env()).validate()
         configure_structured_logging()
         repository = JobRepository(resolved_settings.database_path)
-        cache = TTLCache(resolved_settings.cache_max_entries, resolved_settings.cache_default_ttl_seconds)
+        cache: Any = TTLCache(resolved_settings.cache_max_entries, resolved_settings.cache_default_ttl_seconds)
         metrics = MetricsRegistry()
-        message_bus = InMemoryMessageBus()
+        message_bus: Any = InMemoryMessageBus()
+        if resolved_settings.redis_url:
+            try:
+                import redis
+                from market_agent.backend.redis_adapters import (
+                    RedisMessageBusAdapter,
+                    RedisJobCache,
+                    RedisStreamMessageBus,
+                    RedisTenantCache,
+                )
+                redis_client = redis.Redis.from_url(resolved_settings.redis_url)
+                cache = RedisJobCache(RedisTenantCache(
+                    redis_client, tenant_id=resolved_settings.tenant_id,
+                    default_ttl_seconds=max(1, int(resolved_settings.cache_default_ttl_seconds))))
+                message_bus = RedisMessageBusAdapter(
+                    RedisStreamMessageBus(redis_client, tenant_id=resolved_settings.tenant_id)
+                )
+            except Exception as error:
+                if resolved_settings.environment in {"production", "prod", "staging"}:
+                    raise RuntimeError("configured Redis backend is unavailable") from error
         task_queue = BackgroundTaskQueue(
             repository=repository,
             cache=cache,
@@ -59,9 +82,52 @@ class BackendContainer:
             observability=observability,
         )
         try:
+            from market_agent.backend.memory_maintenance import MemoryMaintenanceScheduler
             from market_agent.backend.agent_service import register_agent_tasks
+            from market_agent.workflow_memory_lifecycle import LifecycleWorker
+            from market_agent.workflow_memory_sqlite import SQLiteMemoryRepository
 
-            container.agent_service = register_agent_tasks(task_queue)
+            memory_authority = object()
+            resolved_settings.memory_database_path.parent.mkdir(parents=True, exist_ok=True)
+            container.memory_repository = SQLiteMemoryRepository(
+                resolved_settings.memory_database_path, writer_authority=memory_authority)
+            container.memory_maintenance = MemoryMaintenanceScheduler(
+                LifecycleWorker(container.memory_repository), tenant_id=resolved_settings.tenant_id,
+                authority=memory_authority,
+                interval_seconds=resolved_settings.memory_maintenance_interval_seconds)
+            container.memory_maintenance.start()
+
+            if resolved_settings.postgres_dsn:
+                import psycopg
+                from market_agent.workflow_memory_postgres import PostgresMemoryRepository
+                from market_agent.workflow_semantic_cache_postgres import PostgresSemanticRequestCache
+
+                connection_factory = lambda: psycopg.connect(resolved_settings.postgres_dsn)
+                container.governed_memory_repository = PostgresMemoryRepository(
+                    connection_factory, embedding_dimension=resolved_settings.embedding_dimension,
+                    writer_authority=memory_authority)
+                container.governed_memory_repository.migrate()
+                container.semantic_response_cache = PostgresSemanticRequestCache(
+                    connection_factory, embedding_dimension=resolved_settings.embedding_dimension)
+                container.semantic_response_cache.migrate()
+
+            def application_factory():
+                from market_agent.workflow_production_application import ProductionWorkflowApplication
+
+                return ProductionWorkflowApplication.from_backend(
+                    settings=resolved_settings,
+                    memory_repository=(container.governed_memory_repository
+                                       or container.memory_repository),
+                    semantic_cache=container.semantic_response_cache,
+                    # Task 4 may replace this trace-bound host callback with
+                    # governed outcome/promotion persistence.
+                    completion_hook=lambda result: result.trace_id,
+                )
+
+            container.agent_service = register_agent_tasks(
+                task_queue,
+                application_factory=application_factory,
+            )
         except BaseException:
             container.shutdown()
             raise
@@ -72,13 +138,32 @@ class BackendContainer:
             database_status = "ok" if self.repository.healthcheck() else "failed"
         except Exception:
             database_status = "failed"
-        cache_stats = self.cache.stats()
-        self.metrics.set_gauge("market_agent_cache_entries", cache_stats.size)
-        self.metrics.set_gauge("market_agent_cache_hits_total", cache_stats.hits)
-        self.metrics.set_gauge("market_agent_cache_misses_total", cache_stats.misses)
+        cache_stats = getattr(self.cache, "stats", None)
+        if callable(cache_stats):
+            stats = cache_stats()
+            self.metrics.set_gauge("market_agent_cache_entries", stats.size)
+            self.metrics.set_gauge("market_agent_cache_hits_total", stats.hits)
+            self.metrics.set_gauge("market_agent_cache_misses_total", stats.misses)
+            cache_status = "ok"
+        else:
+            cache_health = getattr(self.cache, "health", lambda: None)()
+            cache_status = getattr(cache_health, "status", "failed")
         task_queue_status = "ok" if self.task_queue.is_healthy() else "failed"
-        return {"database": database_status, "task_queue": task_queue_status, "cache": "ok"}
+        bus_health = getattr(self.message_bus, "health", lambda: None)()
+        bus_status = getattr(bus_health, "status", "ok" if isinstance(self.message_bus, InMemoryMessageBus) else "failed")
+        components = {"database": database_status, "task_queue": task_queue_status,
+                      "cache": cache_status, "message_bus": bus_status}
+        if self.settings.postgres_dsn:
+            components["postgres"] = "ok" if self.governed_memory_repository is not None else "failed"
+        return components
 
     def shutdown(self) -> None:
         self.task_queue.shutdown(wait=True)
+        close_bus = getattr(self.message_bus, "close", None)
+        if callable(close_bus):
+            close_bus()
+        if self.memory_maintenance is not None:
+            self.memory_maintenance.close()
+        if self.memory_repository is not None:
+            self.memory_repository.close()
         self.repository.close()

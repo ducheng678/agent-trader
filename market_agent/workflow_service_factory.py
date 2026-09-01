@@ -24,6 +24,7 @@ from market_agent.workflow_contracts import (
     WorkflowResult,
 )
 from market_agent.workflow_graph import DecisionBuilder, DecisionVerifier, TechnicalSelector, WorkflowServices
+from market_agent.workflow_memory_retrieval import CoreExperienceSummary
 from market_agent.workflow_risk_gate import RiskPolicy
 
 
@@ -50,6 +51,9 @@ class CoordinatorRuntime:
     verify: DecisionVerifier
     recovery_contexts: RecoveryContextProvider | None = None
     finalize: ResultFinalizer | None = None
+    memory_context: CoreExperienceSummary | None = None
+    memory_tenant_id: str | None = None
+    memory_scope: str | None = None
     risk_policy: RiskPolicy = RiskPolicy()
 
     def services_for(self, request: WorkflowRequest) -> WorkflowServices:
@@ -74,6 +78,9 @@ class CoordinatorRuntime:
                 grants,
                 deadline_epoch=self.deadline_epoch,
                 authorize=self.authorize,
+                memory_context=self.memory_context,
+                memory_tenant_id=self.memory_tenant_id,
+                memory_scope=self.memory_scope,
             ))
 
         def remaining_after(state: WorkflowBudgetState, plan_value: CoordinatorPlan) -> WorkflowBudgetState:
@@ -111,6 +118,9 @@ class CoordinatorRuntime:
                     grants,
                     deadline_epoch=self.deadline_epoch,
                     authorize=self.authorize,
+                    memory_context=self.memory_context,
+                    memory_tenant_id=self.memory_tenant_id,
+                    memory_scope=self.memory_scope,
                 ))
 
                 replaced = set(directive.task_ids)

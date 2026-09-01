@@ -12,6 +12,7 @@ from market_agent.workflow_agent_contracts import StrictModel
 from market_agent.workflow_agent_driver import AgentDriver
 from market_agent.workflow_agents.common import checked_context, profile_for, run_node
 from market_agent.workflow_context_summary import ContextHandoff
+from market_agent.workflow_memory_retrieval import CoreExperienceSummary
 from market_agent.workflow_contracts import (
     Action, AgentReport, AgentTask, ContextSummary, CoordinatorPlan, DecisionDraft,
     InformationalAnswer, KnowledgeStatus, ModelTier, ReportStatus, RiskAssessment,
@@ -106,7 +107,10 @@ def bind_contexts(plan: CoordinatorPlan, contexts: Mapping[str, ContextSummary |
 
 def dispatch_tasks(plan: CoordinatorPlan, contexts: Mapping[str, ContextSummary | ContextHandoff],
                    driver: AgentDriver | Callable | None, grants: Mapping[str, object], *,
-                   deadline_epoch: float | None = None, authorize: Callable | None = None) -> tuple:
+                   deadline_epoch: float | None = None, authorize: Callable | None = None,
+                   memory_context: CoreExperienceSummary | None = None,
+                   memory_tenant_id: str | None = None,
+                   memory_scope: str | None = None) -> tuple:
     bound = bind_contexts(plan, contexts)
     specs = tuple(DispatchSpec(task, checked_context(task, contexts[task.task_id]), grants[task.task_id]) for task in bound.tasks)
     if any(spec.grant is None for spec in specs):
@@ -120,7 +124,10 @@ def dispatch_tasks(plan: CoordinatorPlan, contexts: Mapping[str, ContextSummary 
                 if deadline_epoch is None or authorize is None:
                     raise PermissionError("driver dispatch needs a deadline and host authorizer")
                 report = run_node(spec.task, spec.context, driver, deadline_epoch=deadline_epoch,
-                                  grant=spec.grant, authorize=authorize)
+                                  grant=spec.grant, authorize=authorize,
+                                  memory_context=memory_context,
+                                  memory_tenant_id=memory_tenant_id,
+                                  memory_scope=memory_scope)
             else:
                 report = driver(spec)
             report = AgentReport.model_validate(report)

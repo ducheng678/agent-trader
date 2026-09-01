@@ -22,6 +22,7 @@ PlanBuilder = Callable[[WorkflowRequest], CoordinatorPlan]
 TaskDispatcher = Callable[[CoordinatorPlan], tuple[AgentReport, ...]]
 RecoveryDispatcher = Callable[[CoordinatorPlan, tuple[AgentReport, ...]], tuple[CoordinatorPlan, tuple[AgentReport, ...]] | None]
 DecisionBuilder = Callable[[WorkflowRequest, CoordinatorPlan, tuple[AgentReport, ...]], DecisionDraft | None]
+DecisionVerifier = Callable[[WorkflowRequest, CoordinatorPlan, tuple[AgentReport, ...], DecisionDraft], DecisionDraft | None]
 TechnicalSelector = Callable[[tuple[AgentReport, ...]], TechnicalAnalysis | None]
 AuditFinalizer = Callable[[WorkflowResult], None]
 
@@ -32,6 +33,7 @@ class WorkflowServices:
     dispatch: TaskDispatcher
     decide: DecisionBuilder
     technical: TechnicalSelector
+    verify: DecisionVerifier | None = None
     recover: RecoveryDispatcher | None = None
     finalize: AuditFinalizer | None = None
     risk_policy: RiskPolicy = RiskPolicy()
@@ -129,6 +131,25 @@ def _decide(state: GraphState) -> dict[str, object]:
 
 
 def _route_after_decide(state: GraphState) -> str:
+    return "finalize" if "result" in state else "reflect"
+
+
+def _reflect(state: GraphState) -> dict[str, object]:
+    decision = state.get("decision")
+    verify = state["services"].verify
+    if decision is None or verify is None:
+        return _safe_failure(state, "core decision verification is unavailable")
+    try:
+        accepted = verify(state["request"], state["plan"], state["reports"], decision)
+        if accepted is None:
+            return _safe_failure(state, "core decision failed objective verification")
+        accepted = DecisionDraft.model_validate(accepted)
+        return {"decision": accepted}
+    except Exception:
+        return _safe_failure(state, "core decision verification is unavailable")
+
+
+def _route_after_reflect(state: GraphState) -> str:
     return "finalize" if "result" in state else "risk"
 
 
@@ -171,6 +192,7 @@ def build_workflow_graph():
     graph.add_node("dispatch", _dispatch)
     graph.add_node("recover", _recover)
     graph.add_node("decide", _decide)
+    graph.add_node("reflect", _reflect)
     graph.add_node("risk", _risk)
     graph.add_node("assemble", _assemble)
     graph.add_node("finalize", _finalize)
@@ -178,7 +200,8 @@ def build_workflow_graph():
     graph.add_conditional_edges("plan", _route_after_plan, {"dispatch": "dispatch", "finalize": "finalize"})
     graph.add_conditional_edges("dispatch", _route_after_dispatch, {"recover": "recover", "finalize": "finalize"})
     graph.add_conditional_edges("recover", _route_after_recover, {"decide": "decide", "finalize": "finalize"})
-    graph.add_conditional_edges("decide", _route_after_decide, {"risk": "risk", "finalize": "finalize"})
+    graph.add_conditional_edges("decide", _route_after_decide, {"reflect": "reflect", "finalize": "finalize"})
+    graph.add_conditional_edges("reflect", _route_after_reflect, {"risk": "risk", "finalize": "finalize"})
     graph.add_edge("risk", "assemble")
     graph.add_edge("assemble", "finalize")
     graph.add_edge("finalize", END)
