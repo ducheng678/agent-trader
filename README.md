@@ -242,3 +242,8 @@ In staging and production, the legacy `POST /v1/tasks/generate_playbook`
 compatibility route is disabled by default so it cannot bypass Harness control.
 Set `MARKET_AGENT_LEGACY_PLAYBOOK_API_ENABLED=true` only for a deliberately
 isolated compatibility deployment.
+
+Deployment code should construct the trusted `HarnessKernel` and then call
+`market_agent.backend.governed_app.create_governed_app(...)`. The normal
+`python -m market_agent.backend` launcher is a development/legacy launcher and
+does not fabricate the production signing authority.

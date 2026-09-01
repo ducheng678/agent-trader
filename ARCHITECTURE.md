@@ -72,6 +72,11 @@ is disabled by default in staging and production through
 `MARKET_AGENT_LEGACY_PLAYBOOK_API_ENABLED=false`, preventing an unaudited
 compatibility request from bypassing Harness control.
 
+Deployment imports `market_agent.backend.governed_app.create_governed_app` and
+passes the trusted kernel and optional host completion-evidence factory. The
+default command-line backend remains a development compatibility launcher; it
+never manufactures a signing authority from environment text.
+
 Every workflow request carries the middleware-generated W3C trace through the
 queue payload, Harness stream, coordinated agents, audit events, cache and memory
 operations. Idempotent API replays return the original run trace; requests without
