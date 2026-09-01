@@ -39,6 +39,11 @@ class AuthenticationError(BackendError):
     error_code = "authentication_error"
 
 
+class AuthorizationError(BackendError):
+    status_code = 403
+    error_code = "authorization_error"
+
+
 class DependencyUnavailableError(BackendError):
     status_code = 503
     error_code = "dependency_unavailable"

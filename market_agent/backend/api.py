@@ -34,6 +34,7 @@ from market_agent.backend.container import BackendContainer
 from market_agent.backend.database import JobRecord
 from market_agent.backend.errors import (
     AuthenticationError,
+    AuthorizationError,
     BackendError,
     DependencyUnavailableError,
     NotFoundError,
@@ -43,7 +44,7 @@ from market_agent.backend.observability import current_request_id, request_conte
 from market_agent.workflow_tracing import TraceContext, TraceId
 from market_agent.workflow_contracts import WorkflowRequest
 from market_agent.workflow_execution_backend import ExecutionRegistrationError
-from market_agent.workflow_harness import UnknownHarnessRunError
+from market_agent.workflow_harness import InvalidHarnessInputError, UnknownHarnessRunError
 from market_agent.workflow_harness_contracts import HarnessSessionView, RunState
 
 _logger = logging.getLogger("market_agent.backend.api")
@@ -217,6 +218,8 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             return kernel.snapshot(run_id)
         except UnknownHarnessRunError as error:
             raise NotFoundError("workflow run was not found") from error
+        except InvalidHarnessInputError as error:
+            raise ValidationError("workflow run identifier is invalid") from error
 
     def workflow_status(view: HarnessSessionView) -> WorkflowStatusResponse:
         return WorkflowStatusResponse(
@@ -327,6 +330,8 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             else "wf-" + uuid.uuid4().hex
         )
         payload = body.payload
+        if payload.tenant_id != resolved_container.settings.tenant_id:
+            raise AuthorizationError("workflow tenant does not match the configured host scope")
         workflow_request = WorkflowRequest(
             workflow_id=run_id, trace_id=trace_id, user_query=payload.user_query,
             event_tape=tuple(payload.event_tape), trigger_reason=payload.trigger_reason,
