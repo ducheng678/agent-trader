@@ -27,6 +27,7 @@ class BackendContainer:
     governed_memory_repository: Any = None
     semantic_response_cache: Any = None
     historical_answer_cache: Any = None
+    memory_authority: object | None = None
 
     def __post_init__(self) -> None:
         if self.observability is None:
@@ -89,6 +90,7 @@ class BackendContainer:
             from market_agent.workflow_memory_sqlite import SQLiteMemoryRepository
 
             memory_authority = object()
+            container.memory_authority = memory_authority
             resolved_settings.memory_database_path.parent.mkdir(parents=True, exist_ok=True)
             container.memory_repository = SQLiteMemoryRepository(
                 resolved_settings.memory_database_path, writer_authority=memory_authority)
@@ -127,6 +129,13 @@ class BackendContainer:
 
             def application_factory():
                 from market_agent.workflow_production_application import ProductionWorkflowApplication
+                from market_agent.workflow_memory_result_writer import MemoryResultWriter
+
+                result_writer = MemoryResultWriter(
+                    repository=(container.governed_memory_repository or container.memory_repository),
+                    authority=memory_authority,
+                    tenant_id=resolved_settings.tenant_id,
+                )
 
                 return ProductionWorkflowApplication.from_backend(
                     settings=resolved_settings,
@@ -134,9 +143,7 @@ class BackendContainer:
                                        or container.memory_repository),
                     semantic_cache=container.semantic_response_cache,
                     historical_answer_cache=container.historical_answer_cache,
-                    # Task 4 may replace this trace-bound host callback with
-                    # governed outcome/promotion persistence.
-                    completion_hook=lambda result: result.trace_id,
+                    completion_hook=result_writer.record,
                 )
 
             container.agent_service = register_agent_tasks(
