@@ -236,7 +236,32 @@ def test_driver_discards_memory_bound_output_when_summary_expires_in_completion_
                             memory_tenant_id="tenant-a", memory_scope="default")
 
     assert result.failure.code == "memory_context_expired"
-    assert [event.event_type for event in observer.events][-3:] == ["task_completed", "memory_expired", "task_failed"]
+    terminal = observer.events[-3:]
+    assert [event.event_type for event in terminal] == ["task_completed", "memory_expired", "task_failed"]
+    # The completion callback saw a candidate only, never an immutable success.
+    # Consumers can safely treat the final rejected/failed pair as terminal.
+    assert terminal[0].status == "accepted"
+    assert terminal[0].payload.outcome_code == "selected"
+    assert terminal[0].output_hash is None
+    assert terminal[1].status == "rejected"
+    assert terminal[2].status == "failed"
+    assert "final_decision" not in [event.event_type for event in observer.events]
+
+
+def test_driver_finalizes_memory_bound_success_only_after_candidate_completion_audit():
+    driver, observer, _ = make_driver(Client(response()))
+
+    result = driver.execute(invocation(), memory_context=memory_summary(),
+                            memory_tenant_id="tenant-a", memory_scope="default")
+
+    assert result.output == {"answer": "known"}
+    terminal = observer.events[-2:]
+    assert [event.event_type for event in terminal] == ["task_completed", "final_decision"]
+    assert terminal[0].status == "accepted"
+    assert terminal[0].payload.outcome_code == "selected"
+    assert terminal[0].output_hash is None
+    assert terminal[1].status == "completed"
+    assert terminal[1].payload.outcome_code == "succeeded"
 
 
 def test_driver_accepts_only_summary_as_dynamic_memory_after_stable_system_prefix():

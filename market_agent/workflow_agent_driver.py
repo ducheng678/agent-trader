@@ -254,12 +254,21 @@ class AgentDriver:
                         return self._fail(run, "verification_unavailable")
             if run.model_result_used_memory and self._memory_expired(run):
                 return self._discard_expired_memory_output(run)
-            self._emit(run, "task_completed", "completed", outcome="succeeded", output=result.output, usage=result.usage)
-            # Recording is synchronous but observers may consume time.  Never
-            # accept a model result conditioned on a summary that expired while
-            # its completion event was being committed.
-            if run.model_result_used_memory and self._memory_expired(run):
-                return self._discard_expired_memory_output(run)
+            if run.model_result_used_memory:
+                # A memory-bound result needs a two-stage terminal audit. The
+                # synchronous observer can consume time, so ``task_completed``
+                # is deliberately a non-successful candidate record until the
+                # summary is checked again. This keeps an immutable success
+                # event out of the trace if the bounded authority expires while
+                # the completion audit is being committed.
+                self._emit(run, "task_completed", "accepted", outcome="selected")
+                if self._memory_expired(run):
+                    return self._discard_expired_memory_output(run)
+                self._emit(run, "final_decision", "completed", outcome="succeeded", output=result.output,
+                           usage=result.usage)
+            else:
+                self._emit(run, "task_completed", "completed", outcome="succeeded", output=result.output,
+                           usage=result.usage)
             return result
         except _AuditFailure:
             return self._failure(invocation.trace_id, "audit_unavailable")
