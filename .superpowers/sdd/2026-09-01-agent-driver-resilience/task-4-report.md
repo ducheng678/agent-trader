@@ -38,3 +38,15 @@ Implemented the single bounded `AgentDriver.execute(invocation) -> AgentResult` 
 ## Commit
 
 `feat: compose auditable resilient agent driver`
+
+## Task 4 P2 review closure
+
+- Revalidated the injected clock after both exact and semantic cache adapters return, so the driver's TTL and semantic reuse gates use retrieval-completion time. An entry expiring at or before that time produces a rejected miss and continues to the model path.
+- Wrapped the pre-dispatch probe and prompt audit emissions so an audit failure records an acquired half-open probe as failed before propagating `audit_unavailable`. This reopens the circuit for its normal cooldown without calling the provider, retrying the failed observer, or admitting an extra probe.
+- Added slow real-cache adapter regressions for both cache types immediately before, exactly at, and after expiry. Added failures at both pre-dispatch audit events, asserting the typed audit failure, no provider dispatch, cooldown exclusion, single-probe admission, and successful recovery after cooldown.
+- RED: the focused regression run produced 6 expected failures and 2 valid-before-expiry passes; the failures reproduced expired cache replay and permanently acquired probes.
+- GREEN: the complete driver suite passed with 77 tests. The driver, circuit-breaker, exact-cache, and semantic-cache suites together passed with 147 tests.
+- `python -m compileall -q market_agent/workflow_agent_driver.py market_agent_test_bundle/tests/test_workflow_agent_driver.py` and `git diff --check` passed. Git emitted only the existing LF/CRLF conversion notices.
+- Scope remained the driver, its regression tests, and this report; no `.tmpbudget` files were read or changed.
+
+Closure commit: `fix: revalidate cache expiry and settle abandoned probes`

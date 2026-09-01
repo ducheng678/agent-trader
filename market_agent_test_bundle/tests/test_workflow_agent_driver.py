@@ -363,6 +363,90 @@ def test_audit_failure_stops_before_provider_call():
     assert client.requests == []
 
 
+@pytest.mark.parametrize("failure_event", ["circuit_probe", "prompt_composed"])
+def test_audit_failure_reopens_acquired_probe_and_allows_recovery_after_cooldown(failure_event):
+    """A pre-dispatch audit failure must not leak the only half-open probe."""
+    breaker = CircuitBreaker(failure_threshold=1, cooldown=1.0)
+    breaker.record("luna", "extract", False, 0.0)
+    clock = Clock()
+
+    class FailingObserver(Observer):
+        fail_at = failure_event
+
+        def record(self, event):
+            if event.event_type == "circuit_probe":
+                assert breaker.acquire("luna", "extract", clock.now()).kind == "reject"
+            if event.event_type == self.fail_at:
+                raise OSError("private audit failure")
+            super().record(event)
+
+    observer = FailingObserver()
+    client = Client(response())
+    driver, _, _ = make_driver(client, clock=clock, audit_observer=observer, circuit_breaker=breaker)
+
+    result = driver.execute(invocation())
+
+    assert result.failure.code == "audit_unavailable"
+    assert result.output is None
+    assert client.requests == []
+    assert breaker.acquire("luna", "extract", clock.now()).kind == "reject"
+    observer.fail_at = None
+    clock.time = 1.5
+    assert driver.execute(invocation()).origin == "abstention"
+    assert client.requests == []
+    clock.time = 2.0
+    recovered = driver.execute(invocation())
+    assert recovered.output == {"answer": "known"}
+    assert recovered.origin == "model"
+    assert len(client.requests) == 1
+    assert breaker.acquire("luna", "extract", clock.now()).kind == "allow"
+
+
+@pytest.mark.parametrize("origin", ["fixed_cache", "semantic_cache"])
+@pytest.mark.parametrize("returned_at", [49.9, 50.0, 51.0])
+def test_cache_expiry_is_rechecked_after_slow_adapter_returns(origin, returned_at):
+    """An entry valid when lookup starts may expire while the adapter retrieves it."""
+    clock = Clock()
+
+    class SlowExactCache(ExactResponseCache):
+        def get(self, key, metadata, *, now):
+            entry = super().get(key, metadata, now=now)
+            clock.time = returned_at
+            return entry
+
+    class SlowSemanticCache(SemanticRequestCache):
+        def lookup(self, query, metadata, now):
+            entry = super().lookup(query, metadata, now)
+            clock.time = returned_at
+            return entry
+
+    meta = metadata()
+    if origin == "fixed_cache":
+        cache = SlowExactCache()
+        request_hash = sha256(canonical_json(invocation().user_payload).encode()).hexdigest()
+        cache.put(ExactCacheKey.from_metadata(request_hash, meta), {"answer": "不知道"}, meta, now=0.0)
+        cache_options = {"exact_cache": cache}
+    else:
+        cache = SlowSemanticCache()
+        cache.put(SemanticCacheEntry("seed", (1.0, 0.0), {"answer": "不知道"}, meta, 0.0, "vector-v1", "luna-v1"))
+        cache_options = {"semantic_cache": cache}
+    client = Client(response())
+    driver, observer, _ = make_driver(client, clock=clock, cache_context=lambda inv: cache_request(meta), **cache_options)
+
+    result = driver.execute(invocation())
+
+    if returned_at < 50.0:
+        assert result.origin == origin
+        assert result.output == {"answer": "不知道"}
+        assert client.requests == []
+    else:
+        assert result.origin == "model"
+        assert result.output == {"answer": "known"}
+        assert len(client.requests) == 1
+        assert not any(event.event_type == origin + "_hit" for event in observer.events)
+        assert any(event.event_type == origin + "_miss" and event.status == "rejected" for event in observer.events)
+
+
 def test_driver_has_no_harness_persistence_execution_or_exchange_imports():
     """An authority-bearing import would let the driver bypass its scoped adapters."""
     import ast

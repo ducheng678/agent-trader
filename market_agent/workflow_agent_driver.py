@@ -243,6 +243,8 @@ class AgentDriver:
                     else:
                         entry = None if context.vector is None else cache.lookup(context.vector, context.metadata, now)
                     if entry is not None:
+                        # Retrieval may block beyond the TTL supplied to the adapter.
+                        now = self._clock.now()
                         if entry.metadata != context.metadata or entry.metadata.expires_at <= now or entry.created_at > now:
                             raise ValueError("cache hit has incompatible or expired metadata")
                         if origin == "fixed_cache" and entry.key != key:
@@ -316,16 +318,22 @@ class AgentDriver:
             if circuit.kind == "reject":
                 self._emit(run, "circuit_opened", "open", reason="circuit_open")
                 return None
-            if circuit.kind == "probe":
-                self._emit(run, "circuit_probe", "accepted")
-            request = ModelRequest(
-                trace_id=invocation.trace_id, model_tier=run.tier,
-                messages=(("system", system + _OUTPUT_INSTRUCTIONS), ("user", user)),
-                temperature=release.temperature_for(run.tier), output_schema_id=schema.schema_id,
-                output_schema_digest=schema.digest, output_schema_json=schema.json_schema,
-                deadline_epoch=invocation.deadline_epoch, attempt=run.attempts, cost_limit_usd=float(reservation),
-            )
-            self._emit(run, "prompt_composed", "dispatched")
+            try:
+                if circuit.kind == "probe":
+                    self._emit(run, "circuit_probe", "accepted")
+                request = ModelRequest(
+                    trace_id=invocation.trace_id, model_tier=run.tier,
+                    messages=(("system", system + _OUTPUT_INSTRUCTIONS), ("user", user)),
+                    temperature=release.temperature_for(run.tier), output_schema_id=schema.schema_id,
+                    output_schema_digest=schema.digest, output_schema_json=schema.json_schema,
+                    deadline_epoch=invocation.deadline_epoch, attempt=run.attempts, cost_limit_usd=float(reservation),
+                )
+                self._emit(run, "prompt_composed", "dispatched")
+            except _AuditFailure:
+                if circuit.kind == "probe":
+                    # Settle the abandoned probe without retrying the failed observer.
+                    self._breaker.record(run.tier.value, invocation.task_kind, False, self._clock.now())
+                raise
             if not self._can_call(run, reservation):
                 if circuit.kind == "probe":
                     self._record_circuit(run, success=False, probe=True)
