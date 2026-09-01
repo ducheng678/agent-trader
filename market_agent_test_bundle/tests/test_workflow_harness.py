@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from pydantic import ValidationError
@@ -34,13 +35,16 @@ from market_agent.workflow_execution_backend import (
     ExecutionRegistrationError,
     IssuerTrustDescriptor,
     RegistrationPreparation,
+    LangGraphExecutionBackend,
     canonical_plan_digest,
     canonical_transition_digest,
     canonical_view_digest,
 )
+import market_agent.workflow_execution_backend as execution_backend_module
 from market_agent.workflow_harness import HarnessDecision, HarnessKernel, RunHandle
 from market_agent.workflow_harness_contracts import (
     HarnessPlan,
+    HarnessSessionView,
     HarnessTransition,
     OutcomeKind,
     PinnedVersions,
@@ -299,8 +303,8 @@ class DeterministicClock:
 
 
 class DeterministicIds:
-    def __init__(self) -> None:
-        self._next = 0
+    def __init__(self, start: int = 0) -> None:
+        self._next = start
 
     def new(self, purpose: str) -> str:
         self._next += 1
@@ -662,6 +666,30 @@ def test_create_publishes_only_after_all_dependencies_are_ready(tmp_path):
     assert store.load("run-1") == ()
 
 
+def test_bad_issuer_is_rejected_before_create_publishes_any_event(tmp_path):
+    class TrustCheckingBackend(RecordingBackend):
+        def prepare_registration(self, plan, provisional_view, issuer_trust_descriptor):
+            if issuer_trust_descriptor.key_id != "test-host":
+                raise ExecutionRegistrationError("issuer not pinned")
+            return super().prepare_registration(
+                plan, provisional_view, issuer_trust_descriptor
+            )
+
+    class BadIssuer(StoreBackedIssuer):
+        def trust_descriptor(self):
+            return IssuerTrustDescriptor(
+                trust_version="test-trust-v1",
+                trust_config_digest=HASH,
+                key_id="attacker-host",
+            )
+
+    kernel, store, _, _ = _kernel(tmp_path, backend=TrustCheckingBackend())
+    kernel._receipt_issuer = BadIssuer(store)
+    with pytest.raises(ExecutionRegistrationError):
+        kernel.create(_request())
+    assert store.load("run-1") == ()
+
+
 def test_create_is_passive_and_returns_frozen_strict_handle(tmp_path):
     kernel, store, backend, _ = _kernel(tmp_path)
 
@@ -675,6 +703,92 @@ def test_create_is_passive_and_returns_frozen_strict_handle(tmp_path):
     assert backend.operations == ["prepare", "commit"]
     with pytest.raises(Exception):
         handle.run_id = "changed"
+
+
+def test_create_uses_exact_identified_provisional_fold(tmp_path):
+    class ExactProvisionalBackend(RecordingBackend):
+        def prepare_registration(self, plan, provisional_view, issuer_trust_descriptor):
+            assert provisional_view == HarnessSessionView(
+                run_id=plan.run_id,
+                trace_id=plan.trace_id,
+                plan_revision=plan.revision,
+            )
+            return super().prepare_registration(
+                plan, provisional_view, issuer_trust_descriptor
+            )
+
+    kernel, store, _, _ = _kernel(tmp_path, backend=ExactProvisionalBackend())
+    handle = kernel.create(_request())
+    assert handle.run_state is RunState.CREATED
+    assert len(store.load(handle.run_id)) == 1
+
+
+def test_real_langgraph_backend_accepts_valid_two_phase_create(tmp_path, monkeypatch):
+    from market_agent_test_bundle.tests.test_workflow_execution_backend import (
+        TrustedReceiptVerifier,
+        _generate_test_rsa_key,
+    )
+
+    modulus, exponent, private = _generate_test_rsa_key()
+    key_id = "test-host-rsa"
+    keys = {key_id: (modulus, exponent)}
+    digest = execution_backend_module._trust_config_digest(keys)
+    monkeypatch.setattr(execution_backend_module, "_PINNED_PUBLIC_KEYS", keys)
+    monkeypatch.setattr(
+        execution_backend_module, "_EXPECTED_TRUST_CONFIG_DIGEST", digest
+    )
+    signer = TrustedReceiptVerifier(
+        modulus=modulus, private_exponent=private, key_id=key_id
+    )
+    store = SQLiteHarnessEventStore(tmp_path / "real.sqlite", monotonic=lambda: 100.0)
+
+    class SignedIssuer(StoreBackedIssuer):
+        def trust_descriptor(self):
+            return IssuerTrustDescriptor(
+                trust_version=execution_backend_module._TRUST_VERSION,
+                trust_config_digest=digest,
+                key_id=key_id,
+            )
+
+        def _snapshot(self, plan, sequence=None):
+            unsigned = super()._snapshot(plan, sequence).model_copy(
+                update={"trust_key_id": key_id}
+            )
+            signed = signer.approve(unsigned)
+            self.snapshots[-1] = signed
+            return signed
+
+        def issue_transition_receipt(self, plan, transition, *, pre_sequence):
+            unsigned = CommittedTransitionReceipt(
+                pre=self._snapshot(plan, pre_sequence),
+                post=self._snapshot(plan),
+                transition_digest=canonical_transition_digest(transition),
+                trust_key_id=key_id,
+                signature=SIGNATURE,
+            )
+            receipt = signer.approve(unsigned)
+            self.receipts.append(receipt)
+            return receipt
+
+    kernel = HarnessKernel(
+        event_store=store,
+        state_machine=GlobalTaskStateMachine(),
+        plan_compiler=_compiler(),
+        pinned_versions=_pinned(),
+        loop_guard_factory=lambda: LoopGuard(
+            severity_policy=SeverityPolicy(policy_version="policy-v1")
+        ),
+        confidence_gate_factory=lambda plan: ConfidenceGate(),
+        budget_factory=lambda mode: WorkflowBudgetLedger(mode, clock=lambda: 100.0),
+        execution_backend=LangGraphExecutionBackend(),
+        receipt_issuer=SignedIssuer(store),
+        clock=DeterministicClock(),
+        identifiers=DeterministicIds(),
+    )
+    handle = kernel.create(_request())
+    assert handle.run_state is RunState.CREATED
+    assert handle.backend_synchronized is True
+    assert len(store.load(handle.run_id)) == 1
 
 
 def test_create_commit_failure_keeps_truth_but_rolls_back_and_does_not_return(tmp_path):
@@ -864,6 +978,41 @@ def test_cancel_unknown_order_records_intent_and_waits_for_reconciliation(tmp_pa
     assert sum(event.event_type == "cancellation_requested" for event in store.load(handle.run_id)) == 1
 
 
+def test_concurrent_cancellation_records_one_durable_intent(tmp_path):
+    kernel, store, backend, issuer = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    _append_waiting_reconciliation(store, handle.run_id)
+    second = HarnessKernel(
+        event_store=SQLiteHarnessEventStore(tmp_path / "harness.sqlite", monotonic=lambda: 100.0),
+        state_machine=GlobalTaskStateMachine(),
+        plan_compiler=_compiler(),
+        pinned_versions=_pinned(),
+        loop_guard_factory=lambda: LoopGuard(
+            severity_policy=SeverityPolicy(policy_version="policy-v1")
+        ),
+        confidence_gate_factory=lambda plan: ConfidenceGate(),
+        budget_factory=lambda mode: WorkflowBudgetLedger(mode, clock=lambda: 100.0),
+        execution_backend=backend,
+        receipt_issuer=issuer,
+        clock=DeterministicClock(),
+        identifiers=DeterministicIds(100),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        decisions = tuple(
+            pool.map(
+                lambda item: item.cancel(handle.run_id, "user_requested"),
+                (kernel, second),
+            )
+        )
+    assert all(item.run_state is RunState.WAITING_RECONCILIATION for item in decisions)
+    assert sum(
+        event.event_type == "cancellation_requested"
+        for event in store.load(handle.run_id)
+    ) == 1
+    assert backend.operations.count("cancel") == 0
+
+
 def test_cancel_waiting_approval_commits_legal_terminal_then_cancels_backend(tmp_path):
     kernel, store, backend, issuer = _kernel(tmp_path)
     handle = kernel.create(_request())
@@ -884,6 +1033,34 @@ def test_cancel_waiting_approval_commits_legal_terminal_then_cancels_backend(tmp
     assert duplicate.run_state is RunState.CANCELLED
     assert store.snapshot(handle.run_id).sequence == sequence
     assert backend.operations.count("cancel") == 1
+
+
+def test_cancelled_restart_does_not_cancel_backend_when_resume_fails(tmp_path):
+    kernel, store, backend, issuer = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    _append_waiting_approval(store, handle.run_id)
+    kernel.cancel(handle.run_id, "user_requested")
+    prior_cancels = backend.operations.count("cancel")
+    backend.fail_resume_number = backend.resume_count + 1
+    restarted = HarnessKernel(
+        event_store=store,
+        state_machine=GlobalTaskStateMachine(),
+        plan_compiler=_compiler(),
+        pinned_versions=_pinned(),
+        loop_guard_factory=lambda: LoopGuard(
+            severity_policy=SeverityPolicy(policy_version="policy-v1")
+        ),
+        confidence_gate_factory=lambda plan: ConfidenceGate(),
+        budget_factory=lambda mode: WorkflowBudgetLedger(mode, clock=lambda: 100.0),
+        execution_backend=backend,
+        receipt_issuer=issuer,
+        clock=DeterministicClock(),
+        identifiers=DeterministicIds(),
+    )
+    decision = restarted.cancel(handle.run_id, "user_requested")
+    assert decision.backend_synchronized is False
+    assert backend.operations.count("cancel") == prior_cancels
 
 
 def test_unpinned_confidence_fails_closed_to_no_trade_degradation(tmp_path):
@@ -1008,6 +1185,188 @@ def test_budget_reservation_is_settled_and_durably_projected(tmp_path):
         event for event in store.load(handle.run_id) if event.event_type == "transition_authorized"
     ]
     assert authority_events[-1].payload["budget_remaining_attempts"] == 9
+    assert authority_events[-1].payload["budget_remaining_tokens"] == 798
+
+
+def test_persisted_budget_projection_is_restart_authority_for_all_dimensions(tmp_path):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    plan = HarnessPlan.model_validate_json(store.load(handle.run_id)[0].payload["plan_json"])
+    view = store.snapshot(handle.run_id)
+    store.append(
+        HarnessEvent(
+            event_id="budget-baseline",
+            trace_id=plan.trace_id,
+            span_id="budget-span",
+            run_id=plan.run_id,
+            event_type="budget_projected",
+            occurred_at=NOW,
+            monotonic_offset=100.0,
+            actor="harness-kernel",
+            payload={
+                "budget_remaining_attempts": 1,
+                "budget_remaining_seconds": 100.0,
+                "budget_remaining_cost": "0.01",
+                "budget_remaining_tokens": 2,
+            },
+        ),
+        expected_sequence=view.sequence,
+        expected_state_revision=view.state_revision,
+    )
+    restarted, _, _, _ = _kernel(tmp_path)
+    restarted._identifiers = DeterministicIds(100)
+    decision = restarted.advance(handle.run_id)
+    authority = [
+        event for event in store.load(handle.run_id)
+        if event.event_type == "transition_authorized"
+    ][-1]
+    assert decision.reason_code != "budget_exhausted"
+    assert authority.payload["budget_remaining_attempts"] == 0
+    assert authority.payload["budget_remaining_tokens"] == 0
+    fresh = WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0)
+    assert restarted._budget_closed(tuple(store.load(handle.run_id)), plan, fresh.snapshot())
+
+
+@pytest.mark.parametrize(
+    ("dimension", "value"),
+    (
+        ("budget_remaining_attempts", 0),
+        ("budget_remaining_seconds", 0.0),
+        ("budget_remaining_cost", "0"),
+        ("budget_remaining_tokens", 0),
+    ),
+)
+def test_every_persisted_budget_dimension_is_a_pre_reserve_hard_gate(
+    tmp_path, dimension, value
+):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    plan = HarnessPlan.model_validate_json(store.load(handle.run_id)[0].payload["plan_json"])
+    view = store.snapshot(handle.run_id)
+    payload = {
+        "budget_remaining_attempts": 1,
+        "budget_remaining_seconds": 100.0,
+        "budget_remaining_cost": "0.01",
+        "budget_remaining_tokens": 2,
+    }
+    payload[dimension] = value
+    store.append(
+        HarnessEvent(
+            event_id="budget-hard-gate",
+            trace_id=plan.trace_id,
+            span_id="budget-hard-gate-span",
+            run_id=plan.run_id,
+            event_type="budget_projected",
+            occurred_at=NOW,
+            monotonic_offset=100.0,
+            actor="harness-kernel",
+            payload=payload,
+        ),
+        expected_sequence=view.sequence,
+        expected_state_revision=view.state_revision,
+    )
+    restarted, _, _, _ = _kernel(tmp_path)
+    restarted._identifiers = DeterministicIds(100)
+    decision = restarted.advance(handle.run_id)
+    assert decision.reason_code == "budget_exhausted"
+    assert decision.no_trade is True
+
+
+def test_same_revision_concurrent_advances_commit_only_one_policy_delta(tmp_path):
+    kernel, store, backend, issuer = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    second = HarnessKernel(
+        event_store=store,
+        state_machine=GlobalTaskStateMachine(),
+        plan_compiler=_compiler(),
+        pinned_versions=_pinned(),
+        loop_guard_factory=lambda: LoopGuard(
+            severity_policy=SeverityPolicy(policy_version="policy-v1")
+        ),
+        confidence_gate_factory=lambda plan: ConfidenceGate(),
+        budget_factory=lambda mode: WorkflowBudgetLedger(mode, clock=lambda: 100.0),
+        execution_backend=backend,
+        receipt_issuer=issuer,
+        clock=DeterministicClock(),
+        identifiers=DeterministicIds(),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(
+            pool.map(
+                lambda item: item.advance(
+                    handle.run_id,
+                    candidate={},
+                    expected_state_revision=handle.state_revision,
+                ),
+                (kernel, second),
+            )
+        )
+    assert sorted(result.reason_code for result in results) == [
+        "request_admitted",
+        "stale_revision",
+    ]
+    assert store.snapshot(handle.run_id).state_revision == handle.state_revision + 1
+    assert len(store.load(handle.run_id)) == 3
+
+
+def test_concurrent_running_advances_consume_one_durable_budget_delta(tmp_path):
+    kernel, store, backend, issuer = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    running = store.snapshot(handle.run_id)
+    second = HarnessKernel(
+        event_store=SQLiteHarnessEventStore(tmp_path / "harness.sqlite", monotonic=lambda: 100.0),
+        state_machine=GlobalTaskStateMachine(),
+        plan_compiler=_compiler(),
+        pinned_versions=_pinned(),
+        loop_guard_factory=lambda: LoopGuard(
+            severity_policy=SeverityPolicy(policy_version="policy-v1")
+        ),
+        confidence_gate_factory=lambda plan: ConfidenceGate(),
+        budget_factory=lambda mode: WorkflowBudgetLedger(mode, clock=lambda: 100.0),
+        execution_backend=backend,
+        receipt_issuer=issuer,
+        clock=DeterministicClock(),
+        identifiers=DeterministicIds(100),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        decisions = tuple(
+            pool.map(
+                lambda item: item.advance(
+                    handle.run_id,
+                    candidate={},
+                    expected_state_revision=running.state_revision,
+                ),
+                (kernel, second),
+            )
+        )
+    assert sum(item.reason_code == "stale_revision" for item in decisions) == 1
+    budget_authorities = [
+        event for event in store.load(handle.run_id)
+        if event.event_type == "transition_authorized"
+        and "budget_remaining_attempts" in event.payload
+    ]
+    assert len(budget_authorities) == 1
+    assert budget_authorities[0].payload["budget_remaining_attempts"] == 9
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    (
+        ({"run_state": RunState.DEGRADING, "no_trade": False}, "no-trade"),
+        ({"run_state": RunState.DEGRADED, "no_trade": False}, "no-trade"),
+        ({"run_state": RunState.WAITING_RECONCILIATION, "reconciliation_required": False}, "reconciliation"),
+        ({"reason_code": "completed", "run_state": RunState.DEGRADING, "no_trade": True}, "completed"),
+    ),
+)
+def test_decision_copy_enforces_bidirectional_state_invariants(tmp_path, update, message):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    decision = kernel.advance(handle.run_id, candidate={})
+    with pytest.raises(ValidationError, match=message):
+        decision.model_copy(update=update)
 
 
 def test_loop_action_result_history_is_replayed_before_policy_decision(tmp_path):
