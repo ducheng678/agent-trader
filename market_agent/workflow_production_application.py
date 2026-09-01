@@ -132,6 +132,7 @@ class ProductionWorkflowApplication:
         memory_repository: MemoryRepository | None,
         semantic_cache: SemanticRequestCache | None,
         historical_answer_cache: HistoricalAnswerCache | None = None,
+        prompt_release_manager: Any = None,
         completion_hook: CompletionHook,
     ) -> ProductionWorkflowApplication:
         checked = settings.validate()
@@ -142,6 +143,7 @@ class ProductionWorkflowApplication:
                 memory_repository=memory_repository,
                 semantic_cache=semantic_cache,
                 historical_answer_cache=historical_answer_cache,
+                prompt_release_manager=prompt_release_manager,
                 completion_hook=completion_hook,
             )
 
@@ -328,6 +330,7 @@ def _production_dependencies(
     memory_repository: MemoryRepository | None,
     semantic_cache: SemanticRequestCache | None,
     historical_answer_cache: HistoricalAnswerCache | None,
+    prompt_release_manager: Any | None,
     completion_hook: CompletionHook,
 ) -> ProductionDependencies:
     if not callable(completion_hook):
@@ -336,10 +339,8 @@ def _production_dependencies(
     if not api_key:
         raise ConfigurationError("OPENAI_API_KEY is required for the production workflow")
     repository_root = Path(__file__).resolve().parents[1]
-    prompt_manager = default_prompt_manager(
-        registry_path=settings.prompt_registry_path,
-        git_root=repository_root,
-    )
+    prompt_manager = prompt_release_manager or default_prompt_manager(
+        registry_path=settings.prompt_registry_path, git_root=repository_root)
     audit_writer = AuditWriter(AuditStore(settings.audit_database_path))
     exact_cache = ExactResponseCache()
     breaker = CircuitBreaker(failure_threshold=3, cooldown=30.0)

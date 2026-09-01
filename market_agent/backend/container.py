@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from market_agent.backend.cache import TTLCache
@@ -31,6 +32,7 @@ class BackendContainer:
     harness_kernel: Any = None
     harness_application: Any = None
     harness_completion_candidate_factory: Any = None
+    prompt_release_manager: Any = None
 
     def __post_init__(self) -> None:
         if self.harness_application is not None:
@@ -108,6 +110,7 @@ class BackendContainer:
             from market_agent.backend.agent_service import register_agent_tasks
             from market_agent.workflow_memory_lifecycle import LifecycleWorker
             from market_agent.workflow_memory_sqlite import SQLiteMemoryRepository
+            from market_agent.workflow_prompt_config import default_prompt_manager
 
             memory_authority = object()
             container.memory_authority = memory_authority
@@ -146,6 +149,10 @@ class BackendContainer:
                     "market_agent_maintenance_errors_total", labels={"event": event, "kind": type(error).__name__}),
             )
             container.memory_maintenance.start()
+            container.prompt_release_manager = default_prompt_manager(
+                registry_path=resolved_settings.prompt_registry_path,
+                git_root=Path(__file__).resolve().parents[2],
+            )
 
             def application_factory():
                 from market_agent.workflow_production_application import ProductionWorkflowApplication
@@ -163,6 +170,7 @@ class BackendContainer:
                                        or container.memory_repository),
                     semantic_cache=container.semantic_response_cache,
                     historical_answer_cache=container.historical_answer_cache,
+                    prompt_release_manager=container.prompt_release_manager,
                     completion_hook=result_writer.record,
                 )
 

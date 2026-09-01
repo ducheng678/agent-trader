@@ -70,6 +70,18 @@ class WorkflowEventListResponse(ApiModel):
     has_more: bool
 
 
+class PromptReleaseResponse(ApiModel):
+    release_id: str
+    release_digest: str
+    output_schema_hash: str
+    manifest_hash: str
+
+
+class PromptReleaseActivationResponse(PromptReleaseResponse):
+    action: str
+    previous_release_id: str | None
+
+
 class TaskAcceptedResponse(ApiModel):
     job_id: str
     status: str

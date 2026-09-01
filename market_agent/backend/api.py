@@ -27,6 +27,8 @@ from market_agent.backend.api_contracts import (
     WorkflowAcceptedResponse,
     WorkflowEventListResponse,
     WorkflowEventResponse,
+    PromptReleaseActivationResponse,
+    PromptReleaseResponse,
     WorkflowStatusResponse,
     WorkflowSubmissionRequest,
 )
@@ -213,6 +215,19 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             raise DependencyUnavailableError("Harness workflow application is not configured")
         return application
 
+    def require_prompt_manager() -> Any:
+        manager = getattr(resolved_container, "prompt_release_manager", None)
+        if manager is None:
+            raise DependencyUnavailableError("prompt release manager is not configured")
+        return manager
+
+    def prompt_release_response(manager: Any) -> PromptReleaseResponse:
+        pin = manager.current()
+        return PromptReleaseResponse(
+            release_id=pin.release_id, release_digest=pin.release_digest,
+            output_schema_hash=pin.output_schema_hash, manifest_hash=pin.manifest_hash,
+        )
+
     def workflow_view(kernel: Any, run_id: str) -> HarnessSessionView:
         try:
             return kernel.snapshot(run_id)
@@ -280,6 +295,26 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
         if status != "ok":
             response.status_code = 503
         return HealthResponse(status=status, components=components)
+
+    @app.get("/v1/prompt-releases/current", response_model=PromptReleaseResponse, tags=["prompts"])
+    def current_prompt_release(_: None = Depends(require_api_token)) -> PromptReleaseResponse:
+        return prompt_release_response(require_prompt_manager())
+
+    @app.post("/v1/prompt-releases/{release_id}:activate", response_model=PromptReleaseActivationResponse, tags=["prompts"])
+    def activate_prompt_release(release_id: str, _: None = Depends(require_api_token)) -> PromptReleaseActivationResponse:
+        manager = require_prompt_manager()
+        activation = manager.activate(release_id)
+        current = prompt_release_response(manager)
+        return PromptReleaseActivationResponse(**current.model_dump(), action=activation.action,
+                                               previous_release_id=activation.previous_release_id)
+
+    @app.post("/v1/prompt-releases:rollback", response_model=PromptReleaseActivationResponse, tags=["prompts"])
+    def rollback_prompt_release(_: None = Depends(require_api_token)) -> PromptReleaseActivationResponse:
+        manager = require_prompt_manager()
+        activation = manager.rollback_previous()
+        current = prompt_release_response(manager)
+        return PromptReleaseActivationResponse(**current.model_dump(), action=activation.action,
+                                               previous_release_id=activation.previous_release_id)
 
     @app.post(
         "/v1/tasks/{task_name}",
