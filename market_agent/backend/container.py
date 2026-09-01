@@ -163,6 +163,15 @@ class BackendContainer:
                     completion_hook=result_writer.record,
                 )
 
+            if container.harness_kernel is not None and container.harness_application is None:
+                from market_agent.workflow_harness_application import HarnessWorkflowApplication
+
+                production_application = application_factory()
+                container.harness_application = HarnessWorkflowApplication(
+                    kernel=container.harness_kernel,
+                    run_workflow=production_application.run_workflow,
+                )
+
             container.agent_service = register_agent_tasks(
                 task_queue,
                 application_factory=application_factory,

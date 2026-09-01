@@ -225,9 +225,9 @@ Supply the same `Idempotency-Key` to safely replay a submission. The response
 always returns the original run trace on a replay; requests without that key
 are intentionally independent runs.
 
-The API deliberately requires a deployment-owned `HarnessKernel` and a paired
-`HarnessWorkflowApplication`. Construct the container with
-`BackendContainer.create(harness_kernel=kernel, harness_application=application)`.
-The kernel's receipt issuer and signing capability must be provisioned by the
+The API deliberately requires a deployment-owned `HarnessKernel`. Construct
+the container with `BackendContainer.create(harness_kernel=kernel)`; it builds
+the paired `HarnessWorkflowApplication` around the production runner. The
+kernel's receipt issuer and signing capability must be provisioned by the
 trusted execution host; the HTTP service returns `503` rather than create an
-untrusted local replacement when either dependency is absent.
+untrusted local replacement when that authority is absent.

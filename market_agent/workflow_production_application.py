@@ -155,40 +155,18 @@ class ProductionWorkflowApplication:
                 self._dependencies = dependencies
             return self._dependencies
 
-    def get_playbook(
+    def run_workflow(
         self,
+        request: WorkflowRequest,
         *,
-        user_query: str,
-        event_tape: list[dict[str, Any]] | tuple[dict[str, Any], ...],
-        trigger_reason: str,
-        trigger_event: dict[str, Any] | None = None,
-        recent_events: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
-        trade_symbol_context: dict[str, Any] | None = None,
-        active_symbol: str | None = None,
-        has_live_position: bool = False,
-        prefetched_passive_event_judge: dict[str, Any] | None = None,
-        trace_id: str | None = None,
         tenant_id: str | None = None,
-    ) -> tuple[GenericPlaybook, str]:
+    ) -> WorkflowResult:
         dependencies = self._get_dependencies()
-        admitted_trace = _admit_trace_id(trace_id)
+        request = WorkflowRequest.model_validate(request)
+        admitted_trace = request.trace_id
         bound_tenant = _bind_tenant(tenant_id, dependencies.settings.tenant_id)
-        mode = (WorkflowMode.PASSIVE if trigger_reason == "passive_event_trigger"
+        mode = (WorkflowMode.PASSIVE if request.trigger_reason == "passive_event_trigger"
                 else WorkflowMode.ACTIVE)
-        workflow_id = "wf-" + admitted_trace
-        request = WorkflowRequest(
-            workflow_id=workflow_id,
-            trace_id=admitted_trace,
-            user_query=user_query,
-            event_tape=tuple(event_tape),
-            trigger_reason=trigger_reason,
-            trigger_event=trigger_event,
-            recent_events=tuple(recent_events or ()),
-            trade_symbol_context=trade_symbol_context,
-            active_symbol=active_symbol,
-            has_live_position=has_live_position,
-            prefetched_passive_event_judge=prefetched_passive_event_judge,
-        )
         started_at = dependencies.clock()
         mode_cap = 130.0 if mode is WorkflowMode.PASSIVE else 300.0
         deadline_epoch = started_at + min(
@@ -203,7 +181,7 @@ class ProductionWorkflowApplication:
             dependencies=dependencies,
         )
         if cached is not None:
-            return _generic_playbook(cached, request), _render_report(cached, mode, bound_tenant)
+            return cached
         records = _request_context_records(request, started_at)
         memory_scope = "default"
         memory = _retrieve_core_memory(
@@ -286,7 +264,7 @@ class ProductionWorkflowApplication:
             memory_scope=memory_scope if memory is not None else None,
         )
         result = dependencies.workflow_factory().invoke(request, runtime.services_for(request))
-        if result.trace_id != admitted_trace or result.workflow_id != workflow_id:
+        if result.trace_id != admitted_trace or result.workflow_id != request.workflow_id:
             raise RuntimeError("coordinated workflow returned a cross-trace result")
         if not dependencies.audit_writer.healthy:
             raise RuntimeError("required workflow audit is unavailable")
@@ -301,7 +279,43 @@ class ProductionWorkflowApplication:
             started_at=started_at,
             dependencies=dependencies,
         )
-        return _generic_playbook(result, request), _render_report(result, mode, bound_tenant)
+        return result
+
+    def get_playbook(
+        self,
+        *,
+        user_query: str,
+        event_tape: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        trigger_reason: str,
+        trigger_event: dict[str, Any] | None = None,
+        recent_events: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+        trade_symbol_context: dict[str, Any] | None = None,
+        active_symbol: str | None = None,
+        has_live_position: bool = False,
+        prefetched_passive_event_judge: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> tuple[GenericPlaybook, str]:
+        admitted_trace = _admit_trace_id(trace_id)
+        request = WorkflowRequest(
+            workflow_id="wf-" + admitted_trace,
+            trace_id=admitted_trace,
+            user_query=user_query,
+            event_tape=tuple(event_tape),
+            trigger_reason=trigger_reason,
+            trigger_event=trigger_event,
+            recent_events=tuple(recent_events or ()),
+            trade_symbol_context=trade_symbol_context,
+            active_symbol=active_symbol,
+            has_live_position=has_live_position,
+            prefetched_passive_event_judge=prefetched_passive_event_judge,
+        )
+        result = self.run_workflow(request, tenant_id=tenant_id)
+        dependencies = self._get_dependencies()
+        mode = (WorkflowMode.PASSIVE if trigger_reason == "passive_event_trigger"
+                else WorkflowMode.ACTIVE)
+        tenant = _bind_tenant(tenant_id, dependencies.settings.tenant_id)
+        return _generic_playbook(result, request), _render_report(result, mode, tenant)
 
 
 def _production_dependencies(
