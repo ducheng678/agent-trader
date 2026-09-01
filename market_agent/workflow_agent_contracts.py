@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Mapping, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
@@ -29,6 +29,14 @@ class StrictModel(BaseModel):
     )
     schema_version: Literal["v1"] = "v1"
 
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Copy through the validation boundary instead of trusting Pydantic's fast path."""
+
+        values = {field_name: getattr(self, field_name) for field_name in type(self).model_fields}
+        if update is not None:
+            values.update(update)
+        return type(self).model_validate(values)
+
 
 class ModelTier(str, Enum):
     LUNA = "luna"
@@ -38,6 +46,16 @@ class ModelTier(str, Enum):
 
 BoundedAttempts = Annotated[PositiveInt, Field(le=10)]
 BoundedCostUsd = Annotated[NonNegativeFinite, Field(le=10.0)]
+
+
+def thaw_json(value: object) -> object:
+    """Restore frozen request JSON to standard JSON containers for revalidation."""
+
+    if isinstance(value, dict):
+        return {key: thaw_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [thaw_json(item) for item in value]
+    return value
 
 
 class AgentInvocation(StrictModel):
@@ -63,7 +81,7 @@ class AgentInvocation(StrictModel):
     def require_json_object(cls, value: object) -> object:
         if not isinstance(value, dict):
             raise ValueError("user_payload must be a JSON object")
-        return value
+        return thaw_json(value)
 
     @model_validator(mode="after")
     def validate_attempt_limit(self) -> AgentInvocation:

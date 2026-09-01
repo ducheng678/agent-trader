@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from typing import Annotated
 
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, StrictFloat, ValidationError, model_validator
 
 from market_agent.workflow_agent_contracts import AgentInvocation, ModelTier, StrictModel
 from market_agent.workflow_contracts import Digest, ShortText
@@ -14,12 +15,33 @@ def canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
+Temperature = Annotated[StrictFloat, Field(ge=0.0, le=2.0)]
+
+
 class PromptRelease(StrictModel):
     release_id: ShortText
     digest: Digest
     stable_system_prefix: ShortText
     supported_task_kinds: tuple[ShortText, ...] = Field(min_length=1, max_length=32)
     supported_model_tiers: tuple[ModelTier, ...] = Field(min_length=1, max_length=3)
+    temperature_profile: tuple[tuple[ModelTier, Temperature], ...] = Field(min_length=1, max_length=3)
+
+    @model_validator(mode="after")
+    def validate_temperature_profile(self) -> PromptRelease:
+        temperatures = dict(self.temperature_profile)
+        if len(set(self.supported_model_tiers)) != len(self.supported_model_tiers):
+            raise ValueError("supported model tiers cannot repeat a model tier")
+        if len(temperatures) != len(self.temperature_profile):
+            raise ValueError("temperature profile cannot repeat a model tier")
+        if set(temperatures) != set(self.supported_model_tiers):
+            raise ValueError("temperature profile must cover exactly the supported model tiers")
+        return self
+
+    def temperature_for(self, tier: ModelTier) -> float:
+        for configured_tier, temperature in self.temperature_profile:
+            if configured_tier is tier:
+                return temperature
+        raise ValueError("model tier is not supported by prompt release")
 
 
 class PromptReleaseRegistry(StrictModel):
@@ -32,7 +54,8 @@ class PromptReleaseRegistry(StrictModel):
             raise ValueError("prompt release IDs must be unique")
         return self
 
-    def render(self, invocation: AgentInvocation) -> tuple[str, str]:
+    def select(self, invocation: AgentInvocation) -> PromptRelease:
+        invocation = AgentInvocation.model_validate(invocation)
         release = next((item for item in self.releases if item.release_id == invocation.prompt_release_id), None)
         if release is None:
             raise ValidationError.from_exception_data(
@@ -54,4 +77,9 @@ class PromptReleaseRegistry(StrictModel):
                 "PromptReleaseRegistry",
                 [{"type": "value_error", "loc": ("allowed_model_tier",), "input": invocation.allowed_model_tier, "ctx": {"error": ValueError("model tier is not supported by prompt release")}}],
             )
-        return release.stable_system_prefix, canonical_json(invocation.user_payload)
+        return release
+
+    def render(self, invocation: AgentInvocation) -> tuple[str, str]:
+        validated_invocation = AgentInvocation.model_validate(invocation)
+        release = self.select(validated_invocation)
+        return release.stable_system_prefix, canonical_json(validated_invocation.user_payload)

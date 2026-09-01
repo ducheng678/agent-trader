@@ -31,6 +31,7 @@ def make_release(**overrides: object) -> PromptRelease:
         "stable_system_prefix": "Return only the declared JSON object.",
         "supported_task_kinds": ("extract",),
         "supported_model_tiers": (ModelTier.LUNA,),
+        "temperature_profile": ((ModelTier.LUNA, 0.0),),
     }
     values.update(overrides)
     return PromptRelease(**values)
@@ -59,3 +60,36 @@ def test_render_rejects_a_model_tier_not_supported_by_the_release():
 
     with pytest.raises(ValidationError):
         registry.render(make_invocation(allowed_model_tier=ModelTier.TERRA))
+
+
+def test_render_revalidates_copied_payload_before_canonicalizing_it():
+    """A copied invocation must not retain a caller-owned mutable JSON object."""
+    registry = PromptReleaseRegistry(releases=(make_release(),))
+    payload = {"a": "original"}
+    copied = make_invocation().model_copy(update={"user_payload": payload})
+    payload["a"] = "tampered"
+
+    assert registry.render(copied)[1] == '{"a":"original"}'
+
+
+def test_prompt_release_exposes_a_temperature_for_each_supported_tier():
+    """Missing a tier temperature would leave a permitted driver call underspecified."""
+    release = make_release(
+        supported_model_tiers=(ModelTier.LUNA, ModelTier.TERRA),
+        temperature_profile=((ModelTier.LUNA, 0.0), (ModelTier.TERRA, 0.7)),
+    )
+    registry = PromptReleaseRegistry(releases=(release,))
+
+    assert registry.select(make_invocation()).temperature_for(ModelTier.LUNA) == 0.0
+    with pytest.raises(ValidationError):
+        make_release(
+            supported_model_tiers=(ModelTier.LUNA, ModelTier.TERRA),
+            temperature_profile=((ModelTier.LUNA, 0.0),),
+        )
+
+
+@pytest.mark.parametrize("temperature", [float("nan"), 2.1])
+def test_prompt_release_rejects_nonfinite_or_out_of_range_temperatures(temperature: float):
+    """An invalid temperature must not reach a model call through a release."""
+    with pytest.raises(ValidationError):
+        make_release(temperature_profile=((ModelTier.LUNA, temperature),))

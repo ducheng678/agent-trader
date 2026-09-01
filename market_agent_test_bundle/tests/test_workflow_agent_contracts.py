@@ -43,3 +43,18 @@ def test_invocation_and_result_are_immutable():
         invocation.trace_id = "trace-2"
     with pytest.raises(TypeError):
         result.output["answer"] = "changed"
+
+
+def test_model_copy_revalidates_invocation_and_result_updates():
+    """Bypassing validation through model_copy would permit unauditable data."""
+    invocation = AgentInvocation(trace_id="trace-1")
+    result = AgentResult(
+        trace_id="trace-1",
+        output={"answer": "known"},
+        usage=AgentUsage(input_tokens=1, output_tokens=1, cost_usd=0.01, model_tier=ModelTier.LUNA),
+    )
+
+    with pytest.raises(ValidationError):
+        invocation.model_copy(update={"max_attempts": 0})
+    with pytest.raises(ValidationError):
+        result.model_copy(update={"raw_text": "```json {} ```"})
