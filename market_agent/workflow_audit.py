@@ -278,6 +278,7 @@ class AuditReason(str, Enum):
     RISK_REJECTED = "risk_rejected"
     PROMPT_ROLLBACK = "prompt_rollback"
     EVALUATION_FAILURE = "evaluation_failure"
+    MEMORY_CONTEXT_EXPIRED = "memory_context_expired"
 
 
 _ACTORS = frozenset(item.value for item in AuditActor)

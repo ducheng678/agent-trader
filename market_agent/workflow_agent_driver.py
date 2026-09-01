@@ -155,6 +155,11 @@ class _Run:
     memory_hash: str | None = None
     memory_issued_at: float = 0.0
     memory_expires_at: float = 0.0
+    # This is true only for the successful provider response whose request
+    # actually included the dynamic summary.  A summary may be present on the
+    # run but omitted before dispatch after it expires, in which case its later
+    # expiry must not invalidate an independent, memory-free answer.
+    model_result_used_memory: bool = False
 
 
 class AgentDriver:
@@ -247,7 +252,14 @@ class AgentDriver:
                         self._verification_hook(result)
                     except Exception:
                         return self._fail(run, "verification_unavailable")
+            if run.model_result_used_memory and self._memory_expired(run):
+                return self._discard_expired_memory_output(run)
             self._emit(run, "task_completed", "completed", outcome="succeeded", output=result.output, usage=result.usage)
+            # Recording is synchronous but observers may consume time.  Never
+            # accept a model result conditioned on a summary that expired while
+            # its completion event was being committed.
+            if run.model_result_used_memory and self._memory_expired(run):
+                return self._discard_expired_memory_output(run)
             return result
         except _AuditFailure:
             return self._failure(invocation.trace_id, "audit_unavailable")
@@ -386,6 +398,7 @@ class AgentDriver:
             try:
                 if run.memory_context and not run.memory_issued_at <= self._clock.now() < run.memory_expires_at:
                     request = replace(request, messages=request.messages[:2])
+                memory_injected = len(request.messages) > 2
                 response = self._client.invoke(request)
             except Exception as error:
                 retryable = self._retry.is_retryable(error)
@@ -414,13 +427,33 @@ class AgentDriver:
                 return self._fail(run, "malformed_output")
             if self._clock.now() >= invocation.deadline_epoch:
                 return None
+            if memory_injected and self._memory_expired(run):
+                return self._discard_expired_memory_output(run)
             self._emit(run, "schema_validated", "passed", outcome="passed", output=output)
+            if memory_injected and self._memory_expired(run):
+                return self._discard_expired_memory_output(run)
+            run.model_result_used_memory = memory_injected
             return self._success(run, output, "model", usage)
 
     def _can_call(self, run: _Run, reservation: Decimal) -> bool:
         return (run.attempts < run.invocation.max_attempts
                 and self._clock.now() < run.invocation.deadline_epoch
                 and run.spent + reservation <= Decimal(str(run.invocation.cost_limit_usd)))
+
+    def _memory_expired(self, run: _Run) -> bool:
+        return bool(run.memory_context and not run.memory_issued_at <= self._clock.now() < run.memory_expires_at)
+
+    def _discard_expired_memory_output(self, run: _Run) -> AgentResult:
+        """Reject output whose prompt depended on an expired summary.
+
+        The provider may have completed successfully, but that does not make
+        the result safe to return once the bounded memory authority has ended.
+        Record the discard without the output, then leave a terminal failure
+        in the same trace so downstream callers cannot mistake it for a model
+        success.
+        """
+        self._emit(run, "memory_expired", "rejected", outcome="rejected", reason="memory_context_expired")
+        return self._fail(run, "memory_context_expired", reason="memory_context_expired")
 
     def _record_circuit(self, run: _Run, *, success: bool, probe: bool) -> None:
         self._breaker.record(run.tier.value, run.invocation.task_kind, success, self._clock.now())
@@ -437,8 +470,8 @@ class AgentDriver:
         return AgentResult(trace_id=trace_id, failure=AgentFailure(
             trace_id=trace_id, code=code, message="The bounded invocation did not produce a valid result.", retryable=False))
 
-    def _fail(self, run: _Run, code: str) -> AgentResult:
-        self._emit(run, "task_failed", "failed", reason="validation_error", outcome="failed")
+    def _fail(self, run: _Run, code: str, *, reason: str = "validation_error") -> AgentResult:
+        self._emit(run, "task_failed", "failed", reason=reason, outcome="failed")
         return self._failure(run.invocation.trace_id, code)
 
     def _emit(self, run: _Run, event_type: str, status: str, *, outcome: str = "selected",

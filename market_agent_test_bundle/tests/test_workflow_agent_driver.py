@@ -186,6 +186,59 @@ def test_driver_checks_memory_expiry_after_slow_prompt_audit():
     assert len(client.requests[0].messages) == 2
 
 
+def test_driver_discards_memory_bound_output_when_summary_expires_in_provider():
+    clock = Clock()
+
+    def expires_before_response(_):
+        clock.time = 50.0
+        return response()
+
+    client = Client(expires_before_response)
+    driver, observer, _ = make_driver(client, clock=clock)
+    result = driver.execute(invocation(), memory_context=memory_summary(),
+                            memory_tenant_id="tenant-a", memory_scope="default")
+
+    assert result.failure.code == "memory_context_expired"
+    assert len(client.requests[0].messages) == 3
+    assert [event.event_type for event in observer.events][-2:] == ["memory_expired", "task_failed"]
+    assert "schema_validated" not in [event.event_type for event in observer.events]
+
+
+def test_driver_discards_memory_bound_output_when_summary_expires_in_schema_audit():
+    clock = Clock()
+
+    class SlowObserver(Observer):
+        def record(self, event):
+            super().record(event)
+            if event.event_type == "schema_validated":
+                clock.time = 50.0
+
+    driver, observer, _ = make_driver(Client(response()), clock=clock, audit_observer=SlowObserver())
+    result = driver.execute(invocation(), memory_context=memory_summary(),
+                            memory_tenant_id="tenant-a", memory_scope="default")
+
+    assert result.failure.code == "memory_context_expired"
+    assert [event.event_type for event in observer.events][-2:] == ["memory_expired", "task_failed"]
+    assert "task_completed" not in [event.event_type for event in observer.events]
+
+
+def test_driver_discards_memory_bound_output_when_summary_expires_in_completion_audit():
+    clock = Clock()
+
+    class SlowObserver(Observer):
+        def record(self, event):
+            super().record(event)
+            if event.event_type == "task_completed":
+                clock.time = 50.0
+
+    driver, observer, _ = make_driver(Client(response()), clock=clock, audit_observer=SlowObserver())
+    result = driver.execute(invocation(), memory_context=memory_summary(),
+                            memory_tenant_id="tenant-a", memory_scope="default")
+
+    assert result.failure.code == "memory_context_expired"
+    assert [event.event_type for event in observer.events][-3:] == ["task_completed", "memory_expired", "task_failed"]
+
+
 def test_driver_accepts_only_summary_as_dynamic_memory_after_stable_system_prefix():
     client = Client(response(), response())
     driver, observer, _ = make_driver(client)
