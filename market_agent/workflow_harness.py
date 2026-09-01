@@ -57,7 +57,9 @@ from market_agent.workflow_harness_contracts import (
     HarnessSessionView,
     HarnessTransition,
     PinnedVersions,
+    RiskClass,
     RunState,
+    TaskKind,
     TransitionAuthorityRecord,
 )
 from market_agent.workflow_loop_guard import (
@@ -449,12 +451,11 @@ class HarnessKernel:
         plan = self._plan_compiler.compile(request, self._pinned_versions)
         plan = cast(HarnessPlan, _fresh_contract(plan, HarnessPlan))
         if (
-            plan.mode is not WorkflowMode.PASSIVE
-            or plan.allows_side_effects
+            plan.allows_side_effects
             or plan.run_id != request.workflow_id
             or plan.trace_id != request.trace_id
         ):
-            raise HarnessDependencyError("current request did not compile to passive no-trade")
+            raise HarnessDependencyError("compiled plan violates no-side-effect run binding")
 
         provisional = HarnessSessionView(
             run_id=plan.run_id,
@@ -778,8 +779,11 @@ class HarnessKernel:
             plan.pinned_versions.policy_version.encode("utf-8")
         ).hexdigest()
         gates = context.hard_gates
+        expected_request_class = (
+            "informational" if plan.risk_class is RiskClass.INFORMATIONAL else "trading"
+        )
         return (
-            context.request_class == "informational"
+            context.request_class == expected_request_class
             and gates.run_id == plan.run_id
             and gates.trace_hash
             == sha256(plan.trace_id.encode("utf-8")).hexdigest()
@@ -862,9 +866,10 @@ class HarnessKernel:
             }
         before = budget
         try:
+            policy = self._execution_policy_for(plan)
             reservation = ledger.reserve(
-                node_name="event_filter",
-                model="gpt-5.6-luna",
+                node_name=policy.node_name,
+                model=policy.tiers[0].model,
                 band="short",
                 usage=usage,
             )
@@ -1475,9 +1480,9 @@ class HarnessKernel:
         attempts, seconds, cost, tokens = HarnessKernel._budget_state(
             events, plan, snapshot
         )
-        policy = policy_for("event_filter")
+        policy = HarnessKernel._execution_policy_for(plan)
         required_cost = estimate_workflow_usage_cost(
-            "gpt-5.6-luna", "short", usage
+            policy.tiers[0].model, "short", usage
         )
         required_tokens = (
             usage.input_tokens + usage.cache_write_tokens + usage.output_tokens
@@ -1488,6 +1493,15 @@ class HarnessKernel:
             and cost >= required_cost
             and tokens >= required_tokens
         )
+
+    @staticmethod
+    def _execution_policy_for(plan: HarnessPlan):
+        """Bind reservations to the immutable admitted task, never model output."""
+        node_name = "event_filter" if plan.task_kind is TaskKind.INFORMATIONAL else plan.task_kind.value
+        try:
+            return policy_for(node_name)
+        except Exception as error:
+            raise HarnessDependencyError("plan has no declared execution policy") from error
 
     def _commit_run_transition(
         self,

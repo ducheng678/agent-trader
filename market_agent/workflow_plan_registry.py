@@ -201,9 +201,17 @@ class PlanCompiler:
 
 
 def _admit(request: WorkflowRequest) -> tuple[WorkflowMode, TaskKind, RiskClass]:
-    """Fail closed until ingress carries independently trusted typed intent."""
+    """Select a declared plan from one trusted, normalized ingress field.
 
-    return WorkflowMode.PASSIVE, TaskKind.INFORMATIONAL, RiskClass.INFORMATIONAL
+    User prose, model labels and source payload contents are deliberately not
+    inputs to admission.  They can become bounded evidence later, but cannot
+    choose a plan, worker, route, permission or side-effect capability.
+    """
+
+    request = WorkflowRequest.model_validate(request)
+    if request.trigger_reason == "passive_event_trigger":
+        return WorkflowMode.PASSIVE, TaskKind.INFORMATIONAL, RiskClass.INFORMATIONAL
+    return WorkflowMode.ACTIVE, TaskKind.DECISION_PLANNER, RiskClass.TRADING
 
 
 def _revalidate_template(template: PlanTemplate) -> PlanTemplate:

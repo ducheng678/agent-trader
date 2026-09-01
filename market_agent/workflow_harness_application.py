@@ -1,0 +1,90 @@
+"""Host-owned bridge from a committed Harness run to the coordinated workflow.
+
+The bridge deliberately has no model-output parser.  Harness transitions are
+advanced by fixed host policy; workflow output is only returned as data for a
+later host validator/renderer and never chooses an edge.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from market_agent.workflow_contracts import WorkflowRequest, WorkflowResult
+from market_agent.workflow_harness import HarnessDecision, HarnessKernel, RunHandle
+from market_agent.workflow_harness_contracts import HarnessSessionView, RunState
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessWorkflowExecution:
+    """One immutable record of a host-orchestrated workflow attempt."""
+
+    handle: RunHandle
+    view: HarnessSessionView
+    decisions: tuple[HarnessDecision, ...]
+    workflow_result: WorkflowResult | None
+    workflow_error: str | None
+
+    @property
+    def safe(self) -> bool:
+        return self.view.run_state in {RunState.SUCCEEDED, RunState.DEGRADED}
+
+
+WorkflowRunner = Callable[[WorkflowRequest], WorkflowResult]
+
+
+class HarnessWorkflowApplication:
+    """Invoke a supplied workflow only after Harness reaches RUNNING.
+
+    Until a host confidence/evidence adapter supplies a signed candidate, the
+    kernel's existing fail-closed confidence policy deliberately settles every
+    completed callback through DEGRADED/no-trade.  This makes the bridge safe
+    to deploy before richer evidence adapters are enabled.
+    """
+
+    def __init__(self, *, kernel: HarnessKernel, run_workflow: WorkflowRunner) -> None:
+        if type(kernel) is not HarnessKernel or not callable(run_workflow):
+            raise TypeError("Harness application requires a kernel and host workflow runner")
+        self._kernel = kernel
+        self._run_workflow = run_workflow
+
+    def execute(self, request: WorkflowRequest) -> HarnessWorkflowExecution:
+        request = WorkflowRequest.model_validate(request)
+        handle = self._kernel.create(request)
+        decisions: list[HarnessDecision] = []
+        view = self._kernel.snapshot(handle.run_id)
+        for _ in range(4):
+            if view.run_state is RunState.RUNNING:
+                break
+            decision = self._kernel.advance(handle.run_id, expected_state_revision=view.state_revision)
+            decisions.append(decision)
+            view = self._kernel.snapshot(handle.run_id)
+
+        result: WorkflowResult | None = None
+        error: str | None = None
+        if view.run_state is RunState.RUNNING:
+            try:
+                candidate = self._run_workflow(request)
+                candidate = WorkflowResult.model_validate(candidate)
+                if (candidate.workflow_id, candidate.trace_id) != (request.workflow_id, request.trace_id):
+                    raise ValueError("workflow result identity does not match Harness run")
+                result = candidate
+            except Exception as exc:  # Host error is recorded by deterministic degradation below.
+                error = type(exc).__name__
+            # No candidate is derived from model output.  The kernel therefore
+            # applies its signed confidence policy and degrades safely if a
+            # production evidence adapter has not authorized completion.
+            for _ in range(3):
+                view = self._kernel.snapshot(handle.run_id)
+                if view.run_state in {RunState.SUCCEEDED, RunState.DEGRADED, RunState.FAILED, RunState.CANCELLED}:
+                    break
+                decision = self._kernel.advance(handle.run_id, expected_state_revision=view.state_revision)
+                decisions.append(decision)
+        view = self._kernel.snapshot(handle.run_id)
+        return HarnessWorkflowExecution(
+            handle=handle,
+            view=view,
+            decisions=tuple(decisions),
+            workflow_result=result,
+            workflow_error=error,
+        )
