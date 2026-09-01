@@ -137,6 +137,129 @@ def cache_request(meta=None):
     return api().CacheRequest(metadata=meta or metadata(), vector=(1.0, 0.0))
 
 
+def memory_summary(**changes):
+    from market_agent.workflow_memory_retrieval import CoreExperienceSummary, SummaryItem
+    values = dict(tenant_id="tenant-a", scope="default", conflict_state="clear", confidence=0.8,
+                  selected_ids=("rule-1",), evidence_ids=("event-1", "event-2"),
+                  rules=(SummaryItem(record_id="rule-1", text="Check cited observations before entry.",
+                                     evidence_ids=("event-1", "event-2")),))
+    values.update(changes)
+    return CoreExperienceSummary(**values)
+
+
+def test_driver_accepts_only_summary_as_dynamic_memory_after_stable_system_prefix():
+    client = Client(response(), response())
+    driver, observer, _ = make_driver(client)
+    driver.execute(invocation())
+    summary = memory_summary()
+    result = driver.execute(invocation(), memory_context=summary, memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.output == {"answer": "known"}
+    baseline, enriched = client.requests
+    assert enriched.messages[0] == baseline.messages[0]
+    assert enriched.messages[1] == baseline.messages[1]
+    assert enriched.messages[2][0] == "user"
+    dynamic = json.loads(enriched.messages[2][1])
+    assert dynamic["trust"] == "untrusted_memory"
+    assert dynamic["evidence_ids"] == ["event-1", "event-2"]
+    assert dynamic["summary_hash"] == summary.summary_hash
+    assert "Check cited observations" not in json.dumps([entry.model_dump(mode="json") for entry in observer.events])
+
+
+@pytest.mark.parametrize("value", ["raw memory", {"rule": "raw rule"}, object()])
+def test_driver_rejects_raw_memory_context_before_model_call(value):
+    client = Client(response())
+    driver, _, _ = make_driver(client)
+    result = driver.execute(invocation(), memory_context=value, memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.failure.code == "invalid_memory_context"
+    assert client.requests == []
+
+
+@pytest.mark.parametrize("binding", [{}, {"memory_tenant_id": "tenant-b", "memory_scope": "default"},
+                                     {"memory_tenant_id": "tenant-a", "memory_scope": "private"}])
+def test_driver_requires_explicit_matching_tenant_and_scope_for_memory(binding):
+    client = Client(response())
+    driver, _, _ = make_driver(client)
+    result = driver.execute(invocation(), memory_context=memory_summary(), **binding)
+    assert result.failure.code == "invalid_memory_context"
+    assert client.requests == []
+
+
+@pytest.mark.parametrize("state", ["no_memory", "failed", "conflict"])
+def test_driver_unsafe_memory_injects_nothing_and_fallback_abstains(state):
+    client = Client()
+    driver, observer, _ = make_driver(client)
+    summary = memory_summary(conflict_state=state, rules=(), confidence=0.0)
+    result = driver.execute(invocation(cost_limit_usd=0.0), memory_context=summary,
+                            memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.output == {"answer": "不知道"}
+    assert result.origin == "abstention"
+    assert client.requests == []
+    assert observer.events[-1].event_type == "task_completed"
+
+
+def test_memory_context_cannot_reuse_a_response_cache_without_memory_binding():
+    approved = {schema().digest: {"fixed", "semantic"}}
+    exact = ExactResponseCache(safe_answers=approved)
+    key = ExactCacheKey.from_metadata(sha256(canonical_json(invocation().user_payload).encode()).hexdigest(), metadata())
+    exact.put(key, {"answer": "fixed"}, metadata(), now=0.0)
+    semantic = SemanticRequestCache(safe_answers=approved)
+    semantic.put(SemanticCacheEntry("seed", (1.0, 0.0), {"answer": "semantic"}, metadata(), 0.0, "vector-v1", "luna-v1"))
+    client = Client(response())
+    driver, _, _ = make_driver(client, exact_cache=exact, semantic_cache=semantic,
+                               cache_context=lambda inv: cache_request(), safe_answers=approved)
+    result = driver.execute(invocation(), memory_context=memory_summary(), memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.origin == "model" and len(client.requests) == 1
+
+
+def test_driver_import_and_summary_execution_need_no_memory_storage_or_writer_modules():
+    import subprocess
+    import sys
+    # A fresh interpreter catches direct and transitive imports, even when the
+    # main test process already loaded storage for unrelated integration cases.
+    script = '''
+import importlib.abc
+import sys
+class DenyStorage(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {"market_agent.workflow_memory_sqlite", "market_agent.workflow_memory_lifecycle",
+                        "market_agent.workflow_memory_promotion", "market_agent.workflow_object_store"}:
+            raise AssertionError("driver imported memory writer: " + fullname)
+sys.meta_path.insert(0, DenyStorage())
+from market_agent.workflow_agent_driver import AgentDriver
+from market_agent.workflow_memory_retrieval import CoreExperienceSummary
+assert AgentDriver is not None
+assert CoreExperienceSummary(tenant_id="tenant-a", scope="default", conflict_state="no_memory").as_dynamic_context() == ""
+'''
+    result = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("changes", [{"confidence": 0.1}, {"freshness_seconds": 100000},
+    {"rules": ()}, {"contradicting_evidence_ids": ("contradiction",)}])
+def test_driver_omits_weak_stale_or_conflicting_summary_even_if_labeled_clear(changes):
+    client = Client(response())
+    driver, _, _ = make_driver(client)
+    result = driver.execute(invocation(), memory_context=memory_summary(**changes),
+                             memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.output == {"answer": "known"}
+    assert len(client.requests[0].messages) == 2
+
+
+def test_driver_enforces_memory_budget_and_summary_hash_before_dispatch():
+    from market_agent.workflow_memory_retrieval import CoreExperienceSummary, SummaryItem
+    large = memory_summary(rules=(SummaryItem(record_id="rule-1", text="观" * 3000,
+                                               evidence_ids=("event-1", "event-2")),))
+    client = Client(response())
+    driver, _, _ = make_driver(client)
+    result = driver.execute(invocation(), memory_context=large, memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.output == {"answer": "known"}
+    assert len(client.requests[0].messages) == 2
+    forged = CoreExperienceSummary.model_construct(**dict(memory_summary().model_dump(), summary_hash="0" * 64))
+    result = driver.execute(invocation(), memory_context=forged, memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.failure.code == "invalid_memory_context"
+    assert len(client.requests) == 1
+
+
 def test_driver_prefers_safe_semantic_cache_and_preserves_trace():
     """Calling the provider before a valid semantic hit breaks the ordered flow."""
     approved = {schema().digest: {"stable"}}
@@ -496,6 +619,9 @@ def test_driver_has_no_harness_persistence_execution_or_exchange_imports():
         if isinstance(node, ast.Import):
             imported.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
+            if node.module == "market_agent.workflow_memory_retrieval":
+                assert [alias.name for alias in node.names] == ["CoreExperienceSummary"]
+                continue
             imported.append(node.module or "")
     assert not [name for name in imported if any(part in name for part in forbidden)]
 

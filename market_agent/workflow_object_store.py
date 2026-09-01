@@ -33,6 +33,11 @@ class FileArtifactStore:
                     sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL,
                     PRIMARY KEY(tenant_id, key_digest)
                 );
+                CREATE TABLE IF NOT EXISTS artifact_deletion_audit (
+                    tenant_id TEXT NOT NULL, sha256 TEXT NOT NULL, key_digest TEXT NOT NULL,
+                    trace_id TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                    PRIMARY KEY(tenant_id, sha256), UNIQUE(tenant_id, key_digest)
+                );
             """)
 
     def _path(self, reference: ArtifactReference) -> Path:
@@ -47,6 +52,9 @@ class FileArtifactStore:
         key_digest = hashlib.sha256(ctx.idempotency_key.encode()).hexdigest()
         with closing(sqlite3.connect(self._manifest, timeout=30)) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM artifact_deletion_audit WHERE tenant_id=? AND sha256=?",
+                           (ctx.tenant_id, ref.sha256)).fetchone():
+                raise MemoryConflictError("deleted artifact content cannot be resurrected by put replay")
             replay = db.execute("SELECT trace_id,sha256,size_bytes FROM artifact_audit WHERE tenant_id=? AND key_digest=?",
                                 (ctx.tenant_id, key_digest)).fetchone()
             if replay is not None:
@@ -94,6 +102,36 @@ class FileArtifactStore:
         if row[0] != reference.size_bytes or len(data) != reference.size_bytes or hashlib.sha256(data).hexdigest() != reference.sha256:
             raise MemoryIntegrityError("artifact checksum mismatch")
         return data
+
+    def delete(self, reference: ArtifactReference, **context: Unpack[WriteArguments]) -> None:
+        """Idempotent derivative removal; the repository checks live references.
+
+        Delete intent commits before unlink so a crash cannot permit a new put
+        to resurrect the address. Replays finish a previously interrupted unlink.
+        """
+        ctx = validate_authority(self._authority, **context)
+        reference = ArtifactReference.model_validate(reference)
+        if reference.tenant_id != ctx.tenant_id:
+            raise MemoryAuthorityError("artifact deletion must share tenant scope")
+        key = hashlib.sha256(ctx.idempotency_key.encode()).hexdigest()
+        with closing(sqlite3.connect(self._manifest, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute("SELECT sha256,trace_id,size_bytes FROM artifact_deletion_audit WHERE tenant_id=? AND key_digest=?",
+                                (ctx.tenant_id, key)).fetchone()
+            if prior is not None and prior != (reference.sha256, ctx.trace_id, reference.size_bytes):
+                raise MemoryConflictError("artifact cleanup idempotency key is already bound")
+            other = db.execute("SELECT key_digest,trace_id,size_bytes FROM artifact_deletion_audit WHERE tenant_id=? AND sha256=?",
+                                (ctx.tenant_id, reference.sha256)).fetchone()
+            if other is not None and other != (key, ctx.trace_id, reference.size_bytes):
+                raise MemoryConflictError("artifact cleanup is already owned by another task")
+            db.execute("INSERT OR IGNORE INTO artifact_deletion_audit VALUES(?,?,?,?,?)",
+                        (ctx.tenant_id, reference.sha256, key, ctx.trace_id, reference.size_bytes))
+            db.execute("DELETE FROM artifacts WHERE tenant_id=? AND sha256=?", (ctx.tenant_id, reference.sha256))
+        target = self._path(reference)
+        root = self.root.resolve()
+        if not target.resolve().is_relative_to(root):
+            raise MemoryIntegrityError("artifact path escapes the configured store")
+        target.unlink(missing_ok=True)
 
 
 __all__ = ["ArtifactStore", "FileArtifactStore"]
