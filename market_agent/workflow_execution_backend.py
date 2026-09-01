@@ -524,14 +524,8 @@ def canonical_authority_signing_bytes(
         raise UnverifiedExecutionReceiptError(
             "only exact execution authority contracts can be signed"
         )
-    exclusions = {"signature"}
-    if type(fresh) is CommittedExecutionSnapshot:
-        # The folded view is host-local replay material.  Its digest is signed
-        # with the snapshot, while omitting the full view lets an audit event
-        # retain the public receipt without persisting lease/fencing metadata.
-        exclusions.add("folded_view")
     return json.dumps(
-        fresh.model_dump(mode="json", exclude=exclusions),
+        fresh.model_dump(mode="json", exclude={"signature"}),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

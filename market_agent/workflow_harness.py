@@ -1351,8 +1351,23 @@ class HarnessKernel:
             cast(str, projection["budget_delta_cost"])
         ):
             raise HarnessDependencyError("budget settlement cost is inconsistent")
+        receipt_json = evidence.get("host_receipt")
+        if (
+            type(receipt_json) is not str
+            or not receipt_json
+            or len(receipt_json) > 262_144
+        ):
+            raise HarnessDependencyError("budget settlement receipt is invalid")
         try:
-            pre = CommittedExecutionSnapshot.model_validate(evidence.get("host_receipt"))
+            receipt_value = json.loads(receipt_json)
+            if (
+                json.dumps(
+                    receipt_value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                )
+                != receipt_json
+            ):
+                raise ValueError("receipt JSON is noncanonical")
+            pre = CommittedExecutionSnapshot.model_validate_json(receipt_json)
         except Exception as error:
             raise HarnessDependencyError("budget settlement receipt is invalid") from error
         if not verify_committed_execution_snapshot(pre):
@@ -1577,8 +1592,14 @@ class HarnessKernel:
                 "settlement": settlement,
                 "settlement_event_hash": authority_view.last_event_hash,
                 "settlement_event_sequence": authority_view.sequence,
-                "host_receipt": host_receipt.model_dump(
-                    mode="json", exclude={"folded_view"}
+                # Keep the full signed snapshot as canonical JSON text. Event
+                # payloads freeze nested sequences as tuples, so a mapping
+                # would no longer satisfy the JSON-only payload contract.
+                "host_receipt": json.dumps(
+                    host_receipt.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
                 ),
             }
             event_payload = {

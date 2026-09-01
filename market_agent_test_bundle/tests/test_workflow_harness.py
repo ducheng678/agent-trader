@@ -5,6 +5,7 @@ from decimal import Decimal
 from hashlib import sha256
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import json
 
 import pytest
 from pydantic import ValidationError
@@ -1498,9 +1499,11 @@ def test_budget_settlement_receipt_tampering_fails_before_backend(
     )
     payload = dict(authority.payload)
     evidence = dict(payload["budget_settlement_evidence"])
-    receipt = dict(evidence["host_receipt"])
+    receipt = json.loads(evidence["host_receipt"])
     mutate_receipt(receipt)
-    evidence["host_receipt"] = receipt
+    evidence["host_receipt"] = json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
     unsigned = {key: value for key, value in evidence.items() if key != "binding_digest"}
     evidence["binding_digest"] = HarnessKernel._canonical_digest(unsigned)
     payload["budget_settlement_evidence"] = evidence

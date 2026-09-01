@@ -336,6 +336,12 @@ def test_public_snapshot_verifier_accepts_only_exact_pinned_authority(
     assert verify_committed_execution_snapshot(
         snapshot.model_copy(update={"trust_key_id": "untrusted-host"})
     ) is False
+    forged_view = snapshot.folded_view.model_copy(
+        update={"last_event_hash": "0" * 64}
+    )
+    assert verify_committed_execution_snapshot(
+        snapshot.model_copy(update={"folded_view": forged_view})
+    ) is False
     assert verify_committed_execution_snapshot(None) is False
 
 
