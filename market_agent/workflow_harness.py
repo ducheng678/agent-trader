@@ -662,7 +662,7 @@ class HarnessKernel:
                 "cancellation_completed",
                 backend_synchronized=True,
             )
-        if recorded.run_state is RunState.WAITING_APPROVAL:
+        if recorded.run_state not in _TERMINAL_STATES:
             self._ensure_runtime_dependencies(plan)
             snapshot = self._issued_snapshot(plan, recorded)
             handle = self._execution.resume(plan, recorded, snapshot)

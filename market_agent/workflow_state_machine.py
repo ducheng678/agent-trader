@@ -56,10 +56,10 @@ ATTEMPT_TERMINAL_STATES = frozenset(
 RUN_EDGES: Mapping[RunState | None, frozenset[RunState]] = MappingProxyType(
     {
         None: frozenset({RunState.CREATED}),
-        RunState.CREATED: frozenset({RunState.ADMITTED}),
-        RunState.ADMITTED: frozenset({RunState.PLANNED}),
-        RunState.PLANNED: frozenset({RunState.READY}),
-        RunState.READY: frozenset({RunState.RUNNING}),
+        RunState.CREATED: frozenset({RunState.ADMITTED, RunState.CANCELLED}),
+        RunState.ADMITTED: frozenset({RunState.PLANNED, RunState.CANCELLED}),
+        RunState.PLANNED: frozenset({RunState.READY, RunState.CANCELLED}),
+        RunState.READY: frozenset({RunState.RUNNING, RunState.CANCELLED}),
         RunState.RUNNING: frozenset(
             {
                 RunState.RECONCILING,
@@ -67,6 +67,7 @@ RUN_EDGES: Mapping[RunState | None, frozenset[RunState]] = MappingProxyType(
                 RunState.WAITING_RECONCILIATION,
                 RunState.DEGRADING,
                 RunState.SUMMARIZING,
+                RunState.CANCELLED,
             }
         ),
         RunState.RECONCILING: frozenset(
@@ -76,6 +77,7 @@ RUN_EDGES: Mapping[RunState | None, frozenset[RunState]] = MappingProxyType(
                 RunState.DEGRADING,
                 RunState.SUMMARIZING,
                 RunState.FAILED,
+                RunState.CANCELLED,
             }
         ),
         RunState.WAITING_APPROVAL: frozenset(
@@ -90,10 +92,11 @@ RUN_EDGES: Mapping[RunState | None, frozenset[RunState]] = MappingProxyType(
                 RunState.SUMMARIZING,
                 RunState.DEGRADED,
                 RunState.FAILED,
+                RunState.CANCELLED,
             }
         ),
         RunState.SUMMARIZING: frozenset(
-            {RunState.SUCCEEDED, RunState.DEGRADED, RunState.FAILED}
+            {RunState.SUCCEEDED, RunState.DEGRADED, RunState.FAILED, RunState.CANCELLED}
         ),
     }
 )
