@@ -40,8 +40,8 @@ ConnectionFactory = Callable[[], DBAPIConnection]
 
 
 def postgres_memory_ddl(embedding_dimension: int) -> tuple[str, ...]:
-    if type(embedding_dimension) is not int or not 1 <= embedding_dimension <= 16_000:
-        raise ValueError("pgvector embedding dimension must be between 1 and 16000")
+    if type(embedding_dimension) is not int or not 1 <= embedding_dimension <= 2_000:
+        raise ValueError("ivfflat pgvector embedding dimension must be between 1 and 2000")
     return (
         "CREATE EXTENSION IF NOT EXISTS vector",
         f"CREATE TABLE IF NOT EXISTS governed_memory_records (tenant_id TEXT NOT NULL, record_id TEXT NOT NULL, kind TEXT NOT NULL, body JSONB NOT NULL, body_hash TEXT NOT NULL, event_hash TEXT, embedding vector({embedding_dimension}), model_version TEXT NOT NULL, vector_version TEXT NOT NULL, scope TEXT NOT NULL, lifecycle TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ, PRIMARY KEY (tenant_id, record_id), UNIQUE (tenant_id, event_hash))",
