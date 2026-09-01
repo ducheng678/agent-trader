@@ -710,3 +710,15 @@ Separately reviewed plans then cover:
 1. AgentDriver, prompt releases, capabilities, retry/error classification, circuit breakers, caches, reflection, and correction.
 2. three-layer memory, RAG, forgetting, risk/result sealing, API/database/Redis Streams, observability, and evaluation.
 3. engine migration, shadow mode, security/replay/fault verification, legacy removal, and independent synchronization of both repositories.
+
+## Capability Enforcement Design Note
+
+`workflow_capabilities.py` is a host-owned, in-memory issuer for revocable,
+short-lived grants. A grant binds an exact actor, task, tenant, and trace scope
+and carries separate explicit read, tool, ephemeral state-write, and service
+allowlists. Authorization revalidates the issuer-tracked grant, its credential,
+scope, expiry, and requested resource before returning an audit-safe decision.
+
+Agents receive no durable-memory, exchange, audit, queue, repository, or
+runtime-control authority. Durable control namespaces are categorically denied,
+and state writes are restricted to `invocation.*` or `ephemeral.*` keys.
