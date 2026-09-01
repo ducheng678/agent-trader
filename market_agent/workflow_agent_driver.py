@@ -246,12 +246,23 @@ class AgentDriver:
             if result.failure is not None:
                 return result
             if schema.reflection_required:
-                self._emit(run, "core_result_ready", "accepted", reason="reflection_required", output=result.output)
+                # A response that was conditioned on a bounded summary stays a
+                # candidate until its memory authority survives every
+                # synchronous observer/consumer boundary.  In particular, do
+                # not expose even its output hash from this pre-reflection
+                # audit record: an observer can advance time before the hook
+                # would otherwise receive the candidate.
+                self._emit(run, "core_result_ready", "accepted", reason="reflection_required",
+                           **({} if run.model_result_used_memory else {"output": result.output}))
+                if run.model_result_used_memory and self._memory_expired(run):
+                    return self._discard_expired_memory_output(run)
                 if self._verification_hook is not None:
                     try:
                         self._verification_hook(result)
                     except Exception:
                         return self._fail(run, "verification_unavailable")
+                    if run.model_result_used_memory and self._memory_expired(run):
+                        return self._discard_expired_memory_output(run)
             if run.model_result_used_memory and self._memory_expired(run):
                 return self._discard_expired_memory_output(run)
             if run.model_result_used_memory:
@@ -441,7 +452,11 @@ class AgentDriver:
                 return None
             if memory_injected and self._memory_expired(run):
                 return self._discard_expired_memory_output(run)
-            self._emit(run, "schema_validated", "passed", outcome="passed", output=output)
+            # This is a synchronous observer boundary.  Memory-bound model
+            # output remains a non-observable candidate until it has survived
+            # all expiry checks and finalization records.
+            self._emit(run, "schema_validated", "passed", outcome="passed",
+                       **({} if memory_injected else {"output": output}))
             if memory_injected and self._memory_expired(run):
                 return self._discard_expired_memory_output(run)
             run.model_result_used_memory = memory_injected

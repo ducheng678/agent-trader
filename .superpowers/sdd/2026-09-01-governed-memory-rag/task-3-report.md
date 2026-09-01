@@ -141,3 +141,20 @@ Status: complete; supersedes the prior before-dispatch-only expiry claim.
 - A regression observer advances the trusted clock during `final_decision`.
   The trace ends with the two output-free candidates, `memory_expired`, and
   `task_failed`; no successful output or success outcome is recorded.
+
+## Review fix 5: reflection candidate expiry boundary
+
+- For a memory-bound response, `core_result_ready` is now an output-free
+  candidate audit. The driver rechecks summary expiry immediately after that
+  synchronous callback and before invoking the verification hook, so an audit
+  callback that consumes the last valid instant cannot cause the hook to
+  receive the response. It checks again when the hook returns before any
+  completion candidate is emitted. Non-memory reflection keeps its existing
+  output-bearing audit and hook behavior.
+- The same candidate rule now applies to memory-bound `schema_validated`, so
+  no synchronous observer receives a hash of an answer that may be discarded
+  at the following expiry boundary.
+- Regressions cover expiry during `core_result_ready` (the hook is never
+  called and no output hash is emitted), stable reflection behavior, and a
+  hook that itself consumes the remaining authority (the result is discarded
+  before completion).

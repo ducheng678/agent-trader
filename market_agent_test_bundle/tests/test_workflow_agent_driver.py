@@ -662,6 +662,69 @@ def test_core_verification_hook_gets_only_validated_result_and_cannot_replace_it
     assert any(e.event_type == "core_result_ready" and e.payload.reason_code == "reflection_required" for e in observer.events)
 
 
+def test_memory_bound_reflection_rechecks_expiry_before_hook_after_core_candidate_audit():
+    clock = Clock()
+    seen = []
+
+    class SlowObserver(Observer):
+        def record(self, event):
+            super().record(event)
+            if event.event_type == "core_result_ready":
+                clock.time = 50.0
+
+    output_schema = schema(reflection_required=True)
+    driver, observer, _ = make_driver(
+        Client(response()), output_schema=output_schema, clock=clock, audit_observer=SlowObserver(),
+        verification_hook=lambda result: seen.append(result),
+    )
+
+    result = driver.execute(invocation(output_schema), memory_context=memory_summary(),
+                            memory_tenant_id="tenant-a", memory_scope="default")
+
+    assert result.failure.code == "memory_context_expired"
+    assert seen == []
+    terminal = observer.events[-3:]
+    assert [event.event_type for event in terminal] == ["core_result_ready", "memory_expired", "task_failed"]
+    assert terminal[0].output_hash is None
+
+
+def test_memory_bound_reflection_hook_receives_candidate_while_summary_is_current():
+    seen = []
+    output_schema = schema(reflection_required=True)
+    driver, observer, _ = make_driver(
+        Client(response()), output_schema=output_schema, verification_hook=lambda result: seen.append(result),
+    )
+
+    result = driver.execute(invocation(output_schema), memory_context=memory_summary(),
+                            memory_tenant_id="tenant-a", memory_scope="default")
+
+    assert result.output == {"answer": "known"}
+    assert seen == [result]
+    core = next(event for event in observer.events if event.event_type == "core_result_ready")
+    assert core.output_hash is None
+
+
+def test_memory_bound_reflection_discards_candidate_if_hook_consumes_remaining_authority():
+    clock = Clock()
+    seen = []
+    output_schema = schema(reflection_required=True)
+
+    def expires_in_hook(result):
+        seen.append(result)
+        clock.time = 50.0
+
+    driver, observer, _ = make_driver(
+        Client(response()), output_schema=output_schema, clock=clock, verification_hook=expires_in_hook,
+    )
+
+    result = driver.execute(invocation(output_schema), memory_context=memory_summary(),
+                            memory_tenant_id="tenant-a", memory_scope="default")
+
+    assert result.failure.code == "memory_context_expired"
+    assert seen[0].output == {"answer": "known"}
+    assert [event.event_type for event in observer.events][-2:] == ["memory_expired", "task_failed"]
+
+
 def test_audit_failure_stops_before_provider_call():
     class BrokenObserver:
         def record(self, event):
