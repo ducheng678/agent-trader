@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from market_agent.workflow_contracts import WorkflowRequest, WorkflowResult
+from market_agent.workflow_execution_backend import ExecutionRegistrationError
 from market_agent.workflow_harness import HarnessDecision, HarnessKernel, RunHandle
 from market_agent.workflow_harness_contracts import HarnessSessionView, RunState
 
@@ -50,7 +51,14 @@ class HarnessWorkflowApplication:
 
     def execute(self, request: WorkflowRequest) -> HarnessWorkflowExecution:
         request = WorkflowRequest.model_validate(request)
-        handle = self._kernel.create(request)
+        try:
+            handle = self._kernel.create(request)
+        except ExecutionRegistrationError as error:
+            if str(error) != "run already exists":
+                raise
+            # Queue recovery must continue the same durable run, not create a
+            # second workflow because a worker restarted after admission.
+            handle = self._kernel.resume(request.workflow_id)
         decisions: list[HarnessDecision] = []
         view = self._kernel.snapshot(handle.run_id)
         for _ in range(4):

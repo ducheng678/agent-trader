@@ -206,6 +206,12 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             raise DependencyUnavailableError("Harness kernel is not configured")
         return kernel
 
+    def require_harness_workflow() -> Any:
+        application = getattr(resolved_container, "harness_application", None)
+        if application is None:
+            raise DependencyUnavailableError("Harness workflow application is not configured")
+        return application
+
     def workflow_view(kernel: Any, run_id: str) -> HarnessSessionView:
         try:
             return kernel.snapshot(run_id)
@@ -309,6 +315,7 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
         _: None = Depends(require_api_token),
     ) -> WorkflowAcceptedResponse:
         kernel = require_harness()
+        require_harness_workflow()
         key = _resolve_idempotency_key(body.idempotency_key, idempotency_key_header)
         trace_id = get_request_trace(request).trace_id
         # A missing key deliberately means a distinct user request.  Never use
@@ -337,6 +344,19 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             view = workflow_view(kernel, run_id)
             trace_id = view.trace_id
             status = view.run_state.value if view.run_state is not None else "created"
+        else:
+            try:
+                resolved_container.task_queue.submit(
+                    "execute_harness_workflow",
+                    workflow_request.model_dump(mode="json"),
+                    idempotency_key=run_id,
+                    request_id=trace_id,
+                )
+            except Exception:
+                # Do not leave an admitted run permanently stranded when the
+                # durable dispatcher cannot accept it.
+                kernel.cancel(run_id, "workflow_dispatch_unavailable")
+                raise
         return WorkflowAcceptedResponse(run_id=run_id, trace_id=trace_id, status=status,
                                         status_url=f"/v1/workflows/{run_id}")
 

@@ -29,6 +29,7 @@ class BackendContainer:
     historical_answer_cache: Any = None
     memory_authority: object | None = None
     harness_kernel: Any = None
+    harness_application: Any = None
 
     def __post_init__(self) -> None:
         if self.observability is None:
@@ -45,6 +46,7 @@ class BackendContainer:
         *,
         observability: BackendObservability | None = None,
         harness_kernel: Any = None,
+        harness_application: Any = None,
     ) -> "BackendContainer":
         resolved_settings = (settings or BackendSettings.from_env()).validate()
         configure_structured_logging()
@@ -90,6 +92,7 @@ class BackendContainer:
             task_queue=task_queue,
             observability=observability,
             harness_kernel=harness_kernel,
+            harness_application=harness_application,
         )
         try:
             from market_agent.backend.memory_maintenance import MemoryMaintenanceScheduler
@@ -158,6 +161,13 @@ class BackendContainer:
                 task_queue,
                 application_factory=application_factory,
             )
+            if container.harness_application is not None:
+                from market_agent.backend.harness_service import HarnessWorkflowService
+
+                container.task_queue.register(
+                    "execute_harness_workflow",
+                    HarnessWorkflowService(container.harness_application).execute,
+                )
         except BaseException:
             container.shutdown()
             raise
