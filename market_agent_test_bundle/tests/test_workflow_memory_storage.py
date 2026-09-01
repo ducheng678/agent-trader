@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
 import sqlite3
 
 import pytest
@@ -305,6 +306,131 @@ def test_expired_event_cannot_verify_an_outcome(repo):
     repo.append_decision(decision(), **write(repo, "decision"))
     with pytest.raises(MemoryPromotionError):
         repo.append_outcome(outcome(observed_at=NOW + timedelta(seconds=2)), **write(repo, "outcome"))
+
+
+def derived_event(repo, record_id, parents, *, kind="system", group=None):
+    return repo.append_event(event(
+        record_id, source=record_id, payload={"derived": record_id},
+        provenance=Provenance(source_id=record_id, source_kind=kind,
+                              independent_group=group or record_id, derived_from=parents)),
+        **write(repo, record_id))
+
+
+@pytest.mark.parametrize("depth", [1, 3])
+def test_system_wrappers_cannot_verify_model_only_outcomes(repo, depth):
+    derived_event(repo, "model-root", (), kind="model")
+    parent = "model-root"
+    for level in range(depth):
+        wrapped = derived_event(repo, f"wrapper-{level}", (parent,))
+        parent = wrapped.record_id
+    repo.append_decision(decision(evidence_ids=(parent,)), **write(repo, "decision"))
+    with pytest.raises(MemoryPromotionError):
+        repo.append_outcome(outcome(evidence_ids=(parent,)), **write(repo, "outcome"))
+    assert repo.get_by_id("outcome-1", tenant_id="tenant-a") is None
+    assert repo.list_audit(tenant_id="tenant-a")[-1].operation == "append_decision"
+
+
+def test_external_ancestry_does_not_turn_model_claim_into_verification(repo):
+    repo.append_event(event(), **write(repo, "event-1"))
+    derived_event(repo, "model-claim", ("event-1",), kind="model")
+    derived_event(repo, "wrapper", ("model-claim",))
+    repo.append_decision(decision(), **write(repo, "decision"))
+    with pytest.raises(MemoryPromotionError):
+        repo.append_outcome(outcome(evidence_ids=("wrapper",)), **write(repo, "outcome"))
+
+
+def test_non_event_provenance_cannot_verify_outcome_from_decision_context(repo):
+    evidence(repo)
+    repo.append_decision(decision(), **write(repo, "decision"))
+    derived_event(repo, "wrapper", ("decision-1",))
+    with pytest.raises(MemoryPromotionError):
+        repo.append_outcome(outcome(evidence_ids=("wrapper",)), **write(repo, "outcome"))
+
+
+@pytest.mark.parametrize("source_kind", ["external", "system"])
+def test_real_root_evidence_can_verify_through_multiple_system_derivations(repo, source_kind):
+    derived_event(repo, "root", (), kind=source_kind)
+    derived_event(repo, "normalized", ("root",))
+    derived_event(repo, "parallel", ("root",))
+    derived_event(repo, "verified-result", ("normalized", "parallel"))
+    repo.append_decision(decision(evidence_ids=("root",)), **write(repo, "decision"))
+    verified = repo.append_outcome(outcome(evidence_ids=("verified-result",)), **write(repo, "outcome"))
+    assert verified.verified
+    repo.propose_knowledge(candidate(evidence_ids=("verified-result",), outcome_id="outcome-1"),
+                           **write(repo, "proposal"))
+    assert repo.activate_knowledge("knowledge-1", expected_revision=1, now=NOW,
+                                   **write(repo, "activation")).lifecycle is Lifecycle.ACTIVE
+
+
+@pytest.mark.parametrize("independent", [True, False])
+def test_promotion_counts_original_roots_not_system_wrapper_labels(repo, independent):
+    derived_event(repo, "root-a", (), kind="external", group="source-a")
+    derived_event(repo, "root-b", (), kind="external", group="source-b" if independent else "source-a")
+    derived_event(repo, "wrapper-a", ("root-a",))
+    derived_event(repo, "wrapper-b", ("root-b",))
+    repo.propose_knowledge(candidate(evidence_ids=("wrapper-a", "wrapper-b")), **write(repo, "proposal"))
+    if independent:
+        assert repo.activate_knowledge("knowledge-1", expected_revision=1, now=NOW,
+                                       **write(repo, "activation")).lifecycle is Lifecycle.ACTIVE
+    else:
+        with pytest.raises(MemoryPromotionError):
+            repo.activate_knowledge("knowledge-1", expected_revision=1, now=NOW, **write(repo, "activation"))
+
+
+def replace_stored_record(repo, record):
+    # Simulate a pre-existing graph written by an older producer, with valid checksums.
+    body = record.model_dump_json()
+    with sqlite3.connect(repo.path) as db:
+        db.execute("UPDATE memory_records SET body=?,body_hash=? WHERE tenant_id=? AND record_id=?",
+                   (body, hashlib.sha256(body.encode()).hexdigest(), record.tenant_id, record.record_id))
+        db.execute("DELETE FROM memory_links WHERE tenant_id=? AND record_id=?",
+                   (record.tenant_id, record.record_id))
+        for parent in record.provenance.derived_from:
+            db.execute("INSERT INTO memory_links VALUES(?,?,?)", (record.tenant_id, record.record_id, parent))
+
+
+def test_verified_outcome_rejects_cyclic_provenance(repo):
+    root = derived_event(repo, "root", ())
+    derived_event(repo, "wrapper", ("root",))
+    replace_stored_record(repo, root.model_copy(update={
+        "provenance": root.provenance.model_copy(update={"derived_from": ("wrapper",)})}))
+    repo.append_decision(decision(evidence_ids=("wrapper",)), **write(repo, "decision"))
+    with pytest.raises(MemoryPromotionError):
+        repo.append_outcome(outcome(evidence_ids=("wrapper",)), **write(repo, "outcome"))
+
+
+def test_promotion_revalidates_stored_outcome_provenance(repo):
+    root = derived_event(repo, "root", ())
+    derived_event(repo, "model-root", (), kind="model")
+    derived_event(repo, "wrapper", ("root",))
+    repo.append_decision(decision(evidence_ids=("wrapper",)), **write(repo, "decision"))
+    repo.append_outcome(outcome(evidence_ids=("wrapper",)), **write(repo, "outcome"))
+    repo.propose_knowledge(candidate(evidence_ids=("wrapper",), outcome_id="outcome-1"),
+                           **write(repo, "proposal"))
+    replace_stored_record(repo, root.model_copy(update={
+        "provenance": root.provenance.model_copy(update={"derived_from": ("model-root",)})}))
+    with pytest.raises(MemoryPromotionError):
+        repo.activate_knowledge("knowledge-1", expected_revision=1, now=NOW, **write(repo, "activation"))
+    assert repo.get_by_id("knowledge-1", tenant_id="tenant-a").lifecycle is Lifecycle.PROPOSED
+
+
+@pytest.mark.parametrize("derived", [False, True])
+def test_lesson_rechecks_all_outcome_evidence_at_link_time(repo, derived):
+    repo.append_event(event(expires_at=NOW + timedelta(seconds=1)), **write(repo, "event-1"))
+    repo.append_event(event("fresh", payload={"price": 200}), **write(repo, "fresh"))
+    verification_id = "event-1"
+    if derived:
+        verification_id = derived_event(repo, "wrapper", (verification_id,)).record_id
+    repo.append_decision(decision(), **write(repo, "decision"))
+    repo.append_outcome(outcome(evidence_ids=(verification_id, "fresh")), **write(repo, "outcome"))
+    lesson = DecisionLesson(record_id="lesson", tenant_id="tenant-a", observed_at=NOW + timedelta(seconds=2),
+                            decision_id="decision-1", outcome_id="outcome-1", lesson="Do not use stale outcomes.",
+                            evidence_ids=("fresh",), confidence=0.8)
+    before_audit = repo.list_audit(tenant_id="tenant-a")
+    with pytest.raises(MemoryPromotionError):
+        repo.link_lesson(lesson, **write(repo, "lesson"))
+    assert repo.get_by_id("lesson", tenant_id="tenant-a") is None
+    assert repo.list_audit(tenant_id="tenant-a") == before_audit
 
 
 def test_stale_connection_cannot_activate_superseded_proposal(repo):

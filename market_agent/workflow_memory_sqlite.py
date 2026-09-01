@@ -1,6 +1,7 @@
 """Transactional local memory. Only deterministic services retain writer authority."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime
 import hashlib
 from pathlib import Path
@@ -162,44 +163,75 @@ class SQLiteMemoryRepository:
             if decision.observed_at > record.observed_at:
                 raise MemoryPromotionError("outcomes and lessons cannot predate their decision")
         if isinstance(record, OutcomeRecord) and record.verified:
-            for ref in record.evidence_ids:
-                self._fresh_evidence(self._require(ref, record.tenant_id, EventRecord), record.observed_at)
-            if not any(self._require(ref, record.tenant_id, EventRecord).provenance.source_kind != "model"
-                       for ref in record.evidence_ids):
-                raise MemoryPromotionError("model-only claims cannot verify an outcome")
+            self._validate_outcome_evidence(record, record.observed_at)
         if isinstance(record, DecisionLesson):
-            outcome = self._verified_outcome(record.outcome_id, record.tenant_id)
+            outcome = self._verified_outcome(record.outcome_id, record.tenant_id, now=record.observed_at)
             if outcome.decision_id != record.decision_id:
                 raise MemoryPromotionError("lesson outcome must belong to its decision")
-            self._fresh_evidence(outcome, record.observed_at)
-            for ref in record.evidence_ids:
-                self._fresh_evidence(self._require(ref, record.tenant_id, EventRecord), record.observed_at)
+            self._evidence_roots(record.evidence_ids, record.tenant_id, record.observed_at)
 
-    def _check_evidence_ancestry(self, candidate: KnowledgeRevision) -> None:
+    def _walk_ancestry(self, identifiers: tuple[str, ...], tenant_id: str, *,
+                       events_only: bool = False) -> Iterator[Record]:
+        """Visit parents before children; reject cycles without Python recursion."""
         visiting: set[str] = set()
         visited: set[str] = set()
-
-        def visit(identifier: str) -> None:
-            if identifier in visiting or identifier == candidate.record_id:
+        records: dict[str, Record] = {}
+        pending = [(identifier, False) for identifier in reversed(identifiers)]
+        while pending:
+            identifier, expanded = pending.pop()
+            if expanded:
+                visiting.remove(identifier)
+                visited.add(identifier)
+                yield records[identifier]
+                continue
+            if identifier in visiting:
                 raise MemoryPromotionError("circular evidence is forbidden")
             if identifier in visited:
-                return
-            evidence = self._require(identifier, candidate.tenant_id, tuple(RECORD_TYPES.values()))
+                continue
+            evidence = self._require(identifier, tenant_id,
+                                     EventRecord if events_only else tuple(RECORD_TYPES.values()))
+            records[identifier] = evidence
+            visiting.add(identifier)
+            pending.append((identifier, True))
+            parents = evidence.provenance.derived_from if events_only else self._references(evidence)
+            pending.extend((parent, False) for parent in reversed(parents))
+
+    def _check_evidence_ancestry(self, candidate: KnowledgeRevision) -> None:
+        identifiers = (*candidate.evidence_ids, *((candidate.outcome_id,) if candidate.outcome_id else ()))
+        for evidence in self._walk_ancestry(identifiers, candidate.tenant_id):
             if isinstance(evidence, KnowledgeRevision) and evidence.knowledge_id == candidate.knowledge_id:
                 raise MemoryPromotionError("a rule's descendants cannot corroborate that rule")
-            visiting.add(identifier)
-            for parent in self._references(evidence):
-                visit(parent)
-            visiting.remove(identifier)
-            visited.add(identifier)
 
-        for identifier in (*candidate.evidence_ids, *((candidate.outcome_id,) if candidate.outcome_id else ())):
-            visit(identifier)
+    def _evidence_roots(self, identifiers: tuple[str, ...], tenant_id: str, now: datetime) -> set[str]:
+        """Only fresh, model-free event paths establish independent observations.
 
-    def _verified_outcome(self, record_id: str, tenant_id: str) -> OutcomeRecord:
+        Decision/knowledge links provide context, not observation provenance, so
+        non-event parents are ambiguous here and fail the event type check.
+        """
+        roots: dict[str, set[str]] = {}
+        for evidence in self._walk_ancestry(identifiers, tenant_id, events_only=True):
+            self._fresh_evidence(evidence, now)
+            provenance = evidence.provenance
+            groups: set[str] = set()
+            if provenance.source_kind != "model":
+                if provenance.derived_from:
+                    for parent in provenance.derived_from:
+                        groups.update(roots[parent])
+                else:
+                    groups.add(provenance.independent_group)
+            roots[evidence.record_id] = groups
+        return set().union(*(roots[identifier] for identifier in identifiers))
+
+    def _validate_outcome_evidence(self, record: OutcomeRecord, now: datetime) -> None:
+        self._fresh_evidence(record, now)
+        if not self._evidence_roots(record.evidence_ids, record.tenant_id, now):
+            raise MemoryPromotionError("independent non-model root evidence is required to verify an outcome")
+
+    def _verified_outcome(self, record_id: str, tenant_id: str, *, now: datetime | None = None) -> OutcomeRecord:
         record = self._require(record_id, tenant_id, OutcomeRecord)
         if not record.verified:
             raise MemoryPromotionError("a verified outcome is required")
+        self._validate_outcome_evidence(record, record.observed_at if now is None else now)
         return record
 
     def _replay(self, context: MutationContext, request_hash: str) -> Record | None:
@@ -316,17 +348,9 @@ class SQLiteMemoryRepository:
                 raise MemoryPromotionError("knowledge is not effective at activation time")
             if record.contradicting_ids:
                 raise MemoryPromotionError("conflicting evidence prevents activation")
-            sources = set()
-            for ref in record.evidence_ids:
-                evidence = self._require(ref, ctx.tenant_id, EventRecord)
-                self._fresh_evidence(evidence, now)
-                if evidence.provenance.source_kind != "model" and not evidence.provenance.derived_from:
-                    sources.add(evidence.provenance.independent_group)
+            sources = self._evidence_roots(record.evidence_ids, ctx.tenant_id, now)
             if record.outcome_id is not None:
-                outcome = self._verified_outcome(record.outcome_id, ctx.tenant_id)
-                self._fresh_evidence(outcome, now)
-                for ref in outcome.evidence_ids:
-                    self._fresh_evidence(self._require(ref, ctx.tenant_id, EventRecord), now)
+                outcome = self._verified_outcome(record.outcome_id, ctx.tenant_id, now=now)
                 if not set(outcome.evidence_ids) & set(record.evidence_ids):
                     raise MemoryPromotionError("verified outcome must support the candidate evidence")
             elif len(sources) < 2:
