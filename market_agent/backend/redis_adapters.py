@@ -1,14 +1,18 @@
 """Fail-closed Redis adapters; clients are injected only at backend composition."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 import math
+import random
 import re
+import threading
+import uuid
 from typing import Any, Protocol
 
 from market_agent.backend.message_bus import MessageEnvelope
+from market_agent.backend.database import JobRecord
 
 
 class RedisUnavailableError(RuntimeError):
@@ -27,6 +31,7 @@ class RedisLike(Protocol):
     def xadd(self, name: str, fields: dict[str, str], id: str = "*") -> object: ...
     def xreadgroup(self, groupname: str, consumername: str, streams: dict[str, str], count: int = 1, block: int | None = None) -> object: ...
     def xack(self, name: str, groupname: str, *ids: str) -> object: ...
+    def xgroup_create(self, name: str, groupname: str, id: str = "0", mkstream: bool = False) -> object: ...
 
 
 _SENSITIVE = frozenset({"authorization", "credential", "password", "secret", "token", "api_key", "access_key"})
@@ -152,6 +157,39 @@ class RedisTenantCache:
         return self._prefix + key
 
 
+class RedisJobCache:
+    """Typed task-cache facade that preserves JobRecord on Redis round trips."""
+
+    def __init__(self, cache: RedisTenantCache) -> None:
+        if type(cache) is not RedisTenantCache:
+            raise TypeError("Redis job cache requires a tenant cache")
+        self._cache = cache
+
+    def get(self, key: str, default: Any = None) -> Any:
+        value = self._cache.get(key, default)
+        if value is default:
+            return default
+        if not isinstance(value, dict):
+            self._cache.delete(key)
+            return default
+        try:
+            return JobRecord(**value)
+        except (TypeError, ValueError):
+            self._cache.delete(key)
+            return default
+
+    def set(self, key: str, value: Any, ttl_seconds: float | None = None) -> None:
+        if type(value) is not JobRecord:
+            raise TypeError("Redis task cache stores only JobRecord values")
+        self._cache.set(key, asdict(value), ttl_seconds)
+
+    def delete(self, key: str) -> None:
+        self._cache.delete(key)
+
+    def health(self) -> RedisHealth:
+        return self._cache.health()
+
+
 @dataclass(frozen=True, slots=True)
 class StreamDelivery:
     stream: str
@@ -238,3 +276,122 @@ class RedisStreamMessageBus:
                     raise RedisUnavailableError("Redis stream trace propagation is invalid")
                 envelope = MessageEnvelope(topic=decoded["topic"], payload=decoded["payload"], request_id=decoded["request_id"], job_id=decoded["job_id"], message_id=decoded["message_id"], occurred_at=decoded["occurred_at"])
                 yield StreamDelivery(stream=stream, message_id=str(normalized_id), envelope=envelope)
+
+
+class RedisMessageBusAdapter:
+    """MessageBus-compatible Redis Streams consumer with ack and dead-letter handling."""
+
+    _RETRY_BASE_SECONDS = 0.25
+    _RETRY_MAX_SECONDS = 5.0
+
+    def __init__(self, stream_bus: RedisStreamMessageBus, *, group: str = "market-agent-workers") -> None:
+        if type(stream_bus) is not RedisStreamMessageBus or not group.strip():
+            raise ValueError("Redis message adapter requires a stream bus and consumer group")
+        self._bus = stream_bus
+        self._group = group
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._health_lock = threading.Lock()
+        self._consumer_failures: dict[str, str] = {}
+
+    def publish(self, message: MessageEnvelope) -> None:
+        self._bus.publish(message)
+
+    def subscribe(self, topic: str, handler: Any):
+        if not callable(handler):
+            raise TypeError("message handler must be callable")
+        consumer = "consumer-" + uuid.uuid4().hex
+        stream = self._bus._stream(topic)
+        try:
+            self._bus._client.xgroup_create(stream, self._group, id="0", mkstream=True)
+        except Exception as error:
+            if "BUSYGROUP" not in str(error).upper():
+                raise RedisUnavailableError("Redis consumer group creation failed") from error
+        local_stop = threading.Event()
+
+        def consume() -> None:
+            failures = 0
+            try:
+                while not self._stop.is_set() and not local_stop.is_set():
+                    try:
+                        deliveries = self._bus.consume(
+                            topic=topic,
+                            group=self._group,
+                            consumer=consumer,
+                            count=10,
+                            block_ms=1000,
+                        )
+                    except RedisUnavailableError as error:
+                        failures += 1
+                        self._mark_consumer_degraded(consumer, error)
+                        if self._wait_for_retry(local_stop, self._retry_delay(failures)):
+                            return
+                        continue
+
+                    failures = 0
+                    self._mark_consumer_healthy(consumer)
+                    for delivery in deliveries:
+                        if self._stop.is_set() or local_stop.is_set():
+                            return
+                        try:
+                            handler(delivery.envelope)
+                        except Exception as error:
+                            try:
+                                self._bus.dead_letter(
+                                    delivery,
+                                    group=self._group,
+                                    reason=type(error).__name__[:128],
+                                )
+                            except RedisUnavailableError as dead_letter_error:
+                                self._mark_consumer_degraded(consumer, dead_letter_error)
+                            continue
+                        try:
+                            self._bus.ack(delivery, group=self._group)
+                        except RedisUnavailableError as error:
+                            self._mark_consumer_degraded(consumer, error)
+            finally:
+                self._mark_consumer_healthy(consumer)
+
+        thread = threading.Thread(target=consume, name=consumer, daemon=True)
+        self._threads.append(thread)
+        thread.start()
+
+        def unsubscribe() -> None:
+            local_stop.set()
+
+        return unsubscribe
+
+    def _retry_delay(self, failures: int) -> float:
+        exponential = min(
+            self._RETRY_MAX_SECONDS,
+            self._RETRY_BASE_SECONDS * (2 ** min(failures - 1, 16)),
+        )
+        return random.uniform(exponential / 2.0, exponential)
+
+    def _wait_for_retry(self, local_stop: threading.Event, delay_seconds: float) -> bool:
+        remaining = delay_seconds
+        while remaining > 0.0:
+            interval = min(0.1, remaining)
+            if self._stop.wait(interval) or local_stop.is_set():
+                return True
+            remaining -= interval
+        return self._stop.is_set() or local_stop.is_set()
+
+    def _mark_consumer_degraded(self, consumer: str, error: Exception) -> None:
+        with self._health_lock:
+            self._consumer_failures[consumer] = type(error).__name__
+
+    def _mark_consumer_healthy(self, consumer: str) -> None:
+        with self._health_lock:
+            self._consumer_failures.pop(consumer, None)
+
+    def close(self) -> None:
+        self._stop.set()
+        for thread in tuple(self._threads):
+            thread.join(timeout=2.0)
+
+    def health(self) -> RedisHealth:
+        with self._health_lock:
+            if self._consumer_failures:
+                return RedisHealth("degraded", ",".join(sorted(set(self._consumer_failures.values()))))
+        return self._bus.health()

@@ -50,6 +50,13 @@ def _require_id(value: str) -> str:
     return value
 
 
+def _require_trace_id(value: str) -> str:
+    _require_safe_text(value)
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", value) or not int(value, 16):
+        raise ValueError("audit trace identifiers must be nonzero W3C trace IDs")
+    return value
+
+
 def _require_code(value: str) -> str:
     _require_safe_text(value)
     if not _CODE.fullmatch(value):
@@ -78,7 +85,7 @@ def _require_utc(value: datetime) -> datetime:
 
 
 AuditEventId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
-AuditTraceId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
+AuditTraceId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_trace_id)]
 AuditWorkflowId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
 AuditTaskId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
 AuditAttemptId = Annotated[str, StringConstraints(strip_whitespace=True), AfterValidator(_require_id)]
@@ -726,7 +733,7 @@ class AuditStore:
             raise ValueError("invalid audit cursor")
         if not _DIGEST.fullmatch(filter_hash):
             raise ValueError("invalid audit cursor")
-        return _require_id(trace_id), sequence, _require_id(event_id), filter_hash
+        return _require_trace_id(trace_id), sequence, _require_id(event_id), filter_hash
 
     @staticmethod
     def _filter_hash(trace_id: str | None, workflow_id: str | None, task_id: str | None, attempt_id: str | None, event_type: str | None, start_time: datetime | None, end_time: datetime | None) -> str:

@@ -19,6 +19,8 @@ eth-account==0.13.7
 # Production API and runtime
 fastapi==0.124.2
 uvicorn[standard]==0.38.0
+redis>=5.0,<6.0
+psycopg[binary]>=3.2,<4.0
 
 # Chart rendering
 matplotlib==3.10.9
