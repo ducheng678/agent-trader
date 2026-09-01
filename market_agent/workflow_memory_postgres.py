@@ -39,35 +39,41 @@ class DBAPIConnection(Protocol):
 ConnectionFactory = Callable[[], DBAPIConnection]
 
 
-POSTGRES_MEMORY_DDL = (
-    "CREATE EXTENSION IF NOT EXISTS vector",
-    "CREATE TABLE IF NOT EXISTS governed_memory_records (tenant_id TEXT NOT NULL, record_id TEXT NOT NULL, kind TEXT NOT NULL, body JSONB NOT NULL, body_hash TEXT NOT NULL, event_hash TEXT, embedding vector, model_version TEXT NOT NULL, vector_version TEXT NOT NULL, scope TEXT NOT NULL, lifecycle TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ, PRIMARY KEY (tenant_id, record_id), UNIQUE (tenant_id, event_hash))",
-    "CREATE INDEX IF NOT EXISTS governed_memory_records_scope_idx ON governed_memory_records (tenant_id, scope, lifecycle, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS governed_memory_records_vector_idx ON governed_memory_records USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)",
-    "CREATE TABLE IF NOT EXISTS governed_memory_heads (tenant_id TEXT NOT NULL, knowledge_id TEXT NOT NULL, revision INTEGER NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (tenant_id, knowledge_id))",
-    "CREATE TABLE IF NOT EXISTS governed_memory_idempotency (tenant_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (tenant_id, idempotency_key))",
-    "CREATE TABLE IF NOT EXISTS governed_memory_audit (sequence BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, trace_id TEXT NOT NULL, operation TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_digest TEXT NOT NULL, record_hash TEXT NOT NULL)",
-)
+def postgres_memory_ddl(embedding_dimension: int) -> tuple[str, ...]:
+    if type(embedding_dimension) is not int or not 1 <= embedding_dimension <= 16_000:
+        raise ValueError("pgvector embedding dimension must be between 1 and 16000")
+    return (
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        f"CREATE TABLE IF NOT EXISTS governed_memory_records (tenant_id TEXT NOT NULL, record_id TEXT NOT NULL, kind TEXT NOT NULL, body JSONB NOT NULL, body_hash TEXT NOT NULL, event_hash TEXT, embedding vector({embedding_dimension}), model_version TEXT NOT NULL, vector_version TEXT NOT NULL, scope TEXT NOT NULL, lifecycle TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ, PRIMARY KEY (tenant_id, record_id), UNIQUE (tenant_id, event_hash))",
+        "CREATE INDEX IF NOT EXISTS governed_memory_records_scope_idx ON governed_memory_records (tenant_id, scope, lifecycle, observed_at DESC)",
+        "CREATE INDEX IF NOT EXISTS governed_memory_records_vector_idx ON governed_memory_records USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)",
+        "CREATE TABLE IF NOT EXISTS governed_memory_heads (tenant_id TEXT NOT NULL, knowledge_id TEXT NOT NULL, revision INTEGER NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (tenant_id, knowledge_id))",
+        "CREATE TABLE IF NOT EXISTS governed_memory_idempotency (tenant_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (tenant_id, idempotency_key))",
+        "CREATE TABLE IF NOT EXISTS governed_memory_audit (sequence BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, trace_id TEXT NOT NULL, operation TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_digest TEXT NOT NULL, record_hash TEXT NOT NULL)",
+    )
 
 
-def pgvector_literal(values: tuple[float, ...]) -> str:
-    if not values:
-        raise ValueError("pgvector retrieval requires a nonempty embedding")
+def pgvector_literal(values: tuple[float, ...], *, dimension: int) -> str:
+    if len(values) != dimension:
+        raise ValueError("pgvector embedding does not match the configured dimension")
     return "[" + ",".join(repr(value) for value in values) + "]"
 
 
 class PostgresMemoryRepository:
     """Transactional repository with tenant predicates on every data operation."""
 
-    def __init__(self, connection_factory: ConnectionFactory, *, writer_authority: object | None = None) -> None:
+    def __init__(self, connection_factory: ConnectionFactory, *, embedding_dimension: int,
+                 writer_authority: object | None = None) -> None:
         if not callable(connection_factory):
             raise TypeError("a DB-API connection factory is required")
+        postgres_memory_ddl(embedding_dimension)
         self._factory = connection_factory
+        self._embedding_dimension = embedding_dimension
         self._authority = writer_authority
 
     def migrate(self) -> None:
         with self._transaction() as cursor:
-            for statement in POSTGRES_MEMORY_DDL:
+            for statement in postgres_memory_ddl(self._embedding_dimension):
                 cursor.execute(statement)
             cursor.execute("SELECT 1 FROM pg_extension WHERE extname = %s", ("vector",))
             if cursor.fetchone() is None:
@@ -139,9 +145,9 @@ class PostgresMemoryRepository:
         if not query.embedding:
             return ()
         try:
-            vector = pgvector_literal(query.embedding)
+            vector = pgvector_literal(query.embedding, dimension=self._embedding_dimension)
             with self._cursor() as cursor:
-                cursor.execute("SELECT kind, body, body_hash FROM governed_memory_records WHERE tenant_id = %s AND scope = %s AND lifecycle = %s AND model_version = %s AND vector_version = %s AND expires_at > %s AND embedding IS NOT NULL ORDER BY embedding <=> %s::vector LIMIT %s", (query.tenant_id, query.scope, Lifecycle.ACTIVE.value, query.model_version, query.vector_version, query.now, vector, query.top_k))
+                cursor.execute("SELECT kind, body, body_hash FROM governed_memory_records WHERE tenant_id = %s AND scope = %s AND lifecycle = %s AND model_version = %s AND vector_version = %s AND (expires_at IS NULL OR expires_at > %s) AND embedding IS NOT NULL ORDER BY embedding <=> %s::vector LIMIT %s", (query.tenant_id, query.scope, Lifecycle.ACTIVE.value, query.model_version, query.vector_version, query.now, vector, query.top_k))
                 rows = cursor.fetchall()
             return tuple(self._rehydrate(*row) for row in rows)
         except Exception as error:
@@ -172,7 +178,7 @@ class PostgresMemoryRepository:
                 head = cursor.fetchone()
                 if (head is None and (record.revision != 1 or record.lineage_ids)) or (head is not None and (record.revision != head[0] + 1 or head[1] not in record.lineage_ids)):
                     raise MemoryConflictError("knowledge revision does not extend its tenant head")
-            embedding = pgvector_literal(record.embedding) if record.embedding else None
+            embedding = pgvector_literal(record.embedding, dimension=self._embedding_dimension) if record.embedding else None
             cursor.execute("INSERT INTO governed_memory_records (tenant_id, record_id, kind, body, body_hash, event_hash, embedding, model_version, vector_version, scope, lifecycle, observed_at, expires_at) VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s)", (record.tenant_id, record.record_id, type(record).__name__, body, self._hash(body), record.payload_hash if isinstance(record, EventRecord) else None, embedding, record.model_version, record.vector_version, record.scope, record.lifecycle.value, record.observed_at, record.expires_at))
             if isinstance(record, KnowledgeRevision):
                 cursor.execute("INSERT INTO governed_memory_heads (tenant_id, knowledge_id, revision, record_id) VALUES (%s,%s,%s,%s)", (record.tenant_id, record.knowledge_id, record.revision, record.record_id))
