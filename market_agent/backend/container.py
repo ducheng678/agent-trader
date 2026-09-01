@@ -30,6 +30,7 @@ class BackendContainer:
     memory_authority: object | None = None
     harness_kernel: Any = None
     harness_application: Any = None
+    harness_completion_candidate_factory: Any = None
 
     def __post_init__(self) -> None:
         if self.harness_application is not None:
@@ -53,6 +54,7 @@ class BackendContainer:
         observability: BackendObservability | None = None,
         harness_kernel: Any = None,
         harness_application: Any = None,
+        harness_completion_candidate_factory: Any = None,
     ) -> "BackendContainer":
         resolved_settings = (settings or BackendSettings.from_env()).validate()
         configure_structured_logging()
@@ -99,6 +101,7 @@ class BackendContainer:
             observability=observability,
             harness_kernel=harness_kernel,
             harness_application=harness_application,
+            harness_completion_candidate_factory=harness_completion_candidate_factory,
         )
         try:
             from market_agent.backend.memory_maintenance import MemoryMaintenanceScheduler
@@ -170,6 +173,7 @@ class BackendContainer:
                 container.harness_application = HarnessWorkflowApplication(
                     kernel=container.harness_kernel,
                     run_workflow=production_application.run_workflow,
+                    completion_candidate_factory=container.harness_completion_candidate_factory,
                 )
 
             container.agent_service = register_agent_tasks(

@@ -231,3 +231,9 @@ the paired `HarnessWorkflowApplication` around the production runner. The
 kernel's receipt issuer and signing capability must be provisioned by the
 trusted execution host; the HTTP service returns `503` rather than create an
 untrusted local replacement when that authority is absent.
+
+For a workflow to reach a successful terminal state, the same trusted host
+also supplies `harness_completion_candidate_factory`. It receives the immutable
+request, validated workflow result, and current Harness view, and must return
+the independently signed confidence/evidence candidate expected by the kernel.
+Without it, the default is intentional fail-closed degradation to no-trade.

@@ -32,6 +32,9 @@ class HarnessWorkflowExecution:
 
 
 WorkflowRunner = Callable[[WorkflowRequest], WorkflowResult]
+CompletionCandidateFactory = Callable[
+    [WorkflowRequest, WorkflowResult, HarnessSessionView], dict[str, object]
+]
 
 
 class HarnessWorkflowApplication:
@@ -43,11 +46,20 @@ class HarnessWorkflowApplication:
     to deploy before richer evidence adapters are enabled.
     """
 
-    def __init__(self, *, kernel: HarnessKernel, run_workflow: WorkflowRunner) -> None:
+    def __init__(
+        self,
+        *,
+        kernel: HarnessKernel,
+        run_workflow: WorkflowRunner,
+        completion_candidate_factory: CompletionCandidateFactory | None = None,
+    ) -> None:
         if type(kernel) is not HarnessKernel or not callable(run_workflow):
             raise TypeError("Harness application requires a kernel and host workflow runner")
+        if completion_candidate_factory is not None and not callable(completion_candidate_factory):
+            raise TypeError("completion candidate factory must be host-owned and callable")
         self._kernel = kernel
         self._run_workflow = run_workflow
+        self._completion_candidate_factory = completion_candidate_factory
 
     @property
     def kernel(self) -> HarnessKernel:
@@ -75,6 +87,7 @@ class HarnessWorkflowApplication:
 
         result: WorkflowResult | None = None
         error: str | None = None
+        completion_candidate: dict[str, object] | None = None
         if view.run_state is RunState.RUNNING:
             try:
                 candidate = self._run_workflow(request)
@@ -82,6 +95,12 @@ class HarnessWorkflowApplication:
                 if (candidate.workflow_id, candidate.trace_id) != (request.workflow_id, request.trace_id):
                     raise ValueError("workflow result identity does not match Harness run")
                 result = candidate
+                if self._completion_candidate_factory is not None:
+                    completion_candidate = self._completion_candidate_factory(
+                        request, result, view
+                    )
+                    if type(completion_candidate) is not dict:
+                        raise TypeError("host completion candidate must be an exact dictionary")
             except Exception as exc:  # Host error is recorded by deterministic degradation below.
                 error = type(exc).__name__
             # No candidate is derived from model output.  The kernel therefore
@@ -91,8 +110,13 @@ class HarnessWorkflowApplication:
                 view = self._kernel.snapshot(handle.run_id)
                 if view.run_state in {RunState.SUCCEEDED, RunState.DEGRADED, RunState.FAILED, RunState.CANCELLED}:
                     break
-                decision = self._kernel.advance(handle.run_id, expected_state_revision=view.state_revision)
+                decision = self._kernel.advance(
+                    handle.run_id,
+                    candidate=completion_candidate,
+                    expected_state_revision=view.state_revision,
+                )
                 decisions.append(decision)
+                completion_candidate = None
         view = self._kernel.snapshot(handle.run_id)
         return HarnessWorkflowExecution(
             handle=handle,
