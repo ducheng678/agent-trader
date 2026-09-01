@@ -49,6 +49,11 @@ class HarnessWorkflowApplication:
         self._kernel = kernel
         self._run_workflow = run_workflow
 
+    @property
+    def kernel(self) -> HarnessKernel:
+        """Expose the immutable host authority for composition validation."""
+        return self._kernel
+
     def execute(self, request: WorkflowRequest) -> HarnessWorkflowExecution:
         request = WorkflowRequest.model_validate(request)
         try:

@@ -32,6 +32,12 @@ class BackendContainer:
     harness_application: Any = None
 
     def __post_init__(self) -> None:
+        if self.harness_application is not None:
+            application_kernel = getattr(self.harness_application, "kernel", None)
+            if self.harness_kernel is None or application_kernel is not self.harness_kernel:
+                raise ValueError(
+                    "Harness application and API kernel must share one host authority"
+                )
         if self.observability is None:
             self.observability = BackendObservability.create(
                 event_capacity=self.settings.trace_event_capacity,
