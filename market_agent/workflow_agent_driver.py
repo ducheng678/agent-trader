@@ -255,17 +255,20 @@ class AgentDriver:
             if run.model_result_used_memory and self._memory_expired(run):
                 return self._discard_expired_memory_output(run)
             if run.model_result_used_memory:
-                # A memory-bound result needs a two-stage terminal audit. The
-                # synchronous observer can consume time, so ``task_completed``
-                # is deliberately a non-successful candidate record until the
-                # summary is checked again. This keeps an immutable success
-                # event out of the trace if the bounded authority expires while
-                # the completion audit is being committed.
+                # A memory-bound result needs a two-stage *candidate* audit.
+                # Every observer callback is synchronous and may consume the
+                # remaining summary authority.  Therefore neither record is a
+                # countable success or carries output: the returned result is
+                # accepted only after each callback returns while the summary
+                # remains valid.  This deliberately leaves no immutable success
+                # event for a memory-bound response; generic/no-memory requests
+                # retain their ordinary successful ``task_completed`` record.
                 self._emit(run, "task_completed", "accepted", outcome="selected")
                 if self._memory_expired(run):
                     return self._discard_expired_memory_output(run)
-                self._emit(run, "final_decision", "completed", outcome="succeeded", output=result.output,
-                           usage=result.usage)
+                self._emit(run, "final_decision", "accepted", outcome="selected")
+                if self._memory_expired(run):
+                    return self._discard_expired_memory_output(run)
             else:
                 self._emit(run, "task_completed", "completed", outcome="succeeded", output=result.output,
                            usage=result.usage)

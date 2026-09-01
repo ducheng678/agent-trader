@@ -127,3 +127,17 @@ Status: complete; supersedes the prior before-dispatch-only expiry claim.
   **249 passed in 11.68s**, exit 0. `python -m compileall -q market_agent
   market_agent_test_bundle/tests` and `git diff --check` also passed; only
   normal LF-to-CRLF notices were emitted. `.tmpbudget` was not touched.
+
+## Review fix 4: final-decision audit expiry boundary
+
+- `final_decision` is now also an output-free `accepted`/`selected` candidate
+  for memory-bound model responses. The driver checks the trusted summary
+  deadline after its synchronous observer returns before it returns the model
+  output. This avoids a false immutable success if the observer consumes the
+  final valid instant. Memory-bound audit trails intentionally contain only
+  candidate selection records on success; the returned `AgentResult` is the
+  acceptance boundary. Non-memory calls retain their existing successful
+  `task_completed` audit record.
+- A regression observer advances the trusted clock during `final_decision`.
+  The trace ends with the two output-free candidates, `memory_expired`, and
+  `task_failed`; no successful output or success outcome is recorded.
