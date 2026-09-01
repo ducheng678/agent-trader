@@ -344,30 +344,42 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             has_live_position=payload.has_live_position,
             prefetched_passive_event_judge=payload.prefetched_passive_event_judge,
         )
+        created = False
         try:
             handle = kernel.create(workflow_request)
             status = handle.run_state.value
+            created = True
         except ExecutionRegistrationError as error:
             if str(error) != "run already exists":
                 raise
             view = workflow_view(kernel, run_id)
             trace_id = view.trace_id
             status = view.run_state.value if view.run_state is not None else "created"
-        else:
-            try:
-                resolved_container.task_queue.submit(
-                    "execute_harness_workflow",
-                    workflow_request.model_dump(mode="json"),
-                    idempotency_key=run_id,
-                    request_id=trace_id,
-                )
-            except Exception:
+            workflow_request = WorkflowRequest.model_validate({
+                **workflow_request.model_dump(mode="python"),
+                "trace_id": trace_id,
+            })
+        try:
+            submission = resolved_container.task_queue.submit(
+                "execute_harness_workflow",
+                workflow_request.model_dump(mode="json"),
+                idempotency_key=run_id,
+                request_id=trace_id,
+            )
+        except Exception:
+            if created:
                 # Do not leave an admitted run permanently stranded when the
                 # durable dispatcher cannot accept it.
                 kernel.cancel(run_id, "workflow_dispatch_unavailable")
-                raise
-        return WorkflowAcceptedResponse(run_id=run_id, trace_id=trace_id, status=status,
-                                        status_url=f"/v1/workflows/{run_id}")
+            raise
+        return WorkflowAcceptedResponse(
+            run_id=run_id,
+            trace_id=trace_id,
+            status=status,
+            status_url=f"/v1/workflows/{run_id}",
+            job_id=submission.job.job_id,
+            job_status_url=f"/v1/tasks/{submission.job.job_id}",
+        )
 
     @app.get("/v1/workflows/{run_id}", response_model=WorkflowStatusResponse, tags=["workflows"])
     def get_workflow(run_id: str, _: None = Depends(require_api_token)) -> WorkflowStatusResponse:

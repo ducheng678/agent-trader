@@ -224,6 +224,8 @@ status, cancellation, and event endpoints are `/v1/workflows/{run_id}`,
 Supply the same `Idempotency-Key` to safely replay a submission. The response
 always returns the original run trace on a replay; requests without that key
 are intentionally independent runs.
+It also returns `job_id` and `job_status_url`, which expose the asynchronous
+result payload through the existing durable task API.
 
 The API deliberately requires a deployment-owned `HarnessKernel`. Construct
 the container with `BackendContainer.create(harness_kernel=kernel)`; it builds

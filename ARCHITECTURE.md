@@ -81,7 +81,8 @@ Every workflow request carries the middleware-generated W3C trace through the
 queue payload, Harness stream, coordinated agents, audit events, cache and memory
 operations. Idempotent API replays return the original run trace; requests without
 an idempotency key are independent runs. Tenant scope is checked at the workflow
-API boundary before a run is admitted.
+API boundary before a run is admitted. Creation responses also include the durable
+queue job ID and task-status URL used to retrieve the final structured result.
 
 ## Running Locally
 

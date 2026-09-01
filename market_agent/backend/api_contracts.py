@@ -43,6 +43,8 @@ class WorkflowAcceptedResponse(ApiModel):
     trace_id: TraceId
     status: str
     status_url: str
+    job_id: str
+    job_status_url: str
 
 
 class WorkflowStatusResponse(ApiModel):
