@@ -18,6 +18,14 @@
 - Stable prompt release system prefix comes first; dynamic context is canonical JSON user content.
 - Malformed output, unsafe metadata, and exhausted limits fail closed.
 
+## Prompt Release Activation Note
+
+`workflow_prompt_config.py` loads only Git-tracked, hash-validated release
+manifests. The local SQLite pointer supports atomic activation and a one-action
+rollback to the immediately preceding release. Calls pin an immutable release
+before dispatch, so an in-flight request is unaffected by later activation.
+Optional gate, audit, and metric hooks receive immutable metadata only.
+
 ---
 
 ### Task 1: Contracts and Prompt Releases
