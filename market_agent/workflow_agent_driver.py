@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -153,6 +153,8 @@ class _Run:
     spent: Decimal = Decimal("0")
     memory_context: str = ""
     memory_hash: str | None = None
+    memory_issued_at: float = 0.0
+    memory_expires_at: float = 0.0
 
 
 class AgentDriver:
@@ -214,8 +216,11 @@ class AgentDriver:
                     if summary.tenant_id != memory_tenant_id or summary.scope != memory_scope:
                         raise ValueError("memory requires a matching trusted tenant and scope")
                     content = summary.as_dynamic_context()
+                    run.memory_issued_at = summary.issued_at.timestamp()
+                    run.memory_expires_at = min(summary.expires_at.timestamp(),
+                        run.memory_issued_at + _MEMORY_MAX_AGE_SECONDS - summary.freshness_seconds)
                     if (summary.confidence >= _MEMORY_MIN_CONFIDENCE
-                            and summary.freshness_seconds <= _MEMORY_MAX_AGE_SECONDS
+                            and run.memory_issued_at <= self._clock.now() < run.memory_expires_at
                             and not summary.contradicting_evidence_ids
                             and len(content.encode("utf-8")) <= _MEMORY_MAX_BYTES):
                         run.memory_context = content
@@ -359,7 +364,8 @@ class AgentDriver:
                 request = ModelRequest(
                     trace_id=invocation.trace_id, model_tier=run.tier,
                     messages=(("system", system + _OUTPUT_INSTRUCTIONS), ("user", user))
-                             + ((("user", run.memory_context),) if run.memory_context else ()),
+                             + ((("user", run.memory_context),) if run.memory_context
+                                and run.memory_issued_at <= self._clock.now() < run.memory_expires_at else ()),
                     temperature=release.temperature_for(run.tier), output_schema_id=schema.schema_id,
                     output_schema_digest=schema.digest, output_schema_json=schema.json_schema,
                     deadline_epoch=invocation.deadline_epoch, attempt=run.attempts, cost_limit_usd=float(reservation),
@@ -378,6 +384,8 @@ class AgentDriver:
             per_tier_attempts += 1
             run.spent += reservation
             try:
+                if run.memory_context and not run.memory_issued_at <= self._clock.now() < run.memory_expires_at:
+                    request = replace(request, messages=request.messages[:2])
                 response = self._client.invoke(request)
             except Exception as error:
                 retryable = self._retry.is_retryable(error)

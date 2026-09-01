@@ -1,8 +1,8 @@
 """Transactional local memory. Only deterministic services retain writer authority."""
 from __future__ import annotations
 
-from collections.abc import Iterator
-from datetime import datetime
+from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
 import sqlite3
@@ -24,9 +24,11 @@ from market_agent.workflow_memory_lifecycle import (
 
 
 class SQLiteMemoryRepository:
-    def __init__(self, path: str | Path, *, writer_authority: object | None = None):
+    def __init__(self, path: str | Path, *, writer_authority: object | None = None,
+                 clock: Callable[[], datetime] | None = None):
         self.path = Path(path)
         self._authority = writer_authority
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
         self._db = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
@@ -80,6 +82,13 @@ class SQLiteMemoryRepository:
                 body_hash TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(tenant_id, task_id)
             );
+            CREATE TABLE IF NOT EXISTS memory_cleanup_attempts (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                FOREIGN KEY(tenant_id, task_id) REFERENCES memory_cleanup(tenant_id, task_id)
+            );
+            CREATE INDEX IF NOT EXISTS memory_cleanup_last_attempt
+                ON memory_cleanup_attempts(tenant_id, task_id, sequence);
         """)
 
     def close(self) -> None:
@@ -398,7 +407,7 @@ class SQLiteMemoryRepository:
                 if isinstance(prior, KnowledgeRevision) and prior.knowledge_id == record.knowledge_id and prior.lifecycle is Lifecycle.ACTIVE:
                     archived = prior.model_copy(update={"lifecycle": Lifecycle.ARCHIVED})
                     self._store(archived, update=True)
-                    self._set_lifecycle_time(archived, now)
+                    self._set_lifecycle_time(archived, TypeAdapter(AwareDatetime).validate_python(self._clock(), strict=True))
                     self._audit(archived, "supersede_knowledge", ctx)
             active = record.model_copy(update={"lifecycle": Lifecycle.ACTIVE})
             self._store(active, update=True)
@@ -462,7 +471,9 @@ class SQLiteMemoryRepository:
     def list_cleanup(self, *, tenant_id: str, scope: str | None = None) -> tuple[CleanupTask, ...]:
         with self._lock:
             result = []
-            for row in self._db.execute("SELECT * FROM memory_cleanup WHERE tenant_id=? AND done=0 ORDER BY task_id", (tenant_id,)):
+            for row in self._db.execute("SELECT c.* FROM memory_cleanup c WHERE c.tenant_id=? AND c.done=0 "
+                    "ORDER BY COALESCE((SELECT MAX(a.sequence) FROM memory_cleanup_attempts a "
+                    "WHERE a.tenant_id=c.tenant_id AND a.task_id=c.task_id), 0), c.task_id", (tenant_id,)):
                 task = self._cleanup_task(row)
                 if task.tenant_id != tenant_id or task.task_id != row["task_id"]:
                     raise MemoryIntegrityError("cleanup task identity mismatch")
@@ -484,7 +495,10 @@ class SQLiteMemoryRepository:
             self._db.execute("BEGIN IMMEDIATE")
             # Selection and guards share the write transaction, including links
             # created through other SQLite connections after the dry run.
-            current = build_lifecycle_plan(self.lifecycle_snapshot(plan.scope), plan.scope, plan.now, policy)
+            applied_at = TypeAdapter(AwareDatetime).validate_python(self._clock(), strict=True)
+            if plan.now > applied_at:
+                raise MemoryConflictError("lifecycle plan is ahead of the trusted apply clock")
+            current = build_lifecycle_plan(self.lifecycle_snapshot(plan.scope), plan.scope, applied_at, policy)
             eligible = {action.record_id: action for action in current.actions}
             examined = 0
             for action in plan.actions:
@@ -530,7 +544,7 @@ class SQLiteMemoryRepository:
                     target = Lifecycle.ARCHIVED if action.kind == "archive" else Lifecycle.TOMBSTONED
                     record = record.model_copy(update={"lifecycle": target})
                     self._store(record, update=True)
-                    self._set_lifecycle_time(record, plan.now)
+                    self._set_lifecycle_time(record, applied_at)
                     self._audit(record, "lifecycle_" + action.kind, action_ctx)
                     if action.kind == "tombstone":
                         for kind in ("vector", "cache"):
@@ -538,6 +552,26 @@ class SQLiteMemoryRepository:
                 self._db.execute("INSERT INTO memory_lifecycle_replay VALUES(?,?,?)", (ctx.tenant_id, key, request_hash))
                 applied.append(action.record_id)
         return LifecycleResult(applied_ids=tuple(applied), skipped_ids=tuple(skipped))
+
+    def begin_cleanup(self, task: CleanupTask, **context: Unpack[WriteArguments]) -> bool:
+        """Persist a fair retry position before external work, including crashes."""
+        ctx = self._context(**context)
+        task = CleanupTask.model_validate(task)
+        if task.tenant_id != ctx.tenant_id or task.trace_id != ctx.trace_id or task.task_id != ctx.idempotency_key:
+            raise MemoryAuthorityError("cleanup attempt must match its original mutation context")
+        with self._lock, self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            row = self._db.execute("SELECT * FROM memory_cleanup WHERE tenant_id=? AND task_id=?", (ctx.tenant_id, task.task_id)).fetchone()
+            if row is None or self._cleanup_task(row) != task:
+                raise MemoryIntegrityError("cleanup task is not registered")
+            if row["done"]:
+                return False
+            attempt = self._db.execute("INSERT INTO memory_cleanup_attempts(tenant_id,task_id) VALUES(?,?)",
+                                      (ctx.tenant_id, task.task_id)).lastrowid
+            self._db.execute("INSERT INTO memory_audit(tenant_id,trace_id,operation,record_id,idempotency_digest,record_hash) VALUES(?,?,?,?,?,?)",
+                (ctx.tenant_id, ctx.trace_id, "lifecycle_cleanup_attempt", task.record_id,
+                 content_hash({"task": task.task_id, "attempt": attempt}), task.record_hash))
+            return True
 
     def finish_cleanup(self, task: CleanupTask, **context: Unpack[WriteArguments]) -> None:
         ctx = self._context(**context)

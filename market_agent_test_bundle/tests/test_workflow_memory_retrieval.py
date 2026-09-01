@@ -99,6 +99,19 @@ def test_summary_is_cited_immutable_deterministic_and_bounded(repo):
     assert not tiny.rules and not tiny.evidence_ids
 
 
+@pytest.mark.parametrize("expiry_source", ["rule", "evidence", "age"])
+def test_summary_carries_issuance_and_earliest_support_expiry(repo, expiry_source):
+    rule = seed_rule(repo)
+    if expiry_source != "age":
+        record = rule if expiry_source == "rule" else repo.get_by_id(rule.evidence_ids[0], tenant_id="tenant-a")
+        replace_stored(repo, record.model_copy(update={"expires_at": NOW + timedelta(seconds=10)}))
+    result = retrieve_memory(query(now=NOW + timedelta(seconds=5), max_age_seconds=20), repo)
+    summary = build_core_experience_summary(result, 2000)
+    assert summary.issued_at == NOW + timedelta(seconds=5)
+    assert summary.expires_at == NOW + timedelta(seconds=20 if expiry_source == "age" else 10)
+    assert CoreExperienceSummary.model_validate_json(summary.model_dump_json()) == summary
+
+
 @pytest.mark.parametrize("changes", [
     {"model_version": "model-v2"}, {"vector_version": "embedding-v2"},
     {"memory_schema_version": "v2"},

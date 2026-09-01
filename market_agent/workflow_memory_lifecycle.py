@@ -114,6 +114,7 @@ class LifecycleRepository(MemoryRepository, Protocol):
     def apply_lifecycle(self, plan: LifecyclePlan, policy: LifecyclePolicy, limits: LifecycleLimits,
                         **context: Unpack[WriteArguments]) -> LifecycleResult: ...
     def list_cleanup(self, *, tenant_id: str, scope: str | None = None) -> tuple[CleanupTask, ...]: ...
+    def begin_cleanup(self, task: CleanupTask, **context: Unpack[WriteArguments]) -> bool: ...
     def finish_cleanup(self, task: CleanupTask, **context: Unpack[WriteArguments]) -> None: ...
 
 
@@ -217,8 +218,10 @@ class LifecycleWorker:
                 continue
             if attempted >= limits.max_cleanup:
                 break
-            attempted += 1
             cleanup_context = dict(context, trace_id=task.trace_id, idempotency_key=task.task_id)
+            if not self._repository.begin_cleanup(task, **cleanup_context):
+                continue
+            attempted += 1
             try:
                 if task.kind == "artifact":
                     self._artifacts.delete(task.artifact, **cleanup_context)

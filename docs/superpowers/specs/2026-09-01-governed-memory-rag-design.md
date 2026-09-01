@@ -45,6 +45,12 @@ conflict state, omissions, and deterministic hash. It is dynamic user content
 after a stable system prefix. Weak, stale, contradictory, or failed retrieval
 injects no memory.
 
+Summaries include hash-bound aware `issued_at` and `expires_at` timestamps from
+trusted retrieval. Expiry is the earliest freshness or explicit expiry deadline
+of the selected records and their supporting ancestry, outcomes, and final
+decisions. The driver compares them with its injected clock before every
+provider dispatch, including retries; a cached reported age cannot extend reuse.
+
 ## Promotion and Forgetting
 
 Promotion requires valid same-tenant evidence and independent corroboration or a
@@ -58,6 +64,13 @@ records. Referenced, active, or legally held records cannot purge. Actions are
 ordered archive, tombstone, then purge; idempotent outbox cleanup removes vector,
 artifact, and cache derivatives. Missing evidence yields a retrieval gap and
 safe `不知道`/`no_trade`, never invention.
+
+Application rechecks plan eligibility and records transition time using a trusted
+repository clock inside the write transaction. Future plans are rejected;
+delayed plans never backdate archive or tombstone quarantine. Cleanup records an
+audited durable attempt position before calling each adapter. Pending tasks are
+ordered by their last attempt, so failed tasks cannot monopolize a bounded run,
+including after restart. Adapter idempotency keys remain stable across retries.
 
 ## Verification
 

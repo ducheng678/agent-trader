@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
@@ -57,6 +57,7 @@ class MemoryMatch(MemoryContract):
     contradicting_evidence_ids: tuple[ShortText, ...] = ()
     confidence: FiniteUnit
     freshness_seconds: NonNegativeInt
+    expires_at: AwareDatetime
     score: float
 
 
@@ -81,10 +82,15 @@ class CoreExperienceSummary(MemoryContract):
 
     ``as_dynamic_context`` is empty for every unsafe/no-memory state. No callers
     should place memory in a system prefix or treat its text as instructions.
+    Trusted retrieval supplies issuance and the earliest supporting-record
+    deadline. Consumers must compare these timestamps with their own clock;
+    reported evidence age alone cannot authorize reuse of a cached summary.
     """
     trust: Literal["untrusted_memory"] = "untrusted_memory"
     tenant_id: ShortText
     scope: ShortText
+    issued_at: AwareDatetime
+    expires_at: AwareDatetime
     selected_ids: tuple[ShortText, ...] = ()
     evidence_ids: tuple[ShortText, ...] = ()
     contradicting_evidence_ids: tuple[ShortText, ...] = ()
@@ -99,6 +105,8 @@ class CoreExperienceSummary(MemoryContract):
 
     @model_validator(mode="after")
     def validate_summary_hash(self):
+        if self.expires_at < self.issued_at:
+            raise ValueError("summary expiry cannot precede issuance")
         digest = content_hash(self.model_dump(mode="json", exclude={"summary_hash"}))
         if self.summary_hash is not None and self.summary_hash != digest:
             raise ValueError("summary hash mismatch")
@@ -245,6 +253,7 @@ def _similarity(query: MemoryQuery, record: KnowledgeRevision | DecisionLesson, 
 
 
 def retrieve_memory(query: MemoryQuery, repository: MemoryRepository) -> RetrievalResult:
+    """Retrieve using ``query.now`` supplied by the trusted composition clock."""
     query = MemoryQuery.model_validate(query)
     base = dict(tenant_id=query.tenant_id, scope=query.scope, now=query.now)
     try:
@@ -277,7 +286,15 @@ def retrieve_memory(query: MemoryQuery, repository: MemoryRepository) -> Retriev
             omissions.add("evidence_gap")
             omitted_count += 1
             continue
-        oldest = min(record.observed_at, *(records[identifier].observed_at for identifier in evidence_ids))
+        dependencies = [record, *(records[identifier] for identifier in evidence_ids)]
+        # A verified outcome depends on its final decision even when that
+        # decision is not a displayed evidence citation.
+        dependencies.extend(records[item.decision_id] for item in tuple(dependencies)
+                            if isinstance(item, OutcomeRecord))
+        oldest = min(item.observed_at for item in dependencies)
+        expires_at = min(min(item.observed_at + timedelta(seconds=query.max_age_seconds),
+                             item.expires_at or datetime.max.replace(tzinfo=query.now.tzinfo))
+                         for item in dependencies)
         age = int((query.now - oldest).total_seconds())
         exact = query.task == " ".join(text.split()).casefold()
         score = (0.45 * similarity + 0.15 * exact + 0.1 * authority + 0.1 * record.confidence
@@ -287,7 +304,8 @@ def retrieve_memory(query: MemoryQuery, repository: MemoryRepository) -> Retriev
                                     kind="rule" if isinstance(record, KnowledgeRevision) else "lesson",
                                     text=text, evidence_ids=evidence_ids,
                                     contradicting_evidence_ids=contradicting,
-                                    confidence=record.confidence, freshness_seconds=age, score=round(score, 12)))
+                                    confidence=record.confidence, freshness_seconds=age,
+                                    expires_at=expires_at, score=round(score, 12)))
     # Inspect the full eligible set before Top-K so truncation cannot hide a
     # strong contradiction behind a higher ranked piece of advice.
     status = "conflict" if any(match.contradicting_evidence_ids for match in matches) else "hit" if matches else "miss"
@@ -313,6 +331,7 @@ def _summary(result: RetrievalResult, matches: list[MemoryMatch], omissions: set
     clear = result.status == "hit" and bool(matches)
     state = "clear" if clear else "conflict" if result.status == "conflict" else "failed" if result.status == "failed" else "no_memory"
     values = dict(tenant_id=result.tenant_id, scope=result.scope,
+                  issued_at=result.now, expires_at=min((m.expires_at for m in matches), default=result.now),
                   selected_ids=tuple(match.record_id for match in matches),
                   evidence_ids=tuple(sorted({identifier for match in matches for identifier in match.evidence_ids})),
                   contradicting_evidence_ids=tuple(sorted({identifier for match in matches for identifier in match.contradicting_evidence_ids})),

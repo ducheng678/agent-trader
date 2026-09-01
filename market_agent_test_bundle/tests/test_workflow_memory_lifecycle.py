@@ -13,7 +13,23 @@ from market_agent.workflow_long_term_memory import (
 )
 from market_agent.workflow_memory_retrieval import MemoryQuery, build_core_experience_summary, retrieve_memory
 from market_agent.workflow_object_store import FileArtifactStore
-from test_workflow_memory_storage import NOW, candidate, event, evidence, repo, write
+from market_agent.workflow_memory_sqlite import SQLiteMemoryRepository
+from test_workflow_memory_storage import NOW, candidate, event, evidence, write
+
+
+class Clock:
+    value = NOW
+
+    def __call__(self):
+        return self.value
+
+
+@pytest.fixture
+def repo(tmp_path):
+    clock, authority = Clock(), object()
+    with SQLiteMemoryRepository(tmp_path / "memory.db", writer_authority=authority, clock=clock) as repository:
+        repository.test_authority, repository.test_clock = authority, clock
+        yield repository
 
 
 def api():
@@ -30,6 +46,7 @@ def worker(repository, **changes):
 
 
 def apply(repository, service, plan, key, **changes):
+    repository.test_clock.value = plan.now
     return service.apply(plan, api().LifecycleLimits(**changes), **write(repository, key))
 
 
@@ -175,8 +192,9 @@ def test_cleanup_outbox_retries_across_reopen_and_is_bounded(repo, tmp_path):
     def clean(item, **context):
         assert context["trace_id"] == "trace-1"
         derivative_files[item.kind].unlink(missing_ok=True)
-    with SQLiteMemoryRepository(repo.path, writer_authority=authority) as reopened:
+    with SQLiteMemoryRepository(repo.path, writer_authority=authority, clock=repo.test_clock) as reopened:
         reopened.test_authority = authority
+        reopened.test_clock = repo.test_clock
         restored = worker(reopened, artifact_store=store, cleanup_adapters={"vector": clean, "cache": clean})
         result = apply(reopened, restored, purge, "purge", max_cleanup=1)
         assert len(result.cleaned_ids) == 1
@@ -308,3 +326,57 @@ def test_failed_cleanup_retries_and_cleanup_audit_failure_is_idempotent(repo, tm
         db.execute("DROP TRIGGER fail_cleanup")
     result = apply(repo, restored, plan, "purge")
     assert len(result.cleaned_ids) == 1 and result.pending_cleanup == 1
+
+
+def test_delayed_apply_starts_each_quarantine_at_actual_transition(repo):
+    repo.append_event(event(), **write(repo, "event"))
+    service = worker(repo)
+    actual = repo.test_clock.value = NOW + timedelta(seconds=1000)
+    archive = service.plan("tenant-a", now=NOW + timedelta(seconds=100))
+    service.apply(archive, api().LifecycleLimits(), **write(repo, "archive"))
+    assert repo.lifecycle_snapshot(api().LifecycleScope(tenant_id="tenant-a"))[0].changed_at == actual
+    assert not service.plan("tenant-a", now=actual + timedelta(seconds=9)).tombstone_ids
+    tombstone = service.plan("tenant-a", now=actual + timedelta(seconds=10))
+    actual += timedelta(seconds=1000)
+    repo.test_clock.value = actual
+    service.apply(tombstone, api().LifecycleLimits(), **write(repo, "tombstone"))
+    assert repo.lifecycle_snapshot(api().LifecycleScope(tenant_id="tenant-a"))[0].changed_at == actual
+    assert not service.plan("tenant-a", now=actual + timedelta(seconds=9)).purge_ids
+    purge = service.plan("tenant-a", now=actual + timedelta(seconds=10))
+    with pytest.raises(MemoryConflictError):
+        service.apply(purge, api().LifecycleLimits(), **write(repo, "future-purge"))
+    assert repo.get_by_id("event-1", tenant_id="tenant-a").lifecycle is Lifecycle.TOMBSTONED
+    actual += timedelta(seconds=100)
+    repo.test_clock.value = actual
+    service.apply(purge, api().LifecycleLimits(), **write(repo, "purge"))
+    assert repo.get_by_id("event-1", tenant_id="tenant-a") is None
+
+
+def test_failed_first_cleanup_cannot_starve_healthy_tasks_across_reopen(repo, tmp_path):
+    from market_agent.workflow_memory_sqlite import SQLiteMemoryRepository
+    repo.append_event(event(), **write(repo, "event"))
+    service = worker(repo)
+    purge = retire(repo, service)
+    tasks = repo.list_cleanup(tenant_id="tenant-a")
+    failed_id, healthy_id = tasks[0].task_id, tasks[1].task_id
+    derivative = tmp_path / "healthy-derivative"
+    derivative.write_text("pending", encoding="utf-8")
+    attempts = []
+    def clean(task, **context):
+        attempts.append(task.task_id)
+        if task.task_id == failed_id:
+            raise OSError("persistent backend failure")
+        derivative.unlink(missing_ok=True)
+    service = worker(repo, cleanup_adapters={"vector": clean, "cache": clean})
+    apply(repo, service, purge, "purge", max_cleanup=1)
+    assert attempts == [failed_id] and derivative.exists()
+    with SQLiteMemoryRepository(repo.path, writer_authority=repo.test_authority, clock=repo.test_clock) as reopened:
+        reopened.test_authority = repo.test_authority
+        reopened.test_clock = repo.test_clock
+        resumed = worker(reopened, cleanup_adapters={"vector": clean, "cache": clean})
+        result = apply(reopened, resumed, purge, "purge", max_cleanup=1)
+        assert result.cleaned_ids == (healthy_id,)
+        assert result.pending_cleanup == 1 and not derivative.exists()
+        assert attempts == [failed_id, healthy_id]
+        apply(reopened, resumed, purge, "purge", max_cleanup=1)
+        assert attempts == [failed_id, healthy_id, failed_id]

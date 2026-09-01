@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from hashlib import sha256
 import importlib
 import json
@@ -140,11 +141,49 @@ def cache_request(meta=None):
 def memory_summary(**changes):
     from market_agent.workflow_memory_retrieval import CoreExperienceSummary, SummaryItem
     values = dict(tenant_id="tenant-a", scope="default", conflict_state="clear", confidence=0.8,
+                  issued_at=datetime.fromtimestamp(0, timezone.utc), expires_at=datetime.fromtimestamp(50, timezone.utc),
                   selected_ids=("rule-1",), evidence_ids=("event-1", "event-2"),
                   rules=(SummaryItem(record_id="rule-1", text="Check cited observations before entry.",
                                      evidence_ids=("event-1", "event-2")),))
     values.update(changes)
     return CoreExperienceSummary(**values)
+
+
+def test_driver_rechecks_summary_expiry_when_reused_with_reported_age_zero():
+    client = Client(response(), response())
+    driver, _, clock = make_driver(client)
+    summary = memory_summary()
+    binding = dict(memory_context=summary, memory_tenant_id="tenant-a", memory_scope="default")
+    assert driver.execute(invocation(), **binding).failure is None
+    clock.time = 50.0
+    assert driver.execute(invocation(), **binding).failure is None
+    assert len(client.requests[0].messages) == 3
+    assert len(client.requests[1].messages) == 2
+
+
+def test_driver_drops_summary_that_expires_during_retry_wait():
+    client = Client(ProviderError(status_code=503), response())
+    driver, _, _ = make_driver(client)
+    summary = memory_summary(expires_at=datetime.fromtimestamp(1.1, timezone.utc))
+    result = driver.execute(invocation(), memory_context=summary, memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.failure is None
+    assert len(client.requests[0].messages) == 3
+    assert len(client.requests[1].messages) == 2
+
+
+def test_driver_checks_memory_expiry_after_slow_prompt_audit():
+    clock = Clock()
+    class SlowObserver(Observer):
+        def record(self, event):
+            super().record(event)
+            if event.event_type == "prompt_composed":
+                clock.time = 50.0
+    client = Client(response())
+    driver, _, _ = make_driver(client, clock=clock, audit_observer=SlowObserver())
+    result = driver.execute(invocation(), memory_context=memory_summary(),
+                            memory_tenant_id="tenant-a", memory_scope="default")
+    assert result.failure is None
+    assert len(client.requests[0].messages) == 2
 
 
 def test_driver_accepts_only_summary_as_dynamic_memory_after_stable_system_prefix():
@@ -219,6 +258,7 @@ def test_driver_import_and_summary_execution_need_no_memory_storage_or_writer_mo
     script = '''
 import importlib.abc
 import sys
+from datetime import datetime, timezone
 class DenyStorage(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname in {"market_agent.workflow_memory_sqlite", "market_agent.workflow_memory_lifecycle",
@@ -228,7 +268,8 @@ sys.meta_path.insert(0, DenyStorage())
 from market_agent.workflow_agent_driver import AgentDriver
 from market_agent.workflow_memory_retrieval import CoreExperienceSummary
 assert AgentDriver is not None
-assert CoreExperienceSummary(tenant_id="tenant-a", scope="default", conflict_state="no_memory").as_dynamic_context() == ""
+now = datetime.now(timezone.utc)
+assert CoreExperienceSummary(tenant_id="tenant-a", scope="default", conflict_state="no_memory", issued_at=now, expires_at=now).as_dynamic_context() == ""
 '''
     result = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
