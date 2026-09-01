@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 import json
 import math
+import re
 from typing import Any, Protocol
 
 from market_agent.backend.message_bus import MessageEnvelope
@@ -30,6 +32,18 @@ class RedisLike(Protocol):
 _SENSITIVE = frozenset({"authorization", "credential", "password", "secret", "token", "api_key", "access_key"})
 
 
+def _sensitive_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
+    markers = tuple(re.sub(r"[^a-z0-9]", "", marker) for marker in _SENSITIVE)
+    return normalized in markers or any(normalized.endswith(marker) for marker in markers)
+
+
+def _tenant_namespace(namespace: str, tenant_id: str, kind: str) -> str:
+    if type(namespace) is not str or type(tenant_id) is not str or not namespace.strip() or not tenant_id.strip():
+        raise ValueError("Redis namespace and tenant are required")
+    return f"{namespace}:tenant:{sha256(tenant_id.encode('utf-8')).hexdigest()}:{kind}:"
+
+
 def _safe_value(value: Any) -> Any:
     if value is None or type(value) in (str, int, bool):
         return value
@@ -44,7 +58,7 @@ def _safe_value(value: Any) -> Any:
         for key, item in value.items():
             if type(key) is not str:
                 raise RedisSerializationError("Redis values require string object keys")
-            if key.casefold() in _SENSITIVE:
+            if _sensitive_key(key):
                 result[key] = "[REDACTED]"
             else:
                 result[key] = _safe_value(item)
@@ -83,7 +97,7 @@ class RedisTenantCache:
         if not tenant_id.strip() or not namespace.strip() or default_ttl_seconds < 1 or maximum_value_bytes < 128:
             raise ValueError("invalid Redis cache configuration")
         self._client = client
-        self._prefix = f"{namespace}:tenant:{tenant_id}:cache:"
+        self._prefix = _tenant_namespace(namespace, tenant_id, "cache")
         self._ttl = default_ttl_seconds
         self._maximum_value_bytes = maximum_value_bytes
 
@@ -113,7 +127,8 @@ class RedisTenantCache:
         if lifetime < 1:
             raise ValueError("idempotency TTL must be positive")
         try:
-            return self._client.set(self._key("idempotency:" + key), _encode(value, self._maximum_value_bytes), ex=lifetime, nx=True) is True
+            result = self._client.set(self._key("idempotency:" + key), _encode(value, self._maximum_value_bytes), ex=lifetime, nx=True)
+            return result is True or result in ("OK", b"OK")
         except RedisSerializationError:
             raise
         except Exception as error:
@@ -149,7 +164,7 @@ class RedisStreamMessageBus:
         if not tenant_id.strip() or not namespace.strip() or maximum_message_bytes < 256:
             raise ValueError("invalid Redis message bus configuration")
         self._client = client
-        self._prefix = f"{namespace}:tenant:{tenant_id}:stream:"
+        self._prefix = _tenant_namespace(namespace, tenant_id, "stream")
         self._maximum_message_bytes = maximum_message_bytes
 
     def publish(self, message: MessageEnvelope) -> str:

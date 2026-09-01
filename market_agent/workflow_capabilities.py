@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 import math
+import re
 import secrets
 from threading import RLock
 from typing import Callable, Literal, NoReturn
@@ -37,9 +38,15 @@ _STATE_WRITE_PREFIXES = ("invocation.", "ephemeral.")
 
 
 def _is_reserved_authority(value: str) -> bool:
+    if type(value) is not str:
+        return True
+    segments = tuple(part for part in re.split(r"[-._:/\\\\]+", value.casefold()) if part)
     return any(
-        value == reserved or value.startswith(reserved + ".") or value.startswith(reserved + ":")
-        for reserved in _RESERVED_AUTHORITY
+        segments[:len(reserved_parts)] == reserved_parts
+        for reserved_parts in (
+            tuple(part for part in re.split(r"[._]+", reserved) if part)
+            for reserved in _RESERVED_AUTHORITY
+        )
     )
 
 
