@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
+from market_agent.workflow_structured_logging import StructuredEvent
+from market_agent.workflow_tracing import TraceId
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 IdempotencyKey = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)]
@@ -69,3 +71,17 @@ class ErrorResponse(ApiModel):
     message: str
     request_id: str | None = None
     details: dict[str, Any] = Field(default_factory=dict)
+
+
+class TraceEventResponse(ApiModel):
+    sequence: Annotated[int, Field(ge=1)]
+    event: StructuredEvent
+
+
+class TraceQueryResponse(ApiModel):
+    trace_id: TraceId
+    items: list[TraceEventResponse]
+    next_cursor: Annotated[int, Field(ge=0)]
+    oldest_available_sequence: Annotated[int, Field(ge=0)]
+    has_more: bool
+    truncated: bool

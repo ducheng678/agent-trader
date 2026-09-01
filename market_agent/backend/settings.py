@@ -41,12 +41,21 @@ class BackendSettings:
     api_host: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_API_HOST", "127.0.0.1"))
     api_port: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_API_PORT", 8080))
     environment: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_ENVIRONMENT", "development").lower())
+    trace_event_capacity: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TRACE_EVENT_CAPACITY", 10000))
+    trace_query_limit: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_TRACE_QUERY_LIMIT", 100))
+    workflow_metric_series_limit: int = field(default_factory=lambda: _integer_value("MARKET_AGENT_METRIC_SERIES_LIMIT", 2048))
 
     @classmethod
     def from_env(cls) -> "BackendSettings":
         return cls()
 
     def validate(self) -> "BackendSettings":
+        if type(self.trace_event_capacity) is not int or not 1 <= self.trace_event_capacity <= 100000:
+            raise ConfigurationError("trace_event_capacity must be between 1 and 100000")
+        if type(self.trace_query_limit) is not int or not 1 <= self.trace_query_limit <= min(500, self.trace_event_capacity):
+            raise ConfigurationError("trace_query_limit must be within event capacity and at most 500")
+        if type(self.workflow_metric_series_limit) is not int or not 16 <= self.workflow_metric_series_limit <= 4096:
+            raise ConfigurationError("workflow_metric_series_limit must be between 16 and 4096")
         if self.cache_max_entries < 1:
             raise ConfigurationError("cache_max_entries must be at least 1")
         if not math.isfinite(self.cache_default_ttl_seconds) or self.cache_default_ttl_seconds <= 0:

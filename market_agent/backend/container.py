@@ -9,6 +9,7 @@ from market_agent.backend.message_bus import InMemoryMessageBus
 from market_agent.backend.observability import MetricsRegistry, configure_structured_logging
 from market_agent.backend.settings import BackendSettings
 from market_agent.backend.task_queue import BackgroundTaskQueue
+from market_agent.backend.trace_observability import BackendObservability
 
 
 @dataclass
@@ -20,9 +21,18 @@ class BackendContainer:
     metrics: MetricsRegistry
     task_queue: BackgroundTaskQueue
     agent_service: Any = None
+    observability: BackendObservability | None = None
+
+    def __post_init__(self) -> None:
+        if self.observability is None:
+            self.observability = BackendObservability.create(
+                event_capacity=self.settings.trace_event_capacity,
+                maximum_query=self.settings.trace_query_limit,
+                maximum_metric_series=self.settings.workflow_metric_series_limit,
+            )
 
     @classmethod
-    def create(cls, settings: BackendSettings | None = None) -> "BackendContainer":
+    def create(cls, settings: BackendSettings | None = None, *, observability: BackendObservability | None = None) -> "BackendContainer":
         resolved_settings = (settings or BackendSettings.from_env()).validate()
         configure_structured_logging()
         repository = JobRepository(resolved_settings.database_path)
@@ -46,6 +56,7 @@ class BackendContainer:
             message_bus=message_bus,
             metrics=metrics,
             task_queue=task_queue,
+            observability=observability,
         )
         try:
             from market_agent.backend.agent_service import register_agent_tasks
