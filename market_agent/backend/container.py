@@ -133,6 +133,7 @@ class BackendContainer:
                     memory_repository=(container.governed_memory_repository
                                        or container.memory_repository),
                     semantic_cache=container.semantic_response_cache,
+                    historical_answer_cache=container.historical_answer_cache,
                     # Task 4 may replace this trace-bound host callback with
                     # governed outcome/promotion persistence.
                     completion_hook=lambda result: result.trace_id,

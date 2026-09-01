@@ -11,7 +11,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -39,6 +39,8 @@ from market_agent.workflow_contracts import (
     AgentReport,
     ContextSummary,
     CoordinatorPlan,
+    InformationalAnswer,
+    KnowledgeStatus,
     ReportStatus,
     TerminalMode,
     WorkflowBudgetState,
@@ -51,6 +53,12 @@ from market_agent.workflow_coordinator_services import AgentCoordinatorServices
 from market_agent.workflow_embedding_client import EmbeddingClient, OpenAIEmbeddingClient
 from market_agent.workflow_fallback import FallbackPolicy
 from market_agent.workflow_graph import CoordinatedWorkflow
+from market_agent.workflow_historical_answer_cache import (
+    HistoricalAnswerCache,
+    HistoricalAnswerMetadata,
+    HistoricalAnswerRecord,
+    lookup_fixed_seed,
+)
 from market_agent.workflow_long_term_memory import MemoryRepository, canonical_json as memory_json
 from market_agent.workflow_memory_retrieval import (
     CoreExperienceSummary,
@@ -100,6 +108,7 @@ class ProductionDependencies:
     memory_repository: MemoryRepository | None
     embedding_client: EmbeddingClient | None
     completion_hook: CompletionHook
+    historical_answer_cache: HistoricalAnswerCache | None = None
     workflow_factory: Callable[[], CoordinatedWorkflow] = CoordinatedWorkflow
     clock: Callable[[], float] = time.time
 
@@ -121,6 +130,7 @@ class ProductionWorkflowApplication:
         settings: BackendSettings,
         memory_repository: MemoryRepository | None,
         semantic_cache: SemanticRequestCache | None,
+        historical_answer_cache: HistoricalAnswerCache | None = None,
         completion_hook: CompletionHook,
     ) -> ProductionWorkflowApplication:
         checked = settings.validate()
@@ -130,6 +140,7 @@ class ProductionWorkflowApplication:
                 settings=checked,
                 memory_repository=memory_repository,
                 semantic_cache=semantic_cache,
+                historical_answer_cache=historical_answer_cache,
                 completion_hook=completion_hook,
             )
 
@@ -184,6 +195,15 @@ class ProductionWorkflowApplication:
             mode_cap,
             dependencies.settings.workflow_request_deadline_seconds,
         )
+        cached = _lookup_historical_answer(
+            request=request,
+            mode=mode,
+            tenant_id=bound_tenant,
+            deadline_epoch=deadline_epoch,
+            dependencies=dependencies,
+        )
+        if cached is not None:
+            return _generic_playbook(cached, request), _render_report(cached, mode, bound_tenant)
         records = _request_context_records(request, started_at)
         memory_scope = "default"
         memory = _retrieve_core_memory(
@@ -273,6 +293,14 @@ class ProductionWorkflowApplication:
         dependencies.completion_hook(result)
         if result.trace_id != admitted_trace:
             raise RuntimeError("completion hook received a cross-trace result")
+        _store_historical_answer(
+            request=request,
+            result=result,
+            mode=mode,
+            tenant_id=bound_tenant,
+            started_at=started_at,
+            dependencies=dependencies,
+        )
         return _generic_playbook(result, request), _render_report(result, mode, bound_tenant)
 
 
@@ -281,6 +309,7 @@ def _production_dependencies(
     settings: BackendSettings,
     memory_repository: MemoryRepository | None,
     semantic_cache: SemanticRequestCache | None,
+    historical_answer_cache: HistoricalAnswerCache | None,
     completion_hook: CompletionHook,
 ) -> ProductionDependencies:
     if not callable(completion_hook):
@@ -367,6 +396,7 @@ def _production_dependencies(
         memory_repository=memory_repository,
         embedding_client=embedding_client,
         completion_hook=completion_hook,
+        historical_answer_cache=historical_answer_cache,
         clock=clock.now,
     )
 
@@ -668,3 +698,104 @@ def _render_report(result: WorkflowResult, mode: WorkflowMode, tenant_id: str) -
         "uncertainty_reason": result.uncertainty_reason,
         "workflow_id": result.workflow_id,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _is_static_information(request: WorkflowRequest, mode: WorkflowMode) -> bool:
+    return (
+        mode is WorkflowMode.PASSIVE
+        and not request.event_tape
+        and not request.recent_events
+        and request.trigger_event is None
+        and request.trade_symbol_context is None
+        and request.active_symbol is None
+        and not request.has_live_position
+    )
+
+
+def _historical_metadata(*, tenant_id: str, settings: BackendSettings, now: float) -> HistoricalAnswerMetadata:
+    return HistoricalAnswerMetadata(
+        tenant_scope=tenant_id,
+        model_id=settings.workflow_terra_model_id,
+        model_version=settings.workflow_terra_model_version,
+        embedding_model=settings.embedding_model_id,
+        embedding_version=settings.embedding_model_version,
+        prompt_release_digest="informational-host-v1",
+        output_schema_digest=sha256(b"workflow-informational-v1").hexdigest(),
+        safety_policy_version="safe-informational-v1",
+        locale="zh-CN",
+        context_fingerprint="static-information-v1",
+        knowledge_fingerprint="static-information-v1",
+        evidence_references=(),
+        expires_at=now + settings.workflow_response_cache_ttl_seconds,
+    )
+
+
+def _cached_informational_result(request: WorkflowRequest, answer: str, source_references: tuple[str, ...]) -> WorkflowResult:
+    return WorkflowResult(
+        workflow_id=request.workflow_id,
+        trace_id=request.trace_id,
+        terminal_mode=TerminalMode.INFORMATIONAL,
+        final_action=Action.NO_TRADE,
+        knowledge_status=KnowledgeStatus.KNOWN,
+        uncertainty_reason=None,
+        evidence_references=source_references,
+        route_history=("historical_answer_cache",),
+        informational_answer=InformationalAnswer(
+            knowledge_status=KnowledgeStatus.KNOWN,
+            uncertainty_reason=None,
+            answer=answer,
+            source_references=source_references,
+        ),
+    )
+
+
+def _lookup_historical_answer(*, request: WorkflowRequest, mode: WorkflowMode, tenant_id: str,
+                              deadline_epoch: float, dependencies: ProductionDependencies) -> WorkflowResult | None:
+    if not _is_static_information(request, mode):
+        return None
+    now = dependencies.clock()
+    metadata = _historical_metadata(tenant_id=tenant_id, settings=dependencies.settings, now=now)
+    seed = lookup_fixed_seed(request.user_query, now=now, metadata=metadata)
+    if seed is not None:
+        return _cached_informational_result(request, str(seed.response["answer"]), ())
+    if dependencies.historical_answer_cache is None or dependencies.embedding_client is None:
+        return None
+    try:
+        vector = dependencies.embedding_client.embed(request.user_query, deadline_epoch=deadline_epoch)
+        record = dependencies.historical_answer_cache.lookup(vector, metadata, now=now)
+        if record is None:
+            return None
+        return _cached_informational_result(
+            request,
+            str(record.response["answer"]),
+            record.metadata.evidence_references,
+        )
+    except Exception:
+        return None
+
+
+def _store_historical_answer(*, request: WorkflowRequest, result: WorkflowResult, mode: WorkflowMode,
+                             tenant_id: str, started_at: float, dependencies: ProductionDependencies) -> None:
+    if (
+        not _is_static_information(request, mode)
+        or dependencies.historical_answer_cache is None
+        or dependencies.embedding_client is None
+        or result.terminal_mode is not TerminalMode.INFORMATIONAL
+        or result.knowledge_status is not KnowledgeStatus.KNOWN
+        or result.informational_answer is None
+        or result.uncertainty_reason is not None
+    ):
+        return
+    now = dependencies.clock()
+    try:
+        metadata = _historical_metadata(tenant_id=tenant_id, settings=dependencies.settings, now=now)
+        metadata = replace(metadata, evidence_references=tuple(result.informational_answer.source_references))
+        vector = dependencies.embedding_client.embed(request.user_query, deadline_epoch=now + 5.0)
+        key = sha256((tenant_id + "\x1f" + request.user_query + "\x1f" + metadata.prompt_release_digest).encode()).hexdigest()
+        dependencies.historical_answer_cache.put(HistoricalAnswerRecord(
+            entry_id="history-" + key[:48], request_text=request.user_query,
+            request_vector=vector, response={"answer": result.informational_answer.answer},
+            request_timestamp=started_at, response_timestamp=now, metadata=metadata,
+        ))
+    except Exception:
+        return
