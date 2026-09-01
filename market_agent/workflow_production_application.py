@@ -109,6 +109,7 @@ class ProductionDependencies:
     embedding_client: EmbeddingClient | None
     completion_hook: CompletionHook
     historical_answer_cache: HistoricalAnswerCache | None = None
+    prompt_release_manager: Any = None
     workflow_factory: Callable[[], CoordinatedWorkflow] = CoordinatedWorkflow
     clock: Callable[[], float] = time.time
 
@@ -165,6 +166,7 @@ class ProductionWorkflowApplication:
         request = WorkflowRequest.model_validate(request)
         admitted_trace = request.trace_id
         bound_tenant = _bind_tenant(tenant_id, dependencies.settings.tenant_id)
+        prompt_release_digest = dependencies.prompt_release_manager.current().release_digest
         mode = (WorkflowMode.PASSIVE if request.trigger_reason == "passive_event_trigger"
                 else WorkflowMode.ACTIVE)
         started_at = dependencies.clock()
@@ -177,6 +179,7 @@ class ProductionWorkflowApplication:
             request=request,
             mode=mode,
             tenant_id=bound_tenant,
+            prompt_release_digest=prompt_release_digest,
             deadline_epoch=deadline_epoch,
             dependencies=dependencies,
         )
@@ -277,6 +280,7 @@ class ProductionWorkflowApplication:
             mode=mode,
             tenant_id=bound_tenant,
             started_at=started_at,
+            prompt_release_digest=prompt_release_digest,
             dependencies=dependencies,
         )
         return result
@@ -411,6 +415,7 @@ def _production_dependencies(
         embedding_client=embedding_client,
         completion_hook=completion_hook,
         historical_answer_cache=historical_answer_cache,
+        prompt_release_manager=prompt_manager,
         clock=clock.now,
     )
 
@@ -726,14 +731,15 @@ def _is_static_information(request: WorkflowRequest, mode: WorkflowMode) -> bool
     )
 
 
-def _historical_metadata(*, tenant_id: str, settings: BackendSettings, now: float) -> HistoricalAnswerMetadata:
+def _historical_metadata(*, tenant_id: str, settings: BackendSettings, now: float,
+                         prompt_release_digest: str) -> HistoricalAnswerMetadata:
     return HistoricalAnswerMetadata(
         tenant_scope=tenant_id,
         model_id=settings.workflow_terra_model_id,
         model_version=settings.workflow_terra_model_version,
         embedding_model=settings.embedding_model_id,
         embedding_version=settings.embedding_model_version,
-        prompt_release_digest="informational-host-v1",
+        prompt_release_digest=prompt_release_digest,
         output_schema_digest=sha256(b"workflow-informational-v1").hexdigest(),
         safety_policy_version="safe-informational-v1",
         locale="zh-CN",
@@ -764,11 +770,17 @@ def _cached_informational_result(request: WorkflowRequest, answer: str, source_r
 
 
 def _lookup_historical_answer(*, request: WorkflowRequest, mode: WorkflowMode, tenant_id: str,
-                              deadline_epoch: float, dependencies: ProductionDependencies) -> WorkflowResult | None:
+                              deadline_epoch: float, prompt_release_digest: str,
+                              dependencies: ProductionDependencies) -> WorkflowResult | None:
     if not _is_static_information(request, mode):
         return None
     now = dependencies.clock()
-    metadata = _historical_metadata(tenant_id=tenant_id, settings=dependencies.settings, now=now)
+    metadata = _historical_metadata(
+        tenant_id=tenant_id,
+        settings=dependencies.settings,
+        now=now,
+        prompt_release_digest=prompt_release_digest,
+    )
     seed = lookup_fixed_seed(request.user_query, now=now, metadata=metadata)
     if seed is not None:
         return _cached_informational_result(request, str(seed.response["answer"]), ())
@@ -789,7 +801,8 @@ def _lookup_historical_answer(*, request: WorkflowRequest, mode: WorkflowMode, t
 
 
 def _store_historical_answer(*, request: WorkflowRequest, result: WorkflowResult, mode: WorkflowMode,
-                             tenant_id: str, started_at: float, dependencies: ProductionDependencies) -> None:
+                             tenant_id: str, started_at: float, prompt_release_digest: str,
+                             dependencies: ProductionDependencies) -> None:
     if (
         not _is_static_information(request, mode)
         or dependencies.historical_answer_cache is None
@@ -802,7 +815,12 @@ def _store_historical_answer(*, request: WorkflowRequest, result: WorkflowResult
         return
     now = dependencies.clock()
     try:
-        metadata = _historical_metadata(tenant_id=tenant_id, settings=dependencies.settings, now=now)
+        metadata = _historical_metadata(
+            tenant_id=tenant_id,
+            settings=dependencies.settings,
+            now=now,
+            prompt_release_digest=prompt_release_digest,
+        )
         metadata = replace(metadata, evidence_references=tuple(result.informational_answer.source_references))
         vector = dependencies.embedding_client.embed(request.user_query, deadline_epoch=now + 5.0)
         key = sha256((tenant_id + "\x1f" + request.user_query + "\x1f" + metadata.prompt_release_digest).encode()).hexdigest()
