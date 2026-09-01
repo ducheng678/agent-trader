@@ -1,3 +1,5 @@
+"""Compatibility-only facade for the pre-Harness LLM workflows."""
+
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, TypedDict
@@ -62,6 +64,8 @@ def _build_passive_graph():
 
 
 class LLMWorkflow:
+    """Retain the legacy callable API while Harness execution lives elsewhere."""
+
     def __init__(self):
         self._single = _build_single_graph()
         self._passive = _build_passive_graph()

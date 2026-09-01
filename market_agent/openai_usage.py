@@ -1,6 +1,9 @@
 import os
 import re
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
+from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from market_agent.constants import (
     DEFAULT_CHART_IMAGE_DETAIL,
@@ -9,8 +12,97 @@ from market_agent.constants import (
     SEARCH_QUERY_NOISE_TOKENS,
 )
 
+PricingBand = Literal["short", "long"]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPricing:
+    input: Decimal
+    cached_input: Decimal
+    cache_write: Decimal
+    output: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class UsageTokens:
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    output_tokens: int = 0
+    web_search_tool_calls: int = 0
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.cache_write_tokens,
+            self.output_tokens,
+            self.web_search_tool_calls,
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError("usage token counts must be non-negative integers")
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("cached input tokens cannot exceed input tokens")
+
+
+WORKFLOW_MODEL_PRICING_USD_PER_1M: Mapping[str, Mapping[PricingBand, ModelPricing]] = MappingProxyType({
+    "gpt-5.6-sol": MappingProxyType({
+        "short": ModelPricing(Decimal("4.00"), Decimal("0.40"), Decimal("5.00"), Decimal("20.00")),
+        "long": ModelPricing(Decimal("8.00"), Decimal("0.80"), Decimal("10.00"), Decimal("30.00")),
+    }),
+    "gpt-5.6-terra": MappingProxyType({
+        "short": ModelPricing(Decimal("2.00"), Decimal("0.20"), Decimal("2.50"), Decimal("12.00")),
+        "long": ModelPricing(Decimal("4.00"), Decimal("0.40"), Decimal("5.00"), Decimal("18.00")),
+    }),
+    "gpt-5.6-luna": MappingProxyType({
+        "short": ModelPricing(Decimal("0.20"), Decimal("0.02"), Decimal("0.25"), Decimal("1.20")),
+        "long": ModelPricing(Decimal("0.40"), Decimal("0.04"), Decimal("0.50"), Decimal("1.80")),
+    }),
+})
+
+
+def workflow_model_pricing(model: str, band: PricingBand) -> ModelPricing:
+    if not isinstance(model, str) or model not in WORKFLOW_MODEL_PRICING_USD_PER_1M:
+        raise ValueError("unknown workflow model")
+    if band not in {"short", "long"}:
+        raise ValueError("workflow pricing band must be explicit")
+    return WORKFLOW_MODEL_PRICING_USD_PER_1M[model][band]
+
+
+def estimate_workflow_usage_cost(
+    model: str,
+    band: PricingBand,
+    usage: UsageTokens,
+    *,
+    web_search_tool_price_usd_per_1k: Decimal | None = None,
+) -> Decimal:
+    if not isinstance(usage, UsageTokens):
+        raise ValueError('workflow usage must use UsageTokens')
+    if web_search_tool_price_usd_per_1k is not None and (
+        not isinstance(web_search_tool_price_usd_per_1k, Decimal)
+        or not web_search_tool_price_usd_per_1k.is_finite()
+        or web_search_tool_price_usd_per_1k < 0
+    ):
+        raise ValueError('web search tool price must be a non-negative finite decimal')
+    pricing = workflow_model_pricing(model, band)
+    uncached_input_tokens = usage.input_tokens - usage.cached_input_tokens
+    tool_price = (
+        get_openai_web_search_tool_price_usd_per_1k_decimal()
+        if web_search_tool_price_usd_per_1k is None
+        else web_search_tool_price_usd_per_1k
+    )
+    return (
+        Decimal(uncached_input_tokens) * pricing.input
+        + Decimal(usage.cached_input_tokens) * pricing.cached_input
+        + Decimal(usage.cache_write_tokens) * pricing.cache_write
+        + Decimal(usage.output_tokens) * pricing.output
+    ) / Decimal(1_000_000) + Decimal(usage.web_search_tool_calls) * tool_price / Decimal(1_000)
+
 
 def get_openai_model_pricing(model: str) -> Optional[Dict[str, float]]:
+    model_key = str(model or "").strip().lower()
+    if not model_key or model_key in WORKFLOW_MODEL_PRICING_USD_PER_1M:
+        return None
     override_input = os.getenv("OPENAI_PRICE_INPUT_PER_1M_USD", "").strip()
     override_cached = os.getenv("OPENAI_PRICE_CACHED_INPUT_PER_1M_USD", "").strip()
     override_output = os.getenv("OPENAI_PRICE_OUTPUT_PER_1M_USD", "").strip()
@@ -20,9 +112,6 @@ def get_openai_model_pricing(model: str) -> Optional[Dict[str, float]]:
             "cached_input": float(override_cached),
             "output": float(override_output),
         }
-    model_key = str(model or "").strip().lower()
-    if not model_key:
-        return None
     if model_key in DEFAULT_OPENAI_MODEL_PRICING_USD_PER_1M:
         return dict(DEFAULT_OPENAI_MODEL_PRICING_USD_PER_1M[model_key])
     if model_key.startswith("gpt-5.4-mini"):
@@ -34,11 +123,19 @@ def get_openai_model_pricing(model: str) -> Optional[Dict[str, float]]:
     return None
 
 
+def get_openai_web_search_tool_price_usd_per_1k_decimal() -> Decimal:
+    raw_price = os.getenv("OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD", str(DEFAULT_OPENAI_WEB_SEARCH_TOOL_PRICE_USD_PER_1K)).strip()
+    try:
+        price = Decimal(raw_price)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("web search tool price must be a non-negative finite decimal") from exc
+    if not price.is_finite() or price < 0:
+        raise ValueError("web search tool price must be a non-negative finite decimal")
+    return price
+
+
 def get_openai_web_search_tool_price_usd_per_1k() -> float:
-    return max(
-        0.0,
-        float(os.getenv("OPENAI_WEB_SEARCH_TOOL_PRICE_PER_1K_USD", str(DEFAULT_OPENAI_WEB_SEARCH_TOOL_PRICE_USD_PER_1K))),
-    )
+    return float(get_openai_web_search_tool_price_usd_per_1k_decimal())
 
 
 def _response_attr(value: Any, key: str, default: Any = None) -> Any:
