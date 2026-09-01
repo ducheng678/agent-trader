@@ -1,0 +1,514 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from hashlib import sha256
+import importlib
+import json
+
+import pytest
+from pydantic import BaseModel, ConfigDict, Field
+
+from market_agent.local_knowledge_base import KnowledgeDocument, LocalKnowledgeBase
+from market_agent.workflow_agent_contracts import AgentInvocation, AgentUsage, ModelTier
+from market_agent.workflow_circuit_breaker import CircuitBreaker
+from market_agent.workflow_fallback import FallbackPolicy
+from market_agent.workflow_prompt_release import PromptRelease, PromptReleaseRegistry, canonical_json
+from market_agent.workflow_response_cache import CacheMetadata, CachedResponse, ExactCacheKey, ExactResponseCache
+from market_agent.workflow_retry_policy import ProviderError, RetryPolicy
+from market_agent.workflow_semantic_request_cache import SemanticCacheEntry, SemanticRequestCache
+
+
+class Answer(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    answer: str = Field(min_length=1)
+
+
+class CitedAnswer(Answer):
+    citations: list[str] = Field(default_factory=list)
+
+
+class Clock:
+    def __init__(self):
+        self.time = 1.0
+        self.waits = []
+
+    def now(self):
+        return self.time
+
+    def sleep(self, seconds):
+        self.waits.append(seconds)
+        self.time += seconds
+
+
+class Observer:
+    def __init__(self):
+        self.events = []
+
+    def record(self, event):
+        self.events.append(event)
+
+
+class Client:
+    """Transport double: records the actual driver request and returns raw provider data."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.requests = []
+
+    def invoke(self, request):
+        self.requests.append(request)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if callable(outcome):
+            return outcome(request)
+        return outcome
+
+
+def api():
+    # A missing implementation is an explicit assertion failure on the first RED run.
+    assert importlib.util.find_spec("market_agent.workflow_agent_driver") is not None, "AgentDriver is not implemented"
+    return importlib.import_module("market_agent.workflow_agent_driver")
+
+
+def schema(model=Answer, **overrides):
+    return api().OutputSchema(schema_id="answer-v1", model=model, **overrides)
+
+
+def invocation(output_schema=None, **overrides):
+    values = dict(
+        trace_id="trace-1", run_id="run-1", task_id="task-1", task_kind="extract",
+        prompt_release_id="release-v1", prompt_release_digest="a" * 64,
+        allowed_model_tier=ModelTier.LUNA, deadline_epoch=100.0,
+        max_attempts=6, cost_limit_usd=1.0, output_schema_id="answer-v1",
+        output_schema_digest=(output_schema or schema()).digest,
+        user_payload={"query": "supported answer", "context": "private payload"},
+    )
+    values.update(overrides)
+    return AgentInvocation(**values)
+
+
+def response(content='{"answer":"known"}', tier=ModelTier.LUNA, cost=0.01):
+    return api().ModelResponse(
+        content=content,
+        usage=AgentUsage(input_tokens=4, output_tokens=2, cost_usd=cost, model_tier=tier),
+    )
+
+
+def metadata(output_schema=None, **overrides):
+    values = dict(
+        tenant_scope="tenant-a", prompt_release_digest="a" * 64,
+        output_schema_digest=(output_schema or schema()).digest,
+        model_compatibility_key="luna-v1", category="reference", expires_at=50.0,
+        vector_version="vector-v1", model_version="luna-v1",
+    )
+    values.update(overrides)
+    return CacheMetadata(**values)
+
+
+def make_driver(client, *, output_schema=None, **overrides):
+    output_schema = output_schema or schema()
+    clock, observer = Clock(), Observer()
+    release = PromptRelease(
+        release_id="release-v1", digest="a" * 64, stable_system_prefix="Stable released prefix.",
+        supported_task_kinds=("extract", "analyze", "coordinator"),
+        supported_model_tiers=(ModelTier.SOL, ModelTier.TERRA, ModelTier.LUNA),
+        temperature_profile=((ModelTier.SOL, 0.0), (ModelTier.TERRA, 0.2), (ModelTier.LUNA, 0.0)),
+    )
+    values = dict(
+        model_client=client, audit_observer=observer, clock=clock, random=lambda low, high: high,
+        prompt_releases=PromptReleaseRegistry(releases=(release,)), output_schemas=(output_schema,),
+        retry_policy=RetryPolicy(max_attempts=2, base_delay=0.25),
+        circuit_breaker=CircuitBreaker(failure_threshold=3, cooldown=10.0),
+        fallback_policy=FallbackPolicy((ModelTier.SOL, ModelTier.TERRA, ModelTier.LUNA)),
+        model_costs={ModelTier.SOL: 0.1, ModelTier.TERRA: 0.1, ModelTier.LUNA: 0.1},
+    )
+    values.update(overrides)
+    return api().AgentDriver(**values), values["audit_observer"], values["clock"]
+
+
+def cache_request(meta=None):
+    return api().CacheRequest(metadata=meta or metadata(), vector=(1.0, 0.0))
+
+
+def test_driver_prefers_safe_semantic_cache_and_preserves_trace():
+    """Calling the provider before a valid semantic hit breaks the ordered flow."""
+    approved = {schema().digest: {"stable"}}
+    cache = SemanticRequestCache(safe_answers=approved)
+    cache.put(SemanticCacheEntry("seed", (1.0, 0.0), {"answer": "stable"}, metadata(), 0.0, "vector-v1", "luna-v1"))
+    client = Client()
+    driver, observer, _ = make_driver(client, semantic_cache=cache, cache_context=lambda inv: cache_request(), safe_answers=approved)
+
+    result = driver.execute(invocation())
+
+    assert result.origin == "semantic_cache"
+    assert result.output == {"answer": "stable"}
+    assert result.trace_id == "trace-1"
+    assert client.requests == []
+    assert observer.events[-1].event_type == "task_completed"
+    assert {event.trace_id for event in observer.events} == {"trace-1"}
+
+
+def test_fixed_cache_precedes_semantic_cache():
+    """A valid fixed seed must win even when semantic storage also has an answer."""
+    approved = {schema().digest: {"fixed", "semantic"}}
+    exact = ExactResponseCache(safe_answers=approved)
+    request_hash = sha256(canonical_json(invocation().user_payload).encode()).hexdigest()
+    exact.put(ExactCacheKey.from_metadata(request_hash, metadata()), {"answer": "fixed"}, metadata(), now=0.0)
+    semantic = SemanticRequestCache(safe_answers=approved)
+    semantic.put(SemanticCacheEntry("seed", (1.0, 0.0), {"answer": "semantic"}, metadata(), 0.0, "vector-v1", "luna-v1"))
+    driver, observer, _ = make_driver(Client(), exact_cache=exact, semantic_cache=semantic, cache_context=lambda inv: cache_request(), safe_answers=approved)
+
+    result = driver.execute(invocation())
+
+    assert result.origin == "fixed_cache"
+    assert result.output == {"answer": "fixed"}
+    assert "semantic_cache_hit" not in [event.event_type for event in observer.events]
+
+
+@pytest.mark.parametrize("content", [
+    'Here is the answer: {"answer":"known"}', '```json\n{"answer":"known"}\n```',
+    '{"answer":"known","extra":1}', '{"answer":4}', '[]', 'null',
+    '{"answer":"first","answer":"second"}', '{"answer":NaN}',
+    '{"answer":"known"} {"answer":"other"}', '{"answer":Infinity}',
+])
+def test_driver_rejects_malformed_provider_output_without_retry_or_fallback(content):
+    """Coercion, duplicate keys, wrappers, or schema errors must never become answers."""
+    client = Client(response(content))
+    driver, observer, clock = make_driver(client)
+
+    result = driver.execute(invocation())
+
+    assert result.failure.code == "malformed_output"
+    assert result.failure.retryable is False
+    assert result.output is None
+    assert len(client.requests) == 1
+    assert clock.waits == []
+    assert "fallback_selected" not in [event.event_type for event in observer.events]
+
+
+def test_model_request_has_stable_prefix_then_canonical_user_context():
+    """Dynamic data in the system prefix or a lost schema pin would break provider isolation."""
+    client = Client(response(), response())
+    driver, _, _ = make_driver(client)
+    assert driver.execute(invocation()).output == {"answer": "known"}
+    driver.execute(invocation(user_payload={"query": "different"}, trace_id="trace-2"))
+    first, second = client.requests
+    assert first.messages[0][0] == "system"
+    assert first.messages[0][1].startswith("Stable released prefix.")
+    assert first.messages[0] == second.messages[0]
+    assert "不知道" in first.messages[0][1]
+    assert "internally" in first.messages[0][1]
+    assert "private payload" not in first.messages[0][1]
+    assert first.messages[1] == ("user", '{"context":"private payload","query":"supported answer"}')
+    assert first.trace_id == "trace-1"
+    assert first.output_schema_digest == schema().digest
+    assert first.temperature == 0.0
+    assert first.cost_limit_usd == 0.1
+
+
+def test_transient_retry_keeps_tier_and_honors_retry_after():
+    """Retry must wait before calling the same tier and account for the failed reservation."""
+    client = Client(ProviderError(status_code=429, retry_after=1.5), response())
+    driver, observer, clock = make_driver(client)
+    result = driver.execute(invocation())
+    assert result.output == {"answer": "known"}
+    assert result.usage.cost_usd == pytest.approx(0.11)
+    assert [request.model_tier for request in client.requests] == [ModelTier.LUNA, ModelTier.LUNA]
+    assert [request.attempt for request in client.requests] == [0, 1]
+    assert clock.waits == [1.5]
+    assert "retry_scheduled" in [event.event_type for event in observer.events]
+
+
+@pytest.mark.parametrize("error", [ProviderError(status_code=401), ProviderError(status_code=403), ProviderError(code="safety"), ValueError("secret provider prose")])
+def test_permanent_errors_never_retry_downgrade_or_open_circuit(error):
+    client = Client(error)
+    breaker = CircuitBreaker(failure_threshold=1)
+    driver, observer, clock = make_driver(client, circuit_breaker=breaker)
+    result = driver.execute(invocation())
+    assert result.failure.code == "provider_error"
+    assert len(client.requests) == 1
+    assert clock.waits == []
+    assert breaker.acquire("luna", "extract", 2.0).kind == "allow"
+    assert "fallback_selected" not in [event.event_type for event in observer.events]
+
+
+def test_retry_exhaustion_downgrades_one_tier_at_a_time():
+    client = Client(TimeoutError(), TimeoutError(), TimeoutError(), TimeoutError(), response())
+    driver, observer, _ = make_driver(client)
+    result = driver.execute(invocation(task_kind="coordinator", allowed_model_tier=ModelTier.SOL))
+    assert result.output == {"answer": "known"}
+    assert [request.model_tier for request in client.requests] == [ModelTier.SOL, ModelTier.SOL, ModelTier.TERRA, ModelTier.TERRA, ModelTier.LUNA]
+    assert result.usage.cost_usd == pytest.approx(0.41)
+    assert sum(event.event_type == "model_downgraded" for event in observer.events) == 2
+
+
+@pytest.mark.parametrize("task_kind,allowed,want", [("extract", ModelTier.SOL, ModelTier.LUNA), ("analyze", ModelTier.SOL, ModelTier.TERRA), ("coordinator", ModelTier.LUNA, ModelTier.LUNA)])
+def test_task_routing_respects_difficulty_and_allowed_ceiling(task_kind, allowed, want):
+    client = Client(response(tier=want))
+    driver, _, _ = make_driver(client)
+    result = driver.execute(invocation(task_kind=task_kind, allowed_model_tier=allowed))
+    assert result.usage.model_tier == want
+    assert client.requests[0].model_tier == want
+
+
+def test_open_circuit_skips_provider_and_downgrades():
+    breaker = CircuitBreaker(failure_threshold=1, cooldown=10.0)
+    breaker.record("sol", "coordinator", False, 0.0)
+    client = Client(response(tier=ModelTier.TERRA))
+    driver, observer, _ = make_driver(client, circuit_breaker=breaker)
+    result = driver.execute(invocation(task_kind="coordinator", allowed_model_tier=ModelTier.SOL))
+    assert result.usage.model_tier == ModelTier.TERRA
+    assert [r.model_tier for r in client.requests] == [ModelTier.TERRA]
+    assert "circuit_opened" in [e.event_type for e in observer.events]
+
+
+def test_successful_half_open_probe_closes_circuit_and_is_audited():
+    breaker = CircuitBreaker(failure_threshold=1, cooldown=1.0)
+    breaker.record("luna", "extract", False, 0.0)
+    driver, observer, _ = make_driver(Client(response()), circuit_breaker=breaker)
+    assert driver.execute(invocation()).output == {"answer": "known"}
+    assert breaker.acquire("luna", "extract", 1.0).kind == "allow"
+    assert "circuit_probe" in [e.event_type for e in observer.events]
+    assert "circuit_closed" in [e.event_type for e in observer.events]
+
+
+@pytest.mark.parametrize("limits,want_calls", [({"max_attempts": 1}, 1), ({"cost_limit_usd": 0.1}, 1), ({"cost_limit_usd": 0.09}, 0), ({"deadline_epoch": 1.1}, 1), ({"deadline_epoch": 1.0}, 0), ({"attempt": 2, "max_attempts": 3}, 1)])
+def test_exhausted_limits_never_schedule_an_unfunded_or_late_retry(limits, want_calls):
+    client = Client(*[TimeoutError()] * 6)
+    driver, observer, clock = make_driver(client)
+    result = driver.execute(invocation(**limits))
+    assert result.origin == "abstention"
+    assert result.output == {"answer": "不知道"}
+    assert len(client.requests) == want_calls
+    assert clock.waits == []
+    assert "retry_scheduled" not in [e.event_type for e in observer.events]
+
+
+def test_local_knowledge_is_cited_and_never_promoted_to_cache():
+    output_schema = schema(CitedAnswer)
+    knowledge = LocalKnowledgeBase([KnowledgeDocument("doc-policy", "supported answer", "stable knowledge")])
+    fallback = FallbackPolicy((ModelTier.LUNA,), knowledge_base=knowledge)
+    semantic = SemanticRequestCache()
+    driver, observer, _ = make_driver(Client(TimeoutError()), output_schema=output_schema, fallback_policy=fallback, semantic_cache=semantic)
+    result = driver.execute(invocation(output_schema, max_attempts=1))
+    assert result.origin == "local_knowledge"
+    assert result.output == {"answer": "stable knowledge", "citations": ("doc-policy",)}
+    assert "local_knowledge_retrieved" in [e.event_type for e in observer.events]
+    assert semantic.lookup((1.0, 0.0), metadata(output_schema), 1.0) is None
+
+
+def test_knowledge_missing_citations_or_wrong_schema_falls_back_to_exact_unknown():
+    class Uncited(FallbackPolicy):
+        def resolve_local_knowledge(self, query):
+            return type("Invalid", (), {"answer": "untrusted", "citations": ()})()
+    fallback = Uncited((ModelTier.LUNA,), knowledge_base=LocalKnowledgeBase())
+    driver, _, _ = make_driver(Client(TimeoutError()), fallback_policy=fallback)
+    assert driver.execute(invocation(max_attempts=1)).output == {"answer": "不知道"}
+
+
+@pytest.mark.parametrize("meta_change,response_value", [({}, {"answer": "BUY"}), ({"tenant_scope": "tenant-b"}, {"answer": "不知道"}), ({"prompt_release_digest": "b" * 64}, {"answer": "不知道"}), ({"category": "trade_decision"}, {"answer": "不知道"}), ({"expires_at": 1.0}, {"answer": "不知道"})])
+def test_untrusted_cache_hits_are_revalidated_before_use(meta_change, response_value):
+    class CorruptCache:
+        def get(self, key, metadata, *, now):
+            return CachedResponse(key, response_value, replace(metadata, **meta_change), 0.0)
+    client = Client(response())
+    driver, observer, _ = make_driver(client, exact_cache=CorruptCache(), cache_context=lambda inv: cache_request())
+    result = driver.execute(invocation())
+    assert result.origin == "model"
+    assert result.output == {"answer": "known"}
+    assert any(e.event_type == "fixed_cache_miss" and e.status == "rejected" for e in observer.events)
+
+
+def test_audit_contains_only_trace_bound_hashes_and_redacted_metadata():
+    secret = "sk-live-private-provider-secret"
+    client = Client(TimeoutError(secret), response())
+    driver, observer, _ = make_driver(client)
+    result = driver.execute(invocation(user_payload={"query": secret}))
+    encoded = json.dumps([e.model_dump(mode="json") for e in observer.events])
+    assert result.trace_id == "trace-1"
+    assert {e.trace_id for e in observer.events} == {"trace-1"}
+    assert secret not in encoded
+    assert "known" not in encoded
+    assert all(e.input_hash and len(e.input_hash) == 64 for e in observer.events)
+    assert observer.events[-1].output_hash == sha256(b'{"answer":"known"}').hexdigest()
+
+
+@pytest.mark.parametrize("overrides", [{"prompt_release_digest": "b" * 64}, {"output_schema_digest": "b" * 64}, {"output_schema_id": "missing"}, {"task_kind": "unsupported"}])
+def test_invalid_release_schema_or_task_binding_never_calls_provider(overrides):
+    client = Client()
+    driver, _, _ = make_driver(client)
+    result = driver.execute(invocation(**overrides))
+    assert result.failure.code == "invalid_invocation"
+    assert client.requests == []
+
+
+def test_core_verification_hook_gets_only_validated_result_and_cannot_replace_it():
+    seen = []
+    output_schema = schema(reflection_required=True)
+    driver, observer, _ = make_driver(Client(response()), output_schema=output_schema, verification_hook=lambda result: seen.append(result))
+    result = driver.execute(invocation(output_schema))
+    assert seen == [result]
+    assert any(e.event_type == "core_result_ready" and e.payload.reason_code == "reflection_required" for e in observer.events)
+
+
+def test_audit_failure_stops_before_provider_call():
+    class BrokenObserver:
+        def record(self, event):
+            raise OSError("private database path")
+    client = Client()
+    driver, _, _ = make_driver(client, audit_observer=BrokenObserver())
+    result = driver.execute(invocation())
+    assert result.failure.code == "audit_unavailable"
+    assert client.requests == []
+
+
+def test_driver_has_no_harness_persistence_execution_or_exchange_imports():
+    """An authority-bearing import would let the driver bypass its scoped adapters."""
+    import ast
+    from pathlib import Path
+    tree = ast.parse(Path(api().__file__).read_text(encoding="utf-8"))
+    forbidden = ("workflow_harness", "workflow_state", "workflow_execution", "memory", "exchange", "queue", "sqlite", "sqlalchemy", "hyperliquid")
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
+    assert not [name for name in imported if any(part in name for part in forbidden)]
+
+
+@pytest.mark.parametrize("code", ["authentication", "authorization", "validation", "schema", "safety", "malformed_output"])
+def test_permanent_provider_codes_override_transient_http_status(code):
+    """A contradictory HTTP 503 must not turn a safety/schema denial into fallback."""
+    client = Client(ProviderError(status_code=503, code=code), response())
+    driver, _, clock = make_driver(client)
+    result = driver.execute(invocation())
+    assert result.failure is not None and result.failure.code == "provider_error"
+    assert len(client.requests) == 1
+    assert clock.waits == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"vector_version": "vector-v2"}, {"model_version": "luna-v2"},
+    {"request_vector": (0.0, 1.0)},
+    {"request_vector": (0.95, (1.0 - 0.95**2) ** 0.5)},
+])
+def test_semantic_adapter_cannot_bypass_version_or_similarity_gates(changes):
+    class CorruptSemantic:
+        def lookup(self, query, metadata, now):
+            candidate = SemanticCacheEntry("seed", (1.0, 0.0), {"answer": "不知道"}, metadata, 0.0, "vector-v1", "luna-v1")
+            return replace(candidate, **changes)
+    driver, observer, _ = make_driver(Client(response()), semantic_cache=CorruptSemantic(), cache_context=lambda inv: cache_request())
+    result = driver.execute(invocation())
+    assert result.origin == "model"
+    assert any(e.event_type == "semantic_cache_miss" and e.status == "rejected" for e in observer.events)
+
+
+def test_deadline_is_rechecked_after_audit_and_before_provider_dispatch():
+    clock = Clock()
+    class SlowObserver(Observer):
+        def record(self, event):
+            super().record(event)
+            if event.event_type == "prompt_composed":
+                clock.time = 100.0
+    client = Client(response())
+    driver, _, _ = make_driver(client, clock=clock, audit_observer=SlowObserver())
+    result = driver.execute(invocation())
+    assert client.requests == []
+    assert result.output == {"answer": "不知道"}
+
+
+def test_excessively_nested_provider_json_returns_typed_failure():
+    content = '{"answer":' + '[' * 2000 + '0' + ']' * 2000 + '}'
+    driver, _, _ = make_driver(Client(response(content)))
+    result = driver.execute(invocation())
+    assert result.failure.code == "malformed_output"
+
+
+def test_strict_validation_enforces_extra_field_denial_independent_of_schema_hints():
+    class Misconfigured(Answer):
+        model_config = ConfigDict(extra="ignore", json_schema_extra={"additionalProperties": False})
+    output_schema = schema(Misconfigured)
+    driver, _, _ = make_driver(Client(response('{"answer":"known","hidden":"secret"}')), output_schema=output_schema)
+    result = driver.execute(invocation(output_schema))
+    assert result.failure is not None and result.failure.code == "malformed_output"
+
+
+def test_schema_must_be_closed_and_support_exact_unknown_at_configuration_time():
+    class Open(BaseModel):
+        answer: str
+    class NoUnknown(Answer):
+        answer: int
+    with pytest.raises(ValueError):
+        schema(Open)
+    with pytest.raises(ValueError):
+        schema(NoUnknown)
+
+
+def test_nested_output_is_validated_without_coercing_or_ignoring_fields():
+    class Detail(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        count: int
+    class Nested(Answer):
+        detail: Detail | None = None
+    output_schema = schema(Nested)
+    driver, _, _ = make_driver(Client(response('{"answer":"known","detail":{"count":"2"}}')), output_schema=output_schema)
+    assert driver.execute(invocation(output_schema)).failure.code == "malformed_output"
+
+
+@pytest.mark.parametrize("usage", [None, {"input_tokens": 1}, AgentUsage(input_tokens=1, output_tokens=1, cost_usd=0.2, model_tier=ModelTier.LUNA), AgentUsage(input_tokens=1, output_tokens=1, cost_usd=0.01, model_tier=ModelTier.SOL)])
+def test_invalid_usage_or_wrong_model_cannot_be_a_success(usage):
+    client = Client(api().ModelResponse(content='{"answer":"known"}', usage=usage))
+    driver, _, _ = make_driver(client)
+    assert driver.execute(invocation()).failure.code == "malformed_output"
+
+
+def test_failed_half_open_probe_reopens_without_a_second_probe():
+    breaker = CircuitBreaker(failure_threshold=1, cooldown=1.0)
+    breaker.record("luna", "extract", False, 0.0)
+    client = Client(TimeoutError())
+    driver, observer, _ = make_driver(client, circuit_breaker=breaker)
+    result = driver.execute(invocation(max_attempts=1))
+    assert result.output == {"answer": "不知道"}
+    assert breaker.acquire("luna", "extract", 1.5).kind == "reject"
+    assert any(e.event_type == "circuit_recorded" and e.status == "failed" for e in observer.events)
+
+
+def test_cache_failure_does_not_change_provider_circuit_state():
+    class BrokenCache:
+        def get(self, key, metadata, *, now):
+            raise ConnectionError("local cache is unavailable")
+    breaker = CircuitBreaker(failure_threshold=1)
+    driver, _, _ = make_driver(Client(), exact_cache=BrokenCache(), cache_context=lambda inv: cache_request(), circuit_breaker=breaker)
+    assert driver.execute(invocation(cost_limit_usd=0.0)).origin == "abstention"
+    assert breaker.acquire("luna", "extract", 1.0).kind == "allow"
+
+
+def test_driver_does_not_widen_safe_answers_from_later_policy_mutation():
+    approved = {schema().digest: {"stable"}}
+    exact = ExactResponseCache(safe_answers={schema().digest: {"unreviewed"}})
+    key = ExactCacheKey.from_metadata(sha256(canonical_json(invocation().user_payload).encode()).hexdigest(), metadata())
+    exact.put(key, {"answer": "unreviewed"}, metadata(), now=0.0)
+    driver, _, _ = make_driver(Client(response()), exact_cache=exact, cache_context=lambda inv: cache_request(), safe_answers=approved)
+    approved[schema().digest].add("unreviewed")
+    assert driver.execute(invocation()).origin == "model"
+
+
+def test_knowledge_that_cannot_fit_the_declared_schema_abstains():
+    fallback = FallbackPolicy((ModelTier.LUNA,), knowledge_base=LocalKnowledgeBase([KnowledgeDocument("doc", "supported answer", "known")]))
+    driver, _, _ = make_driver(Client(TimeoutError()), fallback_policy=fallback)
+    result = driver.execute(invocation(max_attempts=1))
+    assert result.origin == "abstention"
+    assert result.output == {"answer": "不知道"}
+
+
+def test_driver_events_can_be_recorded_by_existing_audit_writer(tmp_path):
+    from market_agent.workflow_audit import AuditStore, AuditWriter
+    store = AuditStore(tmp_path / "driver-audit.sqlite3")
+    driver, _, _ = make_driver(Client(TimeoutError(), response()), audit_observer=AuditWriter(store))
+    result = driver.execute(invocation())
+    events = store.list(trace_id="trace-1")
+    assert result.output == {"answer": "known"}
+    assert events[-1].event_type == "task_completed"
+    assert [e.sequence for e in events] == list(range(1, len(events) + 1))

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Protocol
 
 from pydantic import AfterValidator, Field, StringConstraints, field_validator, model_validator
 from typing import Annotated
@@ -164,6 +164,11 @@ class AuditEventType(str, Enum):
     BACKOFF_SCHEDULED = "backoff_scheduled"
     CIRCUIT_OPENED = "circuit_opened"
     CIRCUIT_CLOSED = "circuit_closed"
+    CIRCUIT_PROBE = "circuit_probe"
+    CIRCUIT_RECORDED = "circuit_recorded"
+    MODEL_DOWNGRADED = "model_downgraded"
+    ABSTAINED = "abstained"
+    CORE_RESULT_READY = "core_result_ready"
     BUDGET_EXHAUSTED = "budget_exhausted"
     LOCAL_KNOWLEDGE_RETRIEVED = "local_knowledge_retrieved"
     FALLBACK_SELECTED = "fallback_selected"
@@ -269,6 +274,7 @@ class AuditReason(str, Enum):
     LOCAL_KNOWLEDGE = "local_knowledge"
     FALLBACK = "fallback"
     REFLECTION_FAILURE = "reflection_failure"
+    REFLECTION_REQUIRED = "reflection_required"
     RISK_REJECTED = "risk_rejected"
     PROMPT_ROLLBACK = "prompt_rollback"
     EVALUATION_FAILURE = "evaluation_failure"
@@ -403,6 +409,12 @@ class AuditEvent(ContractModel):
         elif self.hash_policy != _LEGACY_HASH_POLICY or self.legacy_semantic_digest is None:
             raise ValueError("transformed legacy audit rows require lineage and semantic digest metadata")
         return self
+
+
+class AuditObserver(Protocol):
+    """Capability-scoped event sink; drivers receive no audit storage authority."""
+
+    def record(self, event: AuditEvent) -> object: ...
 
 
 class AuditPage(list[AuditEvent]):
