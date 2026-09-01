@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, replace
 import math
-from typing import Mapping
+from typing import Iterable, Mapping
 
 
 class CacheSafetyError(ValueError):
@@ -26,9 +26,6 @@ _SAFE_CATEGORIES = frozenset(
         "validation",
     }
 )
-_SENSITIVE_FIELD_TOKENS = frozenset(
-    {"api_key", "authorization", "credential", "password", "secret", "token"}
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +38,8 @@ class CacheMetadata:
     model_compatibility_key: str
     category: str
     expires_at: float
+    vector_version: str | None = None
+    model_version: str | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -56,6 +55,9 @@ class CacheMetadata:
             raise ValueError("cache metadata strings must be non-empty")
         if not math.isfinite(self.expires_at):
             raise ValueError("cache expiry must be finite")
+        for version in (self.vector_version, self.model_version):
+            if version is not None and (not isinstance(version, str) or not version.strip()):
+                raise ValueError("cache versions must be non-empty when present")
 
     def with_category(self, category: str) -> CacheMetadata:
         return replace(self, category=category)
@@ -108,31 +110,49 @@ class CachedResponse:
     created_at: float
 
 
-def require_cache_safe(metadata: CacheMetadata, response: Mapping[str, object]) -> None:
-    """Fail closed unless a response has an explicitly safe category and no secret field."""
+def require_cache_safe(
+    metadata: CacheMetadata,
+    response: Mapping[str, object],
+    safe_answers: Mapping[str, frozenset[str]] | None = None,
+) -> None:
+    """Admit only the closed answer schema and a reviewed, schema-scoped literal.
+
+    Categories alone cannot establish semantic safety. The only default answer
+    is the fixed abstention; other literals must come from trusted static policy,
+    never from provider output, tool results, or local-knowledge promotion.
+    """
     if metadata.category not in _SAFE_CATEGORIES:
         raise CacheSafetyError("cache category is not explicitly safe and read-only")
-    if not isinstance(response, Mapping):
-        raise CacheSafetyError("cache response must be a JSON object")
-    _reject_sensitive_fields(response)
+    if not isinstance(response, Mapping) or set(response) != {"answer"}:
+        raise CacheSafetyError("cache response must contain only the approved answer field")
+    answer = response["answer"]
+    if type(answer) is not str:
+        raise CacheSafetyError("cache answer must be plain text, without nested content")
+    approved = (safe_answers or {}).get(metadata.output_schema_digest, frozenset())
+    if answer != "不知道" and answer not in approved:
+        raise CacheSafetyError("cache answer is not an explicitly reviewed safe literal")
 
 
-def _reject_sensitive_fields(value: object) -> None:
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            normalized_key = str(key).strip().lower().replace("-", "_")
-            if any(token in normalized_key for token in _SENSITIVE_FIELD_TOKENS):
-                raise CacheSafetyError("cache response contains a sensitive field")
-            _reject_sensitive_fields(child)
-    elif isinstance(value, (tuple, list)):
-        for child in value:
-            _reject_sensitive_fields(child)
+def snapshot_safe_answers(
+    safe_answers: Mapping[str, Iterable[str]] | None,
+) -> dict[str, frozenset[str]]:
+    """Snapshot trusted schema/literal policy so caller mutation cannot widen admission."""
+    approved: dict[str, frozenset[str]] = {}
+    for schema, answers in (safe_answers or {}).items():
+        if type(schema) is not str or not schema.strip() or isinstance(answers, (str, bytes)):
+            raise ValueError("safe answers require a schema digest and a collection of literals")
+        literals = tuple(answers)
+        if not all(type(answer) is str and answer.strip() for answer in literals):
+            raise ValueError("reviewed safe answers must be non-empty plain text literals")
+        approved[schema] = frozenset(literals)
+    return approved
 
 
 class ExactResponseCache:
     """A process-local exact cache with hard metadata and expiry checks."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, safe_answers: Mapping[str, Iterable[str]] | None = None) -> None:
+        self._safe_answers = snapshot_safe_answers(safe_answers)
         self._entries: dict[ExactCacheKey, CachedResponse] = {}
 
     def put(
@@ -144,7 +164,7 @@ class ExactResponseCache:
         now: float,
     ) -> CachedResponse:
         self._validate_key_matches_metadata(key, metadata)
-        require_cache_safe(metadata, response)
+        require_cache_safe(metadata, response, self._safe_answers)
         if not math.isfinite(now):
             raise ValueError("cache creation time must be finite")
         entry = CachedResponse(key, deepcopy(dict(response)), metadata, now)
