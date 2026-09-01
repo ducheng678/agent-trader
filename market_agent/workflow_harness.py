@@ -7,9 +7,12 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 import math
+import os
+from pathlib import Path
 from functools import wraps
 from threading import RLock
 from typing import Any, Callable, Protocol, cast
+from weakref import WeakValueDictionary
 
 from pydantic import StrictBool, model_validator
 
@@ -158,26 +161,24 @@ class HarnessDecision(_StrictOutput):
             raise ValueError("reconciliation is required only while waiting reconciliation")
         if self.run_state is RunState.WAITING_RECONCILIATION and not self.reconciliation_required:
             raise ValueError("waiting reconciliation decisions must require reconciliation")
-        if self.run_state in {RunState.DEGRADING, RunState.DEGRADED} and not self.no_trade:
-            raise ValueError("degradation decisions must be no-trade")
-        if self.run_state is RunState.SUCCEEDED and self.no_trade:
-            raise ValueError("successful informational decisions cannot be no-trade")
-        if self.run_state is RunState.CANCELLED and self.reason_code not in {
-            "cancellation_completed",
-            "terminal_state",
-        }:
-            raise ValueError("cancelled decisions require the cancellation terminal reason")
+        must_be_no_trade = (
+            self.run_state in {
+                RunState.DEGRADING,
+                RunState.DEGRADED,
+                RunState.WAITING_RECONCILIATION,
+            }
+            or (
+                self.run_state is RunState.SUMMARIZING
+                and self.reason_code != "confidence_sufficient"
+            )
+        )
+        if self.no_trade != must_be_no_trade:
+            raise ValueError("decision no-trade flag and state/reason are inconsistent")
         if self.reason_code == "completed" and self.run_state is not RunState.SUCCEEDED:
             raise ValueError("completed reason requires succeeded state")
-        if self.reason_code == "reconciliation_required" and self.run_state is not RunState.WAITING_RECONCILIATION:
-            raise ValueError("reconciliation reason requires waiting reconciliation state")
-        terminal_reasons = {
-            RunState.SUCCEEDED: {"completed", "terminal_state"},
-            RunState.DEGRADED: {"safe_no_trade_due_to_degradation", "terminal_state"},
-            RunState.CANCELLED: {"cancellation_completed", "terminal_state"},
-        }
-        if self.run_state in terminal_reasons and self.reason_code not in terminal_reasons[self.run_state]:
-            raise ValueError("terminal state and reason are inconsistent")
+        allowed_states = _DECISION_REASON_STATES.get(self.reason_code)
+        if allowed_states is None or self.run_state not in allowed_states:
+            raise ValueError("decision reason and run state are inconsistent")
         if self.transition is not None and (
             self.transition.run_id != self.run_id
             or self.transition.trace_id != self.trace_id
@@ -213,20 +214,101 @@ _TERMINAL_STATES = frozenset(
     {RunState.SUCCEEDED, RunState.DEGRADED, RunState.FAILED, RunState.CANCELLED}
 )
 
+_ALL_RUN_STATES = frozenset(RunState)
+_DECISION_REASON_STATES: dict[str, frozenset[RunState]] = {
+    "request_admitted": frozenset({RunState.ADMITTED}),
+    "plan_committed": frozenset({RunState.PLANNED}),
+    "dependencies_ready": frozenset({RunState.READY}),
+    "execution_started": frozenset({RunState.RUNNING}),
+    "safe_no_trade_summary": frozenset({RunState.SUMMARIZING}),
+    "confidence_sufficient": frozenset({RunState.SUMMARIZING}),
+    "completed": frozenset({RunState.SUCCEEDED}),
+    "budget_exhausted": frozenset({RunState.DEGRADING}),
+    "loop_guard_stopped": frozenset({RunState.DEGRADING}),
+    "loop_checkpoint_binding_mismatch": frozenset({RunState.DEGRADING}),
+    "confidence_context_mismatch": frozenset({RunState.DEGRADING}),
+    "confidence_fail_closed": frozenset({RunState.DEGRADING}),
+    "safe_no_trade_due_to_degradation": frozenset(
+        {RunState.DEGRADING, RunState.DEGRADED}
+    ),
+    "reconciliation_required": frozenset({RunState.WAITING_RECONCILIATION}),
+    "cancellation_waits_for_reconciliation": frozenset(
+        {RunState.WAITING_RECONCILIATION}
+    ),
+    "cancellation_completed": frozenset({RunState.CANCELLED}),
+    "terminal_state": _TERMINAL_STATES,
+    "stale_revision": _ALL_RUN_STATES,
+    "candidate_rejected": _ALL_RUN_STATES,
+    "cancellation_intent_recorded": frozenset(
+        {
+            RunState.CREATED,
+            RunState.ADMITTED,
+            RunState.PLANNED,
+            RunState.READY,
+            RunState.RUNNING,
+            RunState.RECONCILING,
+            RunState.DEGRADING,
+            RunState.SUMMARIZING,
+            RunState.SUCCEEDED,
+            RunState.DEGRADED,
+            RunState.FAILED,
+        }
+    ),
+}
+
+_BUDGET_INTEGER_FIELDS = frozenset(
+    {
+        "budget_before_attempts",
+        "budget_delta_attempts",
+        "budget_remaining_attempts",
+        "budget_before_tokens",
+        "budget_delta_tokens",
+        "budget_remaining_tokens",
+    }
+)
+_BUDGET_DECIMAL_FIELDS = frozenset(
+    {
+        "budget_before_seconds",
+        "budget_delta_seconds",
+        "budget_remaining_seconds",
+        "budget_before_cost",
+        "budget_delta_cost",
+        "budget_remaining_cost",
+    }
+)
+_BUDGET_FIELDS = _BUDGET_INTEGER_FIELDS | _BUDGET_DECIMAL_FIELDS
+_BUDGET_AUTHORITY_TARGETS = {
+    "budget_exhausted": RunState.DEGRADING,
+    "loop_guard_stopped": RunState.DEGRADING,
+    "loop_checkpoint_binding_mismatch": RunState.DEGRADING,
+    "confidence_context_mismatch": RunState.DEGRADING,
+    "confidence_fail_closed": RunState.DEGRADING,
+    "confidence_sufficient": RunState.SUMMARIZING,
+}
+
 _RUN_LOCKS_GUARD = RLock()
-_RUN_LOCKS: dict[tuple[object, str], RLock] = {}
+_RUN_LOCKS: WeakValueDictionary[tuple[object, str], RLock] = WeakValueDictionary()
+
+
+def _store_coordination_identity(store: HarnessEventStore) -> object:
+    database_path = getattr(store, "_database_path", None)
+    if type(database_path) is not str or database_path == ":memory:":
+        return (type(store), id(store))
+    canonical_path = os.path.normcase(
+        os.path.normpath(str(Path(database_path).resolve(strict=False)))
+    )
+    return (type(store), canonical_path)
 
 
 def _run_lock(store: HarnessEventStore, run_id: str) -> RLock:
-    database_path = getattr(store, "_database_path", None)
-    store_identity: object = (
-        (type(store), database_path)
-        if type(database_path) is str
-        else (type(store), id(store))
-    )
-    key = (store_identity, run_id)
+    key = (_store_coordination_identity(store), _strict_run_id(run_id))
     with _RUN_LOCKS_GUARD:
-        return _RUN_LOCKS.setdefault(key, RLock())
+        existing = _RUN_LOCKS.get(key)
+        if existing is not None:
+            return existing
+        created = RLock()
+        _RUN_LOCKS[key] = created
+        return created
 
 
 def _serialized_run(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -937,60 +1019,163 @@ class HarnessKernel:
             events, plan, before
         )
         attempt_delta = before.remaining_attempts - after.remaining_attempts
-        seconds_delta = max(0.0, before.remaining_seconds - after.remaining_seconds)
+        seconds_delta = Decimal(str(before.remaining_seconds)) - Decimal(
+            str(after.remaining_seconds)
+        )
         cost_delta = before.remaining_cost - after.remaining_cost
         token_delta = usage.input_tokens + usage.cache_write_tokens + usage.output_tokens
         if attempt_delta < 0 or seconds_delta < 0 or cost_delta < 0 or token_delta < 0:
             raise HarnessDependencyError("runtime budget counters moved backwards")
+        remaining_attempts = attempts - attempt_delta
+        remaining_seconds = seconds - seconds_delta
+        remaining_cost = cost - cost_delta
+        remaining_tokens = tokens - token_delta
+        if min(remaining_attempts, remaining_tokens) < 0 or min(
+            remaining_seconds, remaining_cost
+        ) < 0:
+            raise HarnessDependencyError("runtime budget exceeded durable authority")
         return {
-            "budget_remaining_attempts": max(0, attempts - attempt_delta),
-            "budget_remaining_seconds": max(0.0, seconds - seconds_delta),
-            "budget_remaining_cost": format(max(Decimal("0"), cost - cost_delta), "f"),
-            "budget_remaining_tokens": max(0, tokens - token_delta),
+            "budget_before_attempts": attempts,
+            "budget_delta_attempts": attempt_delta,
+            "budget_remaining_attempts": remaining_attempts,
+            "budget_before_seconds": format(seconds, "f"),
+            "budget_delta_seconds": format(seconds_delta, "f"),
+            "budget_remaining_seconds": format(remaining_seconds, "f"),
+            "budget_before_cost": format(cost, "f"),
+            "budget_delta_cost": format(cost_delta, "f"),
+            "budget_remaining_cost": format(remaining_cost, "f"),
+            "budget_before_tokens": tokens,
+            "budget_delta_tokens": token_delta,
+            "budget_remaining_tokens": remaining_tokens,
         }
+
+    @staticmethod
+    def _budget_decimal(value: object) -> Decimal:
+        if type(value) is not str or not value or len(value) > 80:
+            raise HarnessDependencyError("committed budget projection is invalid")
+        try:
+            parsed = Decimal(value)
+        except Exception as error:
+            raise HarnessDependencyError("committed budget projection is invalid") from error
+        if (
+            not parsed.is_finite()
+            or parsed < 0
+            or "e" in value.casefold()
+            or value.startswith(("+", "-"))
+            or format(parsed, "f") != value
+        ):
+            raise HarnessDependencyError("committed budget projection is invalid")
+        return parsed
+
+    @staticmethod
+    def _validated_budget_projection(
+        event: HarnessEvent,
+        plan: HarnessPlan,
+        current: tuple[int, Decimal, Decimal, int],
+    ) -> tuple[int, Decimal, Decimal, int]:
+        budget_keys = frozenset(
+            key for key in event.payload if str(key).startswith("budget_")
+        )
+        if budget_keys != _BUDGET_FIELDS or event.event_type != "transition_authorized":
+            raise HarnessDependencyError("committed budget projection is not canonical")
+        authority = event.transition_authority
+        expected_target = (
+            _BUDGET_AUTHORITY_TARGETS.get(authority.reason_code)
+            if authority is not None
+            else None
+        )
+        if (
+            authority is None
+            or expected_target is None
+            or event.run_id != plan.run_id
+            or event.trace_id != plan.trace_id
+            or event.sequence <= 0
+            or event.state_revision != authority.expected_state_revision
+            or authority.run_id != plan.run_id
+            or authority.trace_id != plan.trace_id
+            or authority.entity_kind != "run"
+            or authority.entity_id != plan.run_id
+            or authority.plan_revision != plan.revision
+            or authority.from_state != RunState.RUNNING.value
+            or authority.to_state != expected_target.value
+            or authority.idempotency_key
+            != f"run-{authority.expected_state_revision}-{expected_target.value}"
+            or event.payload.get("reason_code") != authority.reason_code
+        ):
+            raise HarnessDependencyError("committed budget authority binding is invalid")
+        integers: dict[str, int] = {}
+        for field in _BUDGET_INTEGER_FIELDS:
+            value = event.payload.get(field)
+            if type(value) is not int or value < 0:
+                raise HarnessDependencyError("committed budget projection is invalid")
+            integers[field] = value
+        decimals = {
+            field: HarnessKernel._budget_decimal(event.payload.get(field))
+            for field in _BUDGET_DECIMAL_FIELDS
+        }
+        before = (
+            integers["budget_before_attempts"],
+            decimals["budget_before_seconds"],
+            decimals["budget_before_cost"],
+            integers["budget_before_tokens"],
+        )
+        delta = (
+            integers["budget_delta_attempts"],
+            decimals["budget_delta_seconds"],
+            decimals["budget_delta_cost"],
+            integers["budget_delta_tokens"],
+        )
+        after = (
+            integers["budget_remaining_attempts"],
+            decimals["budget_remaining_seconds"],
+            decimals["budget_remaining_cost"],
+            integers["budget_remaining_tokens"],
+        )
+        if before != current or tuple(
+            before[index] - delta[index] for index in range(4)
+        ) != after:
+            raise HarnessDependencyError("committed budget projection breaks monotonic chain")
+        return after
 
     @staticmethod
     def _budget_state(
         events: tuple[HarnessEvent, ...],
         plan: HarnessPlan,
         snapshot: BudgetSnapshot,
-    ) -> tuple[int, float, Decimal, int]:
-        attempts = snapshot.remaining_attempts
-        seconds = snapshot.remaining_seconds
-        cost = snapshot.remaining_cost
+    ) -> tuple[int, Decimal, Decimal, int]:
+        if (
+            type(snapshot.remaining_attempts) is not int
+            or type(snapshot.remaining_seconds) is not float
+            or type(snapshot.remaining_cost) is not Decimal
+            or not math.isfinite(snapshot.remaining_seconds)
+            or snapshot.remaining_attempts < 0
+            or snapshot.remaining_seconds < 0
+            or not snapshot.remaining_cost.is_finite()
+            or snapshot.remaining_cost < 0
+        ):
+            raise HarnessDependencyError("initial budget caps are invalid")
+        initial = WorkflowBudgetLedger(plan.mode, clock=lambda: 0.0).snapshot()
+        if (
+            snapshot.remaining_attempts > initial.remaining_attempts
+            or snapshot.remaining_seconds > initial.remaining_seconds
+            or snapshot.remaining_cost > initial.remaining_cost
+        ):
+            raise HarnessDependencyError("runtime budget exceeds initial caps")
+        attempts = initial.remaining_attempts
+        seconds = Decimal(str(initial.remaining_seconds))
+        cost = initial.remaining_cost
         tokens = sum(worker.context_token_budget for worker in plan.workers)
-        for event in reversed(events):
-            if "budget_remaining_attempts" not in event.payload:
-                continue
-            prior_attempts = event.payload.get("budget_remaining_attempts")
-            prior_seconds = event.payload.get("budget_remaining_seconds")
-            prior_cost = event.payload.get("budget_remaining_cost")
-            prior_tokens = event.payload.get("budget_remaining_tokens")
-            if (
-                type(prior_attempts) is not int
-                or type(prior_seconds) is not float
-                or type(prior_cost) is not str
-                or type(prior_tokens) is not int
-                or prior_attempts < 0
-                or not math.isfinite(prior_seconds)
-                or prior_seconds < 0
-                or prior_tokens < 0
-            ):
-                raise HarnessDependencyError("committed budget projection is invalid")
-            try:
-                parsed_cost = Decimal(prior_cost)
-            except Exception as error:
-                raise HarnessDependencyError("committed budget projection is invalid") from error
-            if not parsed_cost.is_finite() or parsed_cost < 0:
-                raise HarnessDependencyError("committed budget projection is invalid")
-            attempts, seconds, cost, tokens = (
-                prior_attempts,
-                prior_seconds,
-                parsed_cost,
-                prior_tokens,
+        current = (attempts, seconds, cost, tokens)
+        for event in events:
+            budget_keys = frozenset(
+                key for key in event.payload if str(key).startswith("budget_")
             )
-            break
-        return attempts, seconds, cost, tokens
+            if not budget_keys:
+                continue
+            current = HarnessKernel._validated_budget_projection(
+                event, plan, current
+            )
+        return current
 
     @staticmethod
     def _budget_closed(
@@ -1011,7 +1196,7 @@ class HarnessKernel:
             snapshot.exhausted
             or snapshot.overdrawn
             or attempts <= 0
-            or seconds <= 0
+            or seconds <= Decimal("0")
             or cost <= 0
             or tokens <= 0
             or node_closed
@@ -1036,7 +1221,7 @@ class HarnessKernel:
         )
         return (
             attempts >= 1
-            and seconds >= float(policy.attempt_timeout_seconds)
+            and seconds >= Decimal(str(policy.attempt_timeout_seconds))
             and cost >= required_cost
             and tokens >= required_tokens
         )
@@ -1144,7 +1329,14 @@ class HarnessKernel:
         transition_event = self._event(
             plan,
             "transition_committed",
-            payload={**event_payload, "reason_code": reason_code},
+            payload={
+                **{
+                    key: value
+                    for key, value in event_payload.items()
+                    if key not in _BUDGET_FIELDS
+                },
+                "reason_code": reason_code,
+            },
             transition=transition,
         )
         self.event_store.append(
@@ -1365,7 +1557,14 @@ class HarnessKernel:
         if view.run_state is None:
             raise HarnessDependencyError("decision requires an identified run state")
         if no_trade is None:
-            no_trade = view.run_state in {RunState.DEGRADING, RunState.DEGRADED}
+            no_trade = view.run_state in {
+                RunState.DEGRADING,
+                RunState.DEGRADED,
+                RunState.WAITING_RECONCILIATION,
+            } or (
+                view.run_state is RunState.SUMMARIZING
+                and reason != "confidence_sufficient"
+            )
         if reconciliation_required is None:
             reconciliation_required = view.run_state is RunState.WAITING_RECONCILIATION
         return HarnessDecision(

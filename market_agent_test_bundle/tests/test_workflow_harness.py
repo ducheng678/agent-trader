@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 from concurrent.futures import ThreadPoolExecutor
+import gc
 
 import pytest
 from pydantic import ValidationError
@@ -41,7 +42,13 @@ from market_agent.workflow_execution_backend import (
     canonical_view_digest,
 )
 import market_agent.workflow_execution_backend as execution_backend_module
-from market_agent.workflow_harness import HarnessDecision, HarnessKernel, RunHandle
+import market_agent.workflow_harness as harness_module
+from market_agent.workflow_harness import (
+    HarnessDecision,
+    HarnessDependencyError,
+    HarnessKernel,
+    RunHandle,
+)
 from market_agent.workflow_harness_contracts import (
     HarnessPlan,
     HarnessSessionView,
@@ -1188,7 +1195,7 @@ def test_budget_reservation_is_settled_and_durably_projected(tmp_path):
     assert authority_events[-1].payload["budget_remaining_tokens"] == 798
 
 
-def test_persisted_budget_projection_is_restart_authority_for_all_dimensions(tmp_path):
+def test_untrusted_self_reported_budget_projection_fails_closed_before_backend(tmp_path):
     kernel, store, _, _ = _kernel(tmp_path)
     handle = kernel.create(_request())
     _advance_to_running(kernel, handle.run_id)
@@ -1214,18 +1221,12 @@ def test_persisted_budget_projection_is_restart_authority_for_all_dimensions(tmp
         expected_sequence=view.sequence,
         expected_state_revision=view.state_revision,
     )
-    restarted, _, _, _ = _kernel(tmp_path)
+    restarted, _, backend, _ = _kernel(tmp_path)
     restarted._identifiers = DeterministicIds(100)
-    decision = restarted.advance(handle.run_id)
-    authority = [
-        event for event in store.load(handle.run_id)
-        if event.event_type == "transition_authorized"
-    ][-1]
-    assert decision.reason_code != "budget_exhausted"
-    assert authority.payload["budget_remaining_attempts"] == 0
-    assert authority.payload["budget_remaining_tokens"] == 0
-    fresh = WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0)
-    assert restarted._budget_closed(tuple(store.load(handle.run_id)), plan, fresh.snapshot())
+    before = tuple(backend.operations)
+    with pytest.raises(HarnessDependencyError, match="canonical"):
+        restarted.advance(handle.run_id)
+    assert tuple(backend.operations) == before
 
 
 @pytest.mark.parametrize(
@@ -1237,7 +1238,7 @@ def test_persisted_budget_projection_is_restart_authority_for_all_dimensions(tmp
         ("budget_remaining_tokens", 0),
     ),
 )
-def test_every_persisted_budget_dimension_is_a_pre_reserve_hard_gate(
+def test_partial_or_wrongly_typed_budget_projection_is_rejected(
     tmp_path, dimension, value
 ):
     kernel, store, _, _ = _kernel(tmp_path)
@@ -1267,11 +1268,178 @@ def test_every_persisted_budget_dimension_is_a_pre_reserve_hard_gate(
         expected_sequence=view.sequence,
         expected_state_revision=view.state_revision,
     )
-    restarted, _, _, _ = _kernel(tmp_path)
+    restarted, _, backend, _ = _kernel(tmp_path)
     restarted._identifiers = DeterministicIds(100)
-    decision = restarted.advance(handle.run_id)
-    assert decision.reason_code == "budget_exhausted"
-    assert decision.no_trade is True
+    before = tuple(backend.operations)
+    with pytest.raises(HarnessDependencyError):
+        restarted.advance(handle.run_id)
+    assert tuple(backend.operations) == before
+
+
+def _canonical_budget_payload(**updates: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "policy": "confidence_gate",
+        "reason_code": "confidence_fail_closed",
+        "no_trade": True,
+        "budget_before_attempts": 10,
+        "budget_delta_attempts": 1,
+        "budget_remaining_attempts": 9,
+        "budget_before_seconds": "130.0",
+        "budget_delta_seconds": "0.0",
+        "budget_remaining_seconds": "130.0",
+        "budget_before_cost": "0.30",
+        "budget_delta_cost": "0.01",
+        "budget_remaining_cost": "0.29",
+        "budget_before_tokens": 800,
+        "budget_delta_tokens": 2,
+        "budget_remaining_tokens": 798,
+    }
+    payload.update(updates)
+    return payload
+
+
+def _budget_authority_event(
+    plan: HarnessPlan,
+    view: HarnessSessionView,
+    payload: dict[str, object],
+    *,
+    event_type: str = "transition_authorized",
+    authority_updates: dict[str, object] | None = None,
+) -> HarnessEvent:
+    authority_values: dict[str, object] = {
+        "run_id": plan.run_id,
+        "trace_id": plan.trace_id,
+        "entity_kind": "run",
+        "entity_id": plan.run_id,
+        "from_state": RunState.RUNNING.value,
+        "to_state": RunState.DEGRADING.value,
+        "expected_state_revision": view.state_revision,
+        "plan_revision": plan.revision,
+        "reason_code": "confidence_fail_closed",
+        "idempotency_key": f"run-{view.state_revision}-{RunState.DEGRADING.value}",
+        "dependency_versions": view.dependency_versions,
+    }
+    authority_values.update(authority_updates or {})
+    authority = TransitionAuthorityRecord(**authority_values)
+    return HarnessEvent(
+        event_id=f"budget-event-{view.sequence}",
+        trace_id=plan.trace_id,
+        span_id=f"budget-span-{view.sequence}",
+        run_id=plan.run_id,
+        sequence=view.sequence + 1,
+        state_revision=view.state_revision,
+        event_type=event_type,
+        occurred_at=NOW,
+        monotonic_offset=100.0,
+        actor="harness-kernel",
+        payload=payload,
+        transition_authority=authority if event_type == "transition_authorized" else None,
+    )
+
+
+def test_real_budget_authority_is_complete_and_survives_restart(tmp_path):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    kernel.advance(handle.run_id, candidate={})
+    events = tuple(store.load(handle.run_id))
+    plan = HarnessPlan.model_validate_json(events[0].payload["plan_json"])
+    authority = next(
+        event
+        for event in reversed(events)
+        if event.event_type == "transition_authorized"
+        and "budget_before_attempts" in event.payload
+    )
+    assert {
+        key for key in authority.payload if key.startswith("budget_")
+    } == set(harness_module._BUDGET_FIELDS)
+    restarted, _, _, _ = _kernel(tmp_path)
+    restarted.resume(handle.run_id)
+    assert restarted._budget_state(
+        tuple(store.load(handle.run_id)), plan, restarted._budgets[handle.run_id].snapshot()
+    ) == (
+        authority.payload["budget_remaining_attempts"],
+        Decimal(authority.payload["budget_remaining_seconds"]),
+        Decimal(authority.payload["budget_remaining_cost"]),
+        authority.payload["budget_remaining_tokens"],
+    )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"budget_before_attempts": 11},
+        {"budget_remaining_attempts": 10},
+        {"budget_delta_attempts": -1},
+        {"budget_before_seconds": 130.0},
+        {"budget_remaining_cost": "2.9E-1"},
+        {"budget_untrusted_override": 1},
+    ),
+)
+def test_budget_projection_rejects_raise_nonmonotonic_type_and_extra_fields(
+    tmp_path, updates
+):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    events = tuple(store.load(handle.run_id))
+    plan = HarnessPlan.model_validate_json(events[0].payload["plan_json"])
+    view = store.snapshot(handle.run_id)
+    event = _budget_authority_event(plan, view, _canonical_budget_payload(**updates))
+    with pytest.raises(HarnessDependencyError):
+        HarnessKernel._budget_state(
+            (*events, event),
+            plan,
+            WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0).snapshot(),
+        )
+
+
+def test_budget_projection_rejects_wrong_authority_and_zero_cannot_recover(tmp_path):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    events = tuple(store.load(handle.run_id))
+    plan = HarnessPlan.model_validate_json(events[0].payload["plan_json"])
+    view = store.snapshot(handle.run_id)
+    wrong = _budget_authority_event(
+        plan,
+        view,
+        _canonical_budget_payload(),
+        authority_updates={"plan_revision": plan.revision + 1},
+    )
+    with pytest.raises(HarnessDependencyError, match="authority"):
+        HarnessKernel._budget_state(
+            (*events, wrong),
+            plan,
+            WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0).snapshot(),
+        )
+
+    zero = _budget_authority_event(
+        plan,
+        view,
+        _canonical_budget_payload(
+            budget_delta_attempts=10,
+            budget_remaining_attempts=0,
+        ),
+    )
+    recovered = _budget_authority_event(
+        plan,
+        view.model_copy(update={"sequence": view.sequence + 1}),
+        _canonical_budget_payload(
+            budget_before_attempts=0,
+            budget_delta_attempts=0,
+            budget_remaining_attempts=1,
+            budget_before_seconds="130.0",
+            budget_before_cost="0.29",
+            budget_before_tokens=798,
+        ),
+    )
+    with pytest.raises(HarnessDependencyError, match="monotonic"):
+        HarnessKernel._budget_state(
+            (*events, zero, recovered),
+            plan,
+            WorkflowBudgetLedger(WorkflowMode.PASSIVE, clock=lambda: 100.0).snapshot(),
+        )
 
 
 def test_same_revision_concurrent_advances_commit_only_one_policy_delta(tmp_path):
@@ -1352,6 +1520,60 @@ def test_concurrent_running_advances_consume_one_durable_budget_delta(tmp_path):
     assert budget_authorities[0].payload["budget_remaining_attempts"] == 9
 
 
+def test_concurrent_kernels_using_database_path_aliases_share_one_lock(tmp_path):
+    database = tmp_path / "harness.sqlite"
+    alias_directory = tmp_path / "alias"
+    alias_directory.mkdir()
+    store = SQLiteHarnessEventStore(database, monotonic=lambda: 100.0)
+    alias_store = SQLiteHarnessEventStore(
+        alias_directory / ".." / "harness.sqlite", monotonic=lambda: 100.0
+    )
+    backend = RecordingBackend()
+    issuer = StoreBackedIssuer(store)
+
+    def build(event_store, start=0):
+        return HarnessKernel(
+            event_store=event_store,
+            state_machine=GlobalTaskStateMachine(),
+            plan_compiler=_compiler(),
+            pinned_versions=_pinned(),
+            loop_guard_factory=lambda: LoopGuard(
+                severity_policy=SeverityPolicy(policy_version="policy-v1")
+            ),
+            confidence_gate_factory=lambda plan: ConfidenceGate(),
+            budget_factory=lambda mode: WorkflowBudgetLedger(mode, clock=lambda: 100.0),
+            execution_backend=backend,
+            receipt_issuer=issuer,
+            clock=DeterministicClock(),
+            identifiers=DeterministicIds(start),
+        )
+
+    first = build(store)
+    handle = first.create(_request())
+    _advance_to_running(first, handle.run_id)
+    running = store.snapshot(handle.run_id)
+    second = build(alias_store, 100)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        decisions = tuple(
+            pool.map(
+                lambda kernel: kernel.advance(
+                    handle.run_id,
+                    candidate={},
+                    expected_state_revision=running.state_revision,
+                ),
+                (first, second),
+            )
+        )
+    assert sum(decision.reason_code == "stale_revision" for decision in decisions) == 1
+    projections = [
+        event
+        for event in store.load(handle.run_id)
+        if event.event_type == "transition_authorized"
+        and "budget_before_attempts" in event.payload
+    ]
+    assert len(projections) == 1
+
+
 @pytest.mark.parametrize(
     ("update", "message"),
     (
@@ -1367,6 +1589,88 @@ def test_decision_copy_enforces_bidirectional_state_invariants(tmp_path, update,
     decision = kernel.advance(handle.run_id, candidate={})
     with pytest.raises(ValidationError, match=message):
         decision.model_copy(update=update)
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "allowed_states"),
+    (
+        ("request_admitted", {RunState.ADMITTED}),
+        ("plan_committed", {RunState.PLANNED}),
+        ("dependencies_ready", {RunState.READY}),
+        ("execution_started", {RunState.RUNNING}),
+        ("safe_no_trade_summary", {RunState.SUMMARIZING}),
+        ("confidence_sufficient", {RunState.SUMMARIZING}),
+        ("completed", {RunState.SUCCEEDED}),
+        ("budget_exhausted", {RunState.DEGRADING}),
+        ("confidence_fail_closed", {RunState.DEGRADING}),
+        ("safe_no_trade_due_to_degradation", {RunState.DEGRADING, RunState.DEGRADED}),
+        ("reconciliation_required", {RunState.WAITING_RECONCILIATION}),
+        ("cancellation_completed", {RunState.CANCELLED}),
+    ),
+)
+def test_decision_reason_codes_have_closed_state_mapping(reason_code, allowed_states):
+    for state in RunState:
+        values = {
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "sequence": 1,
+            "state_revision": 1,
+            "run_state": state,
+            "reason_code": reason_code,
+            "no_trade": state in {
+                RunState.DEGRADING,
+                RunState.DEGRADED,
+                RunState.WAITING_RECONCILIATION,
+            } or reason_code == "safe_no_trade_summary",
+            "reconciliation_required": state is RunState.WAITING_RECONCILIATION,
+        }
+        if state in allowed_states:
+            assert HarnessDecision(**values).run_state is state
+        else:
+            with pytest.raises(ValidationError):
+                HarnessDecision(**values)
+
+
+def test_decision_rejects_unknown_reason_and_running_no_trade_even_on_copy():
+    with pytest.raises(ValidationError, match="reason"):
+        HarnessDecision(
+            run_id="run-1",
+            trace_id="trace-1",
+            sequence=1,
+            state_revision=1,
+            run_state=RunState.RUNNING,
+            reason_code="invented_reason",
+        )
+    running = HarnessDecision(
+        run_id="run-1",
+        trace_id="trace-1",
+        sequence=1,
+        state_revision=1,
+        run_state=RunState.RUNNING,
+        reason_code="execution_started",
+    )
+    with pytest.raises(ValidationError, match="no-trade"):
+        running.model_copy(update={"no_trade": True})
+
+
+def test_store_aliases_share_coordination_lock_and_lock_table_is_reclaimed(tmp_path, monkeypatch):
+    database = tmp_path / "locks" / "harness.sqlite"
+    database.parent.mkdir()
+    store = SQLiteHarnessEventStore(database)
+    alias = SQLiteHarnessEventStore(database.parent / "." / "harness.sqlite")
+    monkeypatch.chdir(database.parent)
+    relative_store = SQLiteHarnessEventStore("harness.sqlite")
+
+    assert harness_module._run_lock(store, "run-1") is harness_module._run_lock(alias, "run-1")
+    assert harness_module._run_lock(store, "run-1") is harness_module._run_lock(relative_store, "run-1")
+    memory_one = SQLiteHarnessEventStore(":memory:")
+    memory_two = SQLiteHarnessEventStore(":memory:")
+    assert harness_module._run_lock(memory_one, "run-1") is not harness_module._run_lock(memory_two, "run-1")
+
+    for index in range(500):
+        harness_module._run_lock(store, f"run-{index}")
+    gc.collect()
+    assert len(harness_module._RUN_LOCKS) <= 4
 
 
 def test_loop_action_result_history_is_replayed_before_policy_decision(tmp_path):
