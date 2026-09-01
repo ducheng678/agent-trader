@@ -152,6 +152,10 @@ class BackendContainer:
             container.prompt_release_manager = default_prompt_manager(
                 registry_path=resolved_settings.prompt_registry_path,
                 git_root=Path(__file__).resolve().parents[2],
+                metric_hook=lambda activation, _pin: container.metrics.increment(
+                    "market_agent_prompt_release_actions_total",
+                    labels={"action": activation.action},
+                ),
             )
 
             def application_factory():
