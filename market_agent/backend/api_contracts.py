@@ -33,6 +33,41 @@ class GeneratePlaybookPayload(ApiModel):
     prefetched_passive_event_judge: dict[str, Any] | None = None
 
 
+class WorkflowSubmissionRequest(ApiModel):
+    payload: GeneratePlaybookPayload
+    idempotency_key: IdempotencyKey | None = None
+
+
+class WorkflowAcceptedResponse(ApiModel):
+    run_id: str
+    trace_id: TraceId
+    status: str
+    status_url: str
+
+
+class WorkflowStatusResponse(ApiModel):
+    run_id: str
+    trace_id: TraceId
+    state: str | None
+    sequence: int
+    state_revision: int
+    plan_revision: int
+    reconciliation_required: bool
+
+
+class WorkflowEventResponse(ApiModel):
+    sequence: int
+    event_type: str
+    state_revision: int
+    payload: dict[str, Any]
+
+
+class WorkflowEventListResponse(ApiModel):
+    items: list[WorkflowEventResponse]
+    next_cursor: int
+    has_more: bool
+
+
 class TaskAcceptedResponse(ApiModel):
     job_id: str
     status: str

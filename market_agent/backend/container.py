@@ -28,6 +28,7 @@ class BackendContainer:
     semantic_response_cache: Any = None
     historical_answer_cache: Any = None
     memory_authority: object | None = None
+    harness_kernel: Any = None
 
     def __post_init__(self) -> None:
         if self.observability is None:
@@ -38,7 +39,13 @@ class BackendContainer:
             )
 
     @classmethod
-    def create(cls, settings: BackendSettings | None = None, *, observability: BackendObservability | None = None) -> "BackendContainer":
+    def create(
+        cls,
+        settings: BackendSettings | None = None,
+        *,
+        observability: BackendObservability | None = None,
+        harness_kernel: Any = None,
+    ) -> "BackendContainer":
         resolved_settings = (settings or BackendSettings.from_env()).validate()
         configure_structured_logging()
         repository = JobRepository(resolved_settings.database_path)
@@ -82,6 +89,7 @@ class BackendContainer:
             metrics=metrics,
             task_queue=task_queue,
             observability=observability,
+            harness_kernel=harness_kernel,
         )
         try:
             from market_agent.backend.memory_maintenance import MemoryMaintenanceScheduler

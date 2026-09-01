@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+from hashlib import sha256
 import logging
 import re
 import time
@@ -23,12 +24,27 @@ from market_agent.backend.api_contracts import (
     TaskSubmissionRequest,
     TraceEventResponse,
     TraceQueryResponse,
+    WorkflowAcceptedResponse,
+    WorkflowEventListResponse,
+    WorkflowEventResponse,
+    WorkflowStatusResponse,
+    WorkflowSubmissionRequest,
 )
 from market_agent.backend.container import BackendContainer
 from market_agent.backend.database import JobRecord
-from market_agent.backend.errors import AuthenticationError, BackendError, DependencyUnavailableError, ValidationError
+from market_agent.backend.errors import (
+    AuthenticationError,
+    BackendError,
+    DependencyUnavailableError,
+    NotFoundError,
+    ValidationError,
+)
 from market_agent.backend.observability import current_request_id, request_context
 from market_agent.workflow_tracing import TraceContext, TraceId
+from market_agent.workflow_contracts import WorkflowRequest
+from market_agent.workflow_execution_backend import ExecutionRegistrationError
+from market_agent.workflow_harness import UnknownHarnessRunError
+from market_agent.workflow_harness_contracts import HarnessSessionView, RunState
 
 _logger = logging.getLogger("market_agent.backend.api")
 _request_id_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -184,6 +200,32 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
         if not hmac.compare_digest(supplied_token.strip(), expected_token):
             raise AuthenticationError("valid bearer token required")
 
+    def require_harness():
+        kernel = getattr(resolved_container, "harness_kernel", None)
+        if kernel is None:
+            raise DependencyUnavailableError("Harness kernel is not configured")
+        return kernel
+
+    def workflow_view(kernel: Any, run_id: str) -> HarnessSessionView:
+        try:
+            return kernel.snapshot(run_id)
+        except UnknownHarnessRunError as error:
+            raise NotFoundError("workflow run was not found") from error
+
+    def workflow_status(view: HarnessSessionView) -> WorkflowStatusResponse:
+        return WorkflowStatusResponse(
+            run_id=view.run_id,
+            trace_id=view.trace_id,
+            state=view.run_state.value if view.run_state is not None else None,
+            sequence=view.sequence,
+            state_revision=view.state_revision,
+            plan_revision=view.plan_revision,
+            reconciliation_required=bool(
+                view.external_side_effect_unknown
+                or view.run_state is RunState.WAITING_RECONCILIATION
+            ),
+        )
+
     @app.exception_handler(RequestValidationError)
     async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
         request_id = _request_id(request)
@@ -258,6 +300,72 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             status=submission.job.status,
             reused=submission.reused,
         )
+
+    @app.post("/v1/workflows", response_model=WorkflowAcceptedResponse, status_code=202, tags=["workflows"])
+    def create_workflow(
+        request: Request,
+        body: WorkflowSubmissionRequest,
+        idempotency_key_header: str | None = Header(default=None, alias="Idempotency-Key"),
+        _: None = Depends(require_api_token),
+    ) -> WorkflowAcceptedResponse:
+        kernel = require_harness()
+        key = _resolve_idempotency_key(body.idempotency_key, idempotency_key_header)
+        trace_id = get_request_trace(request).trace_id
+        # A missing key deliberately means a distinct user request.  Never use
+        # the request trace as implicit idempotency: upstream retries normally
+        # receive a new trace identifier.
+        run_id = (
+            "wf-" + sha256(f"{resolved_container.settings.tenant_id}:{key}".encode("utf-8")).hexdigest()[:32]
+            if key is not None
+            else "wf-" + uuid.uuid4().hex
+        )
+        payload = body.payload
+        workflow_request = WorkflowRequest(
+            workflow_id=run_id, trace_id=trace_id, user_query=payload.user_query,
+            event_tape=tuple(payload.event_tape), trigger_reason=payload.trigger_reason,
+            trigger_event=payload.trigger_event, recent_events=tuple(payload.recent_events or ()),
+            trade_symbol_context=payload.trade_symbol_context, active_symbol=payload.active_symbol,
+            has_live_position=payload.has_live_position,
+            prefetched_passive_event_judge=payload.prefetched_passive_event_judge,
+        )
+        try:
+            handle = kernel.create(workflow_request)
+            status = handle.run_state.value
+        except ExecutionRegistrationError as error:
+            if str(error) != "run already exists":
+                raise
+            view = workflow_view(kernel, run_id)
+            trace_id = view.trace_id
+            status = view.run_state.value if view.run_state is not None else "created"
+        return WorkflowAcceptedResponse(run_id=run_id, trace_id=trace_id, status=status,
+                                        status_url=f"/v1/workflows/{run_id}")
+
+    @app.get("/v1/workflows/{run_id}", response_model=WorkflowStatusResponse, tags=["workflows"])
+    def get_workflow(run_id: str, _: None = Depends(require_api_token)) -> WorkflowStatusResponse:
+        return workflow_status(workflow_view(require_harness(), run_id))
+
+    @app.post("/v1/workflows/{run_id}:cancel", response_model=WorkflowStatusResponse, tags=["workflows"])
+    def cancel_workflow(run_id: str, _: None = Depends(require_api_token)) -> WorkflowStatusResponse:
+        kernel = require_harness()
+        kernel.cancel(run_id, "api_cancellation")
+        return workflow_status(workflow_view(kernel, run_id))
+
+    @app.get("/v1/workflows/{run_id}/events", response_model=WorkflowEventListResponse, tags=["workflows"])
+    def get_workflow_events(run_id: str, after_sequence: int = Query(default=0, ge=0),
+                            limit: int = Query(default=100, ge=1, le=500),
+                            _: None = Depends(require_api_token)) -> WorkflowEventListResponse:
+        kernel = require_harness()
+        # Establish existence through the authoritative projection first; a
+        # direct empty event-store read cannot distinguish an unknown run.
+        workflow_view(kernel, run_id)
+        events = kernel.event_store.load(run_id)
+        selected = [event for event in events if event.sequence > after_sequence]
+        page = selected[:limit]
+        return WorkflowEventListResponse(items=[WorkflowEventResponse(
+            sequence=event.sequence, event_type=event.event_type,
+            state_revision=event.state_revision, payload=dict(event.payload),
+        ) for event in page], next_cursor=page[-1].sequence if page else after_sequence,
+            has_more=len(selected) > len(page))
 
     @app.get("/v1/tasks/{job_id}", response_model=TaskStatusResponse, tags=["tasks"])
     def get_task(job_id: str, _: None = Depends(require_api_token)) -> TaskStatusResponse:

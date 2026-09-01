@@ -215,3 +215,19 @@ Run locally after installing the root requirements:
 ```bash
 MARKET_AGENT_API_TOKEN=local-token python -m market_agent.backend
 ```
+
+### Governed Workflow API
+
+`POST /v1/workflows` creates an asynchronous, Harness-governed workflow; the
+status, cancellation, and event endpoints are `/v1/workflows/{run_id}`,
+`/v1/workflows/{run_id}:cancel`, and `/v1/workflows/{run_id}/events`.
+Supply the same `Idempotency-Key` to safely replay a submission. The response
+always returns the original run trace on a replay; requests without that key
+are intentionally independent runs.
+
+The API deliberately requires a deployment-owned `HarnessKernel`. Construct
+the container with `BackendContainer.create(harness_kernel=kernel)` (or inject
+the same field into a container passed to `create_app`). The kernel's receipt
+issuer and signing capability must be provisioned by the trusted execution
+host; the HTTP service will return `503` rather than create an untrusted local
+replacement when it is absent.
