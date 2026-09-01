@@ -20,6 +20,7 @@ from market_agent.workflow_risk_gate import RiskPolicy, evaluate_risk
 
 PlanBuilder = Callable[[WorkflowRequest], CoordinatorPlan]
 TaskDispatcher = Callable[[CoordinatorPlan], tuple[AgentReport, ...]]
+RecoveryDispatcher = Callable[[CoordinatorPlan, tuple[AgentReport, ...]], tuple[CoordinatorPlan, tuple[AgentReport, ...]] | None]
 DecisionBuilder = Callable[[WorkflowRequest, CoordinatorPlan, tuple[AgentReport, ...]], DecisionDraft | None]
 TechnicalSelector = Callable[[tuple[AgentReport, ...]], TechnicalAnalysis | None]
 AuditFinalizer = Callable[[WorkflowResult], None]
@@ -31,6 +32,7 @@ class WorkflowServices:
     dispatch: TaskDispatcher
     decide: DecisionBuilder
     technical: TechnicalSelector
+    recover: RecoveryDispatcher | None = None
     finalize: AuditFinalizer | None = None
     risk_policy: RiskPolicy = RiskPolicy()
 
@@ -89,6 +91,31 @@ def _dispatch(state: GraphState) -> dict[str, object]:
 
 
 def _route_after_dispatch(state: GraphState) -> str:
+    return "finalize" if "result" in state else "recover"
+
+
+def _recover(state: GraphState) -> dict[str, object]:
+    recover = state["services"].recover
+    if recover is None:
+        return {}
+    try:
+        outcome = recover(state["plan"], state["reports"])
+        if outcome is None:
+            return _safe_failure(state, "coordinator recovery could not produce a safe report set")
+        plan, reports = outcome
+        request = state["request"]
+        if (plan.workflow_id, plan.trace_id) != (request.workflow_id, request.trace_id):
+            return _safe_failure(state, "coordinator recovery returned a cross-trace plan")
+        if not isinstance(reports, tuple) or any(
+            (report.workflow_id, report.trace_id) != (request.workflow_id, request.trace_id) for report in reports
+        ):
+            return _safe_failure(state, "coordinator recovery returned cross-trace reports")
+        return {"plan": plan, "reports": reports}
+    except Exception:
+        return _safe_failure(state, "coordinator recovery is unavailable")
+
+
+def _route_after_recover(state: GraphState) -> str:
     return "finalize" if "result" in state else "decide"
 
 
@@ -122,7 +149,7 @@ def _assemble(state: GraphState) -> dict[str, object]:
             decision=state.get("decision"),
             risk=state.get("risk"),
             evidence_references=references,
-            route_history=("coordinated_graph", "plan", "dispatch", "risk", "assemble"),
+            route_history=("coordinated_graph", "plan", "dispatch", "recover", "risk", "assemble"),
         )
     }
 
@@ -142,13 +169,15 @@ def build_workflow_graph():
     graph = StateGraph(GraphState)
     graph.add_node("plan", _plan)
     graph.add_node("dispatch", _dispatch)
+    graph.add_node("recover", _recover)
     graph.add_node("decide", _decide)
     graph.add_node("risk", _risk)
     graph.add_node("assemble", _assemble)
     graph.add_node("finalize", _finalize)
     graph.add_edge(START, "plan")
     graph.add_conditional_edges("plan", _route_after_plan, {"dispatch": "dispatch", "finalize": "finalize"})
-    graph.add_conditional_edges("dispatch", _route_after_dispatch, {"decide": "decide", "finalize": "finalize"})
+    graph.add_conditional_edges("dispatch", _route_after_dispatch, {"recover": "recover", "finalize": "finalize"})
+    graph.add_conditional_edges("recover", _route_after_recover, {"decide": "decide", "finalize": "finalize"})
     graph.add_conditional_edges("decide", _route_after_decide, {"risk": "risk", "finalize": "finalize"})
     graph.add_edge("risk", "assemble")
     graph.add_edge("assemble", "finalize")

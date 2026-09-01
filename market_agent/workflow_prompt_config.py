@@ -17,7 +17,7 @@ from pydantic import Field, model_validator
 
 from market_agent.workflow_agent_contracts import ModelTier
 from market_agent.workflow_contracts import ContractModel, Digest, ShortText
-from market_agent.workflow_prompt_release import PromptRelease, canonical_json
+from market_agent.workflow_prompt_release import PromptRelease, PromptReleaseRegistry, canonical_json
 
 
 _PLACEHOLDER = re.compile(r"\{\{|\}\}|\$\{|\{(?:trace_id|task_id|tenant_id|workflow_id|run_id|now|timestamp)\}")
@@ -167,6 +167,19 @@ class PromptReleaseManager:
         if release_id is None:
             return self.current()
         return self._pin(release_id)
+
+    def registry(self) -> PromptReleaseRegistry:
+        """Return immutable copies of every Git-validated release for a driver.
+
+        Selection remains an ingress-time operation through ``current``.  The
+        registry only provides the driver's immutable digest and capability
+        validation boundary.
+        """
+        with self._lock:
+            return PromptReleaseRegistry(releases=tuple(
+                PromptRelease.model_validate(manifest.release.model_dump(mode="python"))
+                for _, manifest in sorted(self._manifests.items())
+            ))
 
     def activate(self, release_id: str) -> PromptActivation:
         pin = self._pin(release_id)

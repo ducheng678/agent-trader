@@ -36,11 +36,15 @@ class DispatchSpec:
 
 
 def _task(request: WorkflowRequest, kind: TaskType, budget: WorkflowBudgetState, revision: int,
-          parent: str | None = None) -> AgentTask:
+          parent: str | None = None, remaining_task_slots: int = 1) -> AgentTask:
+    if type(remaining_task_slots) is not int or remaining_task_slots < 1:
+        raise ValueError("remaining task slots must be a positive integer")
     profile = profile_for(kind)
     policy = policy_for("escalation" if kind is TaskType.RECONCILIATION else kind.value)
     identifier = sha256(f"{request.workflow_id}:{revision}:{kind.value}:{parent or ''}".encode()).hexdigest()[:24]
-    reserved = min(float(policy.node_cost_cap), budget.remaining_cost)
+    # Keep enough authority for every task that is still required by the plan.
+    # This also leaves any unallocated budget available for bounded recovery.
+    reserved = min(float(policy.node_cost_cap), budget.remaining_cost / remaining_task_slots)
     if reserved <= 0 or budget.remaining_attempts < 1:
         raise ValueError("insufficient workflow budget for a specialist task")
     return AgentTask(task_id=identifier, parent_task_id=parent, workflow_id=request.workflow_id, trace_id=request.trace_id,
@@ -50,7 +54,8 @@ def _task(request: WorkflowRequest, kind: TaskType, budget: WorkflowBudgetState,
         difficulty=TaskDifficulty.HIGH if profile.tier.value == "sol" else TaskDifficulty.LOW if profile.tier.value == "luna" else TaskDifficulty.NORMAL,
         model_tier=ModelTier("gpt-5.6-" + profile.tier.value), prompt_version=profile.profile_id,
         attempt_timeout_seconds=policy.attempt_timeout_seconds,
-        maximum_retries=min(3, policy.maximum_total_attempts - 1, budget.remaining_attempts - 1),
+        maximum_retries=min(3, policy.maximum_total_attempts - 1,
+                            budget.remaining_attempts - remaining_task_slots),
         reserved_cost=reserved, remaining_workflow_cost=budget.remaining_cost,
         analysis_steps=profile.analysis_steps, escalation_rule="return_to_coordinator",
         conflict_return_rule="return_typed_conflict")
@@ -64,7 +69,23 @@ def plan_request(request: WorkflowRequest, budget: WorkflowBudgetState, *,
                           (TaskType.MARKET_CONTEXT, TaskType.FUNDAMENTAL, TaskType.TECHNICAL))
     if not 1 <= len(kinds) <= 5 or len(set(kinds)) != len(kinds):
         raise ValueError("plans require one to five distinct catalogued specialists")
-    tasks = tuple(_task(request, kind, budget, 0) for kind in kinds)
+    # Preserve one global attempt for deterministic coordinator recovery when
+    # the caller supplied capacity beyond the initial task set.  Per-task
+    # retries are allocated from the remainder and can never consume it.
+    remaining_attempts = budget.remaining_attempts - (1 if budget.remaining_attempts > len(kinds) else 0)
+    remaining_cost = budget.remaining_cost
+    tasks = []
+    for index, kind in enumerate(kinds):
+        slots = len(kinds) - index
+        available = budget.model_copy(update={
+            "remaining_attempts": remaining_attempts,
+            "remaining_cost": remaining_cost,
+        })
+        task = _task(request, kind, available, 0, remaining_task_slots=slots)
+        tasks.append(task)
+        remaining_attempts -= task.maximum_retries + 1
+        remaining_cost -= task.reserved_cost
+    tasks = tuple(tasks)
     if sum(task.reserved_cost for task in tasks) > budget.remaining_cost + 1e-12 or len(tasks) > budget.remaining_attempts:
         raise ValueError("planned dispatch exceeds the remaining workflow budget")
     return CoordinatorPlan(workflow_id=request.workflow_id, trace_id=request.trace_id,
@@ -168,16 +189,26 @@ def reschedule(plan: CoordinatorPlan, directive: CoordinatorDirective, budget: W
         raise ValueError("recovery must name tasks from the current plan")
     selected = directive.task_ids[:1] if directive.action == "schedule_reconciliation" else directive.task_ids
     tasks = []
-    for identifier in selected:
+    remaining_attempts = budget.remaining_attempts
+    remaining_cost = budget.remaining_cost
+    for index, identifier in enumerate(selected):
         original = originals[identifier]
         kind = TaskType.RECONCILIATION if directive.action == "schedule_reconciliation" else original.task_type
         request = WorkflowRequest(workflow_id=plan.workflow_id, trace_id=plan.trace_id,
                                   user_query=original.objective, trigger_reason="bounded_recovery")
-        task = _task(request, kind, budget, plan.revision + 1, parent=identifier)
+        slots = len(selected) - index
+        available = budget.model_copy(update={
+            "remaining_attempts": remaining_attempts,
+            "remaining_cost": remaining_cost,
+        })
+        task = _task(request, kind, available, plan.revision + 1, parent=identifier,
+                     remaining_task_slots=slots)
         if directive.downgrade:
             tier = ModelTier.TERRA if original.model_tier is ModelTier.SOL else ModelTier.LUNA
             task = AgentTask.model_validate(dict(task.model_dump(mode="python"), model_tier=tier))
         tasks.append(task)
+        remaining_attempts -= task.maximum_retries + 1
+        remaining_cost -= task.reserved_cost
     if sum(task.reserved_cost for task in tasks) > budget.remaining_cost + 1e-12 or len(tasks) > budget.remaining_attempts:
         raise ValueError("recovery exceeds remaining workflow budget")
     return CoordinatorPlan(workflow_id=plan.workflow_id, trace_id=plan.trace_id, revision=plan.revision + 1,

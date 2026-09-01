@@ -18,6 +18,7 @@ from market_agent.workflow_circuit_breaker import CircuitBreaker
 from market_agent.workflow_fallback import Abstain, Downgrade, FallbackPolicy, UseLocalKnowledge
 from market_agent.workflow_memory_retrieval import CoreExperienceSummary
 from market_agent.workflow_prompt_release import PromptReleaseRegistry, canonical_json
+from market_agent.workflow_prompt_config import PromptReleaseManager
 from market_agent.workflow_response_cache import CacheMetadata, ExactCacheKey, ExactResponseCache, require_cache_safe, snapshot_safe_answers
 from market_agent.workflow_retry_policy import RetryPolicy, UniformRandom
 from market_agent.workflow_semantic_request_cache import SemanticRequestCache
@@ -174,7 +175,7 @@ class AgentDriver:
     def __init__(
         self, *, model_client: ModelClient, audit_observer: AuditObserver, clock: Clock,
         random: Callable[[float, float], float] | UniformRandom,
-        prompt_releases: PromptReleaseRegistry, output_schemas: Iterable[OutputSchema],
+        prompt_releases: PromptReleaseRegistry | PromptReleaseManager, output_schemas: Iterable[OutputSchema],
         retry_policy: RetryPolicy, circuit_breaker: CircuitBreaker, fallback_policy: FallbackPolicy,
         model_costs: Mapping[ModelTier, float],
         exact_cache: ExactResponseCache | None = None,
@@ -185,7 +186,9 @@ class AgentDriver:
         verification_hook: Callable[[AgentResult], object] | None = None,
     ) -> None:
         self._client, self._observer, self._clock, self._random = model_client, audit_observer, clock, random
-        self._releases = PromptReleaseRegistry.model_validate(prompt_releases)
+        self._release_manager = prompt_releases if isinstance(prompt_releases, PromptReleaseManager) else None
+        self._releases = (self._release_manager.registry() if self._release_manager is not None
+                          else PromptReleaseRegistry.model_validate(prompt_releases))
         schemas = tuple(output_schemas)
         self._schemas = {(schema.schema_id, schema.digest): schema for schema in schemas}
         if not schemas or len(self._schemas) != len(schemas):
@@ -210,6 +213,18 @@ class AgentDriver:
         no repository, retrieval callback, or memory writer capability.
         """
         invocation = AgentInvocation.model_validate(invocation)
+        if self._release_manager is not None:
+            # New runs pin the active Git-tracked release at ingress.  This
+            # intentionally leaves in-flight invocations unchanged if a
+            # release is activated while their provider call is outstanding.
+            try:
+                pin = self._release_manager.current()
+                invocation = invocation.model_copy(update={
+                    "prompt_release_id": pin.release_id,
+                    "prompt_release_digest": pin.release_digest,
+                })
+            except Exception:
+                return self._failure(invocation.trace_id, "prompt_release_unavailable")
         run = _Run(invocation, invocation.allowed_model_tier, invocation.attempt)
         try:
             self._emit(run, "trace_started", "received")
