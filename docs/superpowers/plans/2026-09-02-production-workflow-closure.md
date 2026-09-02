@@ -70,9 +70,9 @@
 
 - [x] **Step 1: Add failing tests** showing a successful result survives the queue adapter and a degraded result never exposes candidate model output.
 - [x] **Step 2: Run the targeted tests** and confirm the result is currently discarded.
-- [ ] **Step 3: Add the typed result field** to task and workflow status projections.
-- [ ] **Step 4: Preserve successful results and synthesize safe terminal results** for degraded/failed/cancelled workflows.
-- [ ] **Step 5: Run API, queue-adapter, and Harness-application tests.**
+- [x] **Step 3: Add the typed result field** to task and workflow status projections.
+- [x] **Step 4: Preserve successful results and synthesize safe terminal results** for degraded/failed/cancelled workflows.
+- [x] **Step 5: Run API, queue-adapter, and Harness-application tests.**
 
 ### Task 4: Commit side effects only after Harness acceptance
 
@@ -86,11 +86,11 @@
 **Interfaces:**
 - Produces: candidate execution separated from idempotent `commit_accepted_result(request, result)`.
 
-- [ ] **Step 1: Add failing tests** proving memory/cache hooks are not called before acceptance or for degraded/cancelled runs.
-- [ ] **Step 2: Run tests** and confirm current eager writes fail.
-- [ ] **Step 3: Move completion and historical-cache writes** into an idempotent host-owned commit callback.
-- [ ] **Step 4: Invoke commit only after `RunState.SUCCEEDED`.**
-- [ ] **Step 5: Run result-writer, cache, and Harness integration tests.**
+- [x] **Step 1: Add failing tests** proving memory/cache hooks are not called before acceptance or for degraded/cancelled runs.
+- [x] **Step 2: Run tests** and confirm current eager writes fail.
+- [x] **Step 3: Move completion and historical-cache writes** into an idempotent host-owned commit callback.
+- [x] **Step 4: Invoke commit only after `RunState.SUCCEEDED`.**
+- [x] **Step 5: Run result-writer, cache, and Harness integration tests.**
 
 ### Task 5: Propagate cancellation through queue, graph, and provider boundaries
 

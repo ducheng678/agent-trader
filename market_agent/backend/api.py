@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 from hashlib import sha256
 import logging
 import re
@@ -44,7 +45,7 @@ from market_agent.backend.errors import (
 )
 from market_agent.backend.observability import current_request_id, request_context
 from market_agent.workflow_tracing import TraceContext, TraceId
-from market_agent.workflow_contracts import WorkflowRequest
+from market_agent.workflow_contracts import WorkflowRequest, WorkflowResult
 from market_agent.workflow_execution_backend import ExecutionRegistrationError
 from market_agent.workflow_harness import InvalidHarnessInputError, UnknownHarnessRunError
 from market_agent.workflow_harness_contracts import HarnessSessionView, RunState
@@ -64,6 +65,46 @@ def _task_response(job: JobRecord) -> TaskStatusResponse:
         max_attempts=job.max_attempts,
         created_at=job.created_at,
         updated_at=job.updated_at,
+    )
+
+
+def workflow_status(view: HarnessSessionView, job: JobRecord | None = None) -> WorkflowStatusResponse:
+    trusted_result: WorkflowResult | None = None
+    dispatcher_status = job.status if job is not None else None
+    if (
+        job is not None
+        and job.task_name == "execute_harness_workflow"
+        and job.idempotency_key == view.run_id
+        and job.request_id == view.trace_id
+        and job.status == "succeeded"
+        and isinstance(job.result, dict)
+        and isinstance(job.result.get("workflow_result"), dict)
+    ):
+        try:
+            candidate = WorkflowResult.model_validate_json(
+                json.dumps(job.result["workflow_result"], ensure_ascii=False)
+            )
+        except (TypeError, ValueError):
+            candidate = None
+        if (
+            candidate is not None
+            and candidate.workflow_id == view.run_id
+            and candidate.trace_id == view.trace_id
+        ):
+            trusted_result = candidate
+    return WorkflowStatusResponse(
+        run_id=view.run_id,
+        trace_id=view.trace_id,
+        state=view.run_state.value if view.run_state is not None else None,
+        sequence=view.sequence,
+        state_revision=view.state_revision,
+        plan_revision=view.plan_revision,
+        reconciliation_required=bool(
+            view.external_side_effect_unknown
+            or view.run_state is RunState.WAITING_RECONCILIATION
+        ),
+        dispatcher_status=dispatcher_status,
+        result=trusted_result,
     )
 
 
@@ -235,20 +276,6 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             raise NotFoundError("workflow run was not found") from error
         except InvalidHarnessInputError as error:
             raise ValidationError("workflow run identifier is invalid") from error
-
-    def workflow_status(view: HarnessSessionView) -> WorkflowStatusResponse:
-        return WorkflowStatusResponse(
-            run_id=view.run_id,
-            trace_id=view.trace_id,
-            state=view.run_state.value if view.run_state is not None else None,
-            sequence=view.sequence,
-            state_revision=view.state_revision,
-            plan_revision=view.plan_revision,
-            reconciliation_required=bool(
-                view.external_side_effect_unknown
-                or view.run_state is RunState.WAITING_RECONCILIATION
-            ),
-        )
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -422,13 +449,17 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
 
     @app.get("/v1/workflows/{run_id}", response_model=WorkflowStatusResponse, tags=["workflows"])
     def get_workflow(run_id: str, _: None = Depends(require_api_token)) -> WorkflowStatusResponse:
-        return workflow_status(workflow_view(require_harness(), run_id))
+        view = workflow_view(require_harness(), run_id)
+        job = resolved_container.task_queue.get_job_by_idempotency_key(run_id)
+        return workflow_status(view, job)
 
     @app.post("/v1/workflows/{run_id}:cancel", response_model=WorkflowStatusResponse, tags=["workflows"])
     def cancel_workflow(run_id: str, _: None = Depends(require_api_token)) -> WorkflowStatusResponse:
         kernel = require_harness()
         kernel.cancel(run_id, "api_cancellation")
-        return workflow_status(workflow_view(kernel, run_id))
+        view = workflow_view(kernel, run_id)
+        job = resolved_container.task_queue.get_job_by_idempotency_key(run_id)
+        return workflow_status(view, job)
 
     @app.get("/v1/workflows/{run_id}/events", response_model=WorkflowEventListResponse, tags=["workflows"])
     def get_workflow_events(run_id: str, after_sequence: int = Query(default=0, ge=0),

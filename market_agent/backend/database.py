@@ -314,6 +314,20 @@ class JobRepository:
         finally:
             connection.close()
 
+    def get_job_by_idempotency_key(self, idempotency_key: str) -> JobRecord | None:
+        normalized_key = _normalize_idempotency_key(idempotency_key)
+        if normalized_key is None:
+            return None
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE idempotency_key = ?",
+                (normalized_key,),
+            ).fetchone()
+            return None if row is None else self._to_job(row)
+        finally:
+            connection.close()
+
     def _transition(
         self,
         job_id: str,

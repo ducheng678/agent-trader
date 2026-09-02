@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 from market_agent.workflow_structured_logging import StructuredEvent
 from market_agent.workflow_tracing import TraceId
+from market_agent.workflow_contracts import WorkflowResult
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 IdempotencyKey = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)]
@@ -55,6 +56,8 @@ class WorkflowStatusResponse(ApiModel):
     state_revision: int
     plan_revision: int
     reconciliation_required: bool
+    dispatcher_status: str | None = None
+    result: WorkflowResult | None = None
 
 
 class WorkflowEventResponse(ApiModel):

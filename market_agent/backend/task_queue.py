@@ -302,6 +302,9 @@ class BackgroundTaskQueue:
             self._cache.set(cache_key, job)
         return job
 
+    def get_job_by_idempotency_key(self, idempotency_key: str) -> JobRecord | None:
+        return self._repository.get_job_by_idempotency_key(idempotency_key)
+
     def list_events(self, job_id: str, limit: int = 100) -> list[EventRecord]:
         self.get_job(job_id)
         return self._repository.list_events(job_id, limit=limit)
