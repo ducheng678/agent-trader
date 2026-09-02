@@ -190,7 +190,8 @@ def run_node(task: AgentTask, context: ContextSummary | ContextHandoff, driver: 
              deadline_epoch: float, grant: object, authorize: Callable[[AgentTask, object], None],
              memory_context: CoreExperienceSummary | None = None,
              memory_tenant_id: str | None = None,
-             memory_scope: str | None = None) -> AgentReport:
+             memory_scope: str | None = None,
+             cancellation_check: Callable[[], bool] = lambda: False) -> AgentReport:
     checked_context(task, context)
     if grant is None or not callable(authorize):
         raise PermissionError("specialist dispatch requires a host-issued grant and authorizer")
@@ -201,4 +202,5 @@ def run_node(task: AgentTask, context: ContextSummary | ContextHandoff, driver: 
         memory_context=memory_context,
         memory_tenant_id=memory_tenant_id,
         memory_scope=memory_scope,
+        cancellation_check=cancellation_check,
     ))

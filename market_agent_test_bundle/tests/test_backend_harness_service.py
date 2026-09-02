@@ -18,6 +18,7 @@ from market_agent.workflow_harness_application import (
     HarnessWorkflowExecution,
 )
 from market_agent.workflow_harness_contracts import HarnessSessionView, RunState
+from market_agent.workflow_cancellation import WorkflowCancellationRegistry
 
 
 TRACE_ID = "1" * 32
@@ -160,6 +161,20 @@ def test_workflow_status_fails_closed_for_unfinished_or_cross_wired_jobs() -> No
     assert workflow_status(view, _job({"workflow_result": result}, status="running")).result is None
     cross_wired = _known_result().model_copy(update={"workflow_id": "workflow-other"}).model_dump(mode="json")
     assert workflow_status(view, _job({"workflow_result": cross_wired})).result is None
+    cancelled = view.model_copy(update={"run_state": RunState.CANCELLED})
+    assert workflow_status(cancelled, _job({"workflow_result": result})).result is None
+
+
+def test_cancellation_registry_is_run_scoped_and_sticky() -> None:
+    registry = WorkflowCancellationRegistry()
+    first = registry.signal(RUN_ID)
+    other = registry.signal("workflow-other")
+
+    registry.cancel(RUN_ID)
+
+    assert first.is_cancelled()
+    assert registry.signal(RUN_ID).is_cancelled()
+    assert not other.is_cancelled()
 
 
 class _TerminalKernel:
@@ -183,6 +198,10 @@ class _TerminalKernel:
         self.finished = True
         return object()
 
+    def cancel(self, _run_id, _reason):
+        self.terminal = RunState.CANCELLED
+        self.finished = True
+
 
 def _application_for_terminal(terminal: RunState, committed: list[WorkflowResult]):
     application = object.__new__(HarnessWorkflowApplication)
@@ -204,3 +223,21 @@ def test_candidate_side_effects_commit_only_after_harness_success() -> None:
     degraded = _application_for_terminal(RunState.DEGRADED, committed).execute(_payload())
     assert degraded.view.run_state is RunState.DEGRADED
     assert committed == []
+
+
+def test_pre_cancelled_harness_run_never_calls_runner_or_committer() -> None:
+    registry = WorkflowCancellationRegistry()
+    registry.cancel(RUN_ID)
+    calls: list[str] = []
+    application = object.__new__(HarnessWorkflowApplication)
+    application._kernel = _TerminalKernel(RunState.SUCCEEDED)
+    application._run_workflow = lambda _request: calls.append("run")
+    application._completion_candidate_factory = lambda *_args: {"accepted": True}
+    application._accepted_result_committer = lambda *_args: calls.append("commit")
+    application._cancellation_signal_factory = registry.signal
+
+    execution = application.execute(_payload())
+
+    assert execution.view.run_state is RunState.CANCELLED
+    assert execution.workflow_result is None
+    assert calls == []

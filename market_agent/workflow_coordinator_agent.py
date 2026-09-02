@@ -110,7 +110,8 @@ def dispatch_tasks(plan: CoordinatorPlan, contexts: Mapping[str, ContextSummary 
                    deadline_epoch: float | None = None, authorize: Callable | None = None,
                    memory_context: CoreExperienceSummary | None = None,
                    memory_tenant_id: str | None = None,
-                   memory_scope: str | None = None) -> tuple:
+                   memory_scope: str | None = None,
+                   cancellation_check: Callable[[], bool] = lambda: False) -> tuple:
     bound = bind_contexts(plan, contexts)
     specs = tuple(DispatchSpec(task, checked_context(task, contexts[task.task_id]), grants[task.task_id]) for task in bound.tasks)
     if any(spec.grant is None for spec in specs):
@@ -127,7 +128,8 @@ def dispatch_tasks(plan: CoordinatorPlan, contexts: Mapping[str, ContextSummary 
                                   grant=spec.grant, authorize=authorize,
                                   memory_context=memory_context,
                                   memory_tenant_id=memory_tenant_id,
-                                  memory_scope=memory_scope)
+                                  memory_scope=memory_scope,
+                                  cancellation_check=cancellation_check)
             else:
                 report = driver(spec)
             report = AgentReport.model_validate(report)

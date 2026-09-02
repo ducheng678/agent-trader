@@ -105,10 +105,10 @@
 **Interfaces:**
 - Produces: run-scoped `CancellationSignal.is_cancelled() -> bool`.
 
-- [ ] **Step 1: Add failing cancellation tests** at queued, between-node, before-retry, and before-commit boundaries.
-- [ ] **Step 2: Implement the run-scoped cancellation registry and signal.**
-- [ ] **Step 3: Check cancellation at every bounded execution boundary.**
-- [ ] **Step 4: Verify cancellation prevents later calls and durable candidate side effects.**
+- [x] **Step 1: Add failing cancellation tests** at queued, between-node, before-retry, and before-commit boundaries.
+- [x] **Step 2: Implement the run-scoped cancellation registry and signal.**
+- [x] **Step 3: Check cancellation at every bounded execution boundary.**
+- [x] **Step 4: Verify cancellation prevents later calls and durable candidate side effects.**
 
 ### Task 6: Bind Harness checkpoints and actual usage to LangGraph execution
 
