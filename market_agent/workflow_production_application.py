@@ -163,6 +163,7 @@ class ProductionWorkflowApplication:
         request: WorkflowRequest,
         *,
         tenant_id: str | None = None,
+        cancellation_signal: Any = None,
     ) -> WorkflowResult:
         dependencies = self._get_dependencies()
         request = WorkflowRequest.model_validate(request)
@@ -206,6 +207,7 @@ class ProductionWorkflowApplication:
             memory_context=memory,
             memory_scope=memory_scope if memory is not None else None,
             clock=dependencies.clock,
+            cancellation_check=(cancellation_signal.is_cancelled if cancellation_signal is not None else lambda: False),
         )
 
         def contexts(plan: CoordinatorPlan) -> Mapping[str, ContextSummary]:
@@ -267,6 +269,7 @@ class ProductionWorkflowApplication:
             memory_context=memory,
             memory_tenant_id=bound_tenant if memory is not None else None,
             memory_scope=memory_scope if memory is not None else None,
+            cancellation_check=(cancellation_signal.is_cancelled if cancellation_signal is not None else lambda: False),
         )
         result = dependencies.workflow_factory().invoke(request, runtime.services_for(request))
         if result.trace_id != admitted_trace or result.workflow_id != request.workflow_id:

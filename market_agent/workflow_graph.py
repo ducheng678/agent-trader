@@ -25,6 +25,7 @@ DecisionBuilder = Callable[[WorkflowRequest, CoordinatorPlan, tuple[AgentReport,
 DecisionVerifier = Callable[[WorkflowRequest, CoordinatorPlan, tuple[AgentReport, ...], DecisionDraft], DecisionDraft | None]
 TechnicalSelector = Callable[[tuple[AgentReport, ...]], TechnicalAnalysis | None]
 AuditFinalizer = Callable[[WorkflowResult], None]
+CancellationCheck = Callable[[], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,7 @@ class WorkflowServices:
     verify: DecisionVerifier | None = None
     recover: RecoveryDispatcher | None = None
     finalize: AuditFinalizer | None = None
+    cancelled: CancellationCheck = lambda: False
     risk_policy: RiskPolicy = RiskPolicy()
 
 
@@ -64,7 +66,16 @@ def _safe_failure(state: GraphState, reason: str) -> dict[str, object]:
     }
 
 
+def _cancelled(state: GraphState) -> bool:
+    try:
+        return bool(state["services"].cancelled())
+    except Exception:
+        return True
+
+
 def _plan(state: GraphState) -> dict[str, object]:
+    if _cancelled(state):
+        return _safe_failure(state, "workflow cancelled before planning")
     try:
         plan = state["services"].plan(state["request"])
         request = state["request"]
@@ -80,6 +91,8 @@ def _route_after_plan(state: GraphState) -> str:
 
 
 def _dispatch(state: GraphState) -> dict[str, object]:
+    if _cancelled(state):
+        return _safe_failure(state, "workflow cancelled before dispatch")
     try:
         reports = state["services"].dispatch(state["plan"])
         if not isinstance(reports, tuple):
@@ -97,6 +110,8 @@ def _route_after_dispatch(state: GraphState) -> str:
 
 
 def _recover(state: GraphState) -> dict[str, object]:
+    if _cancelled(state):
+        return _safe_failure(state, "workflow cancelled before recovery")
     recover = state["services"].recover
     if recover is None:
         return {}
@@ -122,6 +137,8 @@ def _route_after_recover(state: GraphState) -> str:
 
 
 def _decide(state: GraphState) -> dict[str, object]:
+    if _cancelled(state):
+        return _safe_failure(state, "workflow cancelled before decision")
     try:
         decision = state["services"].decide(state["request"], state["plan"], state["reports"])
         technical = state["services"].technical(state["reports"])
@@ -135,6 +152,8 @@ def _route_after_decide(state: GraphState) -> str:
 
 
 def _reflect(state: GraphState) -> dict[str, object]:
+    if _cancelled(state):
+        return _safe_failure(state, "workflow cancelled before reflection")
     decision = state.get("decision")
     verify = state["services"].verify
     if decision is None or verify is None:
@@ -154,6 +173,8 @@ def _route_after_reflect(state: GraphState) -> str:
 
 
 def _risk(state: GraphState) -> dict[str, object]:
+    if _cancelled(state):
+        return _safe_failure(state, "workflow cancelled before risk evaluation")
     decision = state.get("decision")
     if decision is None:
         return _safe_failure(state, "decision draft is unavailable")
@@ -161,6 +182,8 @@ def _risk(state: GraphState) -> dict[str, object]:
 
 
 def _assemble(state: GraphState) -> dict[str, object]:
+    if _cancelled(state):
+        return _safe_failure(state, "workflow cancelled before assembly")
     request = state["request"]
     references = tuple(sorted({reference for report in state.get("reports", ()) for reference in report.evidence_refs}))
     return {

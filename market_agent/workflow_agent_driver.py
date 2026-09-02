@@ -161,6 +161,7 @@ class _Run:
     # run but omitted before dispatch after it expires, in which case its later
     # expiry must not invalidate an independent, memory-free answer.
     model_result_used_memory: bool = False
+    cancellation_check: Callable[[], bool] = lambda: False
 
 
 class AgentDriver:
@@ -206,7 +207,8 @@ class AgentDriver:
         self._event_number = 0
 
     def execute(self, invocation: AgentInvocation, *, memory_context: CoreExperienceSummary | None = None,
-                memory_tenant_id: str | None = None, memory_scope: str | None = None) -> AgentResult:
+                memory_tenant_id: str | None = None, memory_scope: str | None = None,
+                cancellation_check: Callable[[], bool] = lambda: False) -> AgentResult:
         """Accept memory only as a validated summary with trusted scope binding.
 
         The caller obtains the bounded summary before invocation; the driver has
@@ -225,9 +227,16 @@ class AgentDriver:
                 })
             except Exception:
                 return self._failure(invocation.trace_id, "prompt_release_unavailable")
-        run = _Run(invocation, invocation.allowed_model_tier, invocation.attempt)
+        run = _Run(
+            invocation,
+            invocation.allowed_model_tier,
+            invocation.attempt,
+            cancellation_check=cancellation_check,
+        )
         try:
             self._emit(run, "trace_started", "received")
+            if self._cancelled(run):
+                return self._fail(run, "cancelled", reason="cancellation")
             if memory_context is not None:
                 try:
                     if type(memory_context) is not CoreExperienceSummary:
@@ -360,6 +369,8 @@ class AgentDriver:
 
     def _models_and_fallback(self, run: _Run, schema: OutputSchema) -> AgentResult:
         while True:
+            if self._cancelled(run):
+                return self._fail(run, "cancelled", reason="cancellation")
             result = self._model(run, schema)
             if result is not None:
                 return result
@@ -429,7 +440,7 @@ class AgentDriver:
         except Exception:
             # Cache admission is optional and must never change the selected
             # model result. Rejections remain observable as a skipped write.
-            self._emit(run, "semantic_cache_write", "rejected", reason="unsafe_or_unavailable")
+            self._emit(run, "semantic_cache_write", "rejected", reason="cache_miss")
 
     def _model(self, run: _Run, schema: OutputSchema) -> AgentResult | None:
         per_tier_attempts = 0
@@ -442,6 +453,8 @@ class AgentDriver:
         except (ValueError, KeyError):
             return None
         while True:
+            if self._cancelled(run):
+                return self._fail(run, "cancelled", reason="cancellation")
             if not self._can_call(run, reservation):
                 self._emit(run, "budget_exhausted", "omitted", reason="budget_exhausted")
                 return None
@@ -491,8 +504,13 @@ class AgentDriver:
                 if decision.terminal:
                     return None
                 self._emit(run, "retry_scheduled", "rescheduled", reason="retryable_error")
+                if self._cancelled(run):
+                    return self._fail(run, "cancelled", reason="cancellation")
                 self._clock.sleep(decision.delay)
                 continue
+            if self._cancelled(run):
+                self._record_circuit(run, success=True, probe=circuit.kind == "probe")
+                return self._fail(run, "cancelled", reason="cancellation")
             self._record_circuit(run, success=True, probe=circuit.kind == "probe")
             try:
                 if not isinstance(response, ModelResponse):
@@ -517,6 +535,13 @@ class AgentDriver:
                 return self._discard_expired_memory_output(run)
             run.model_result_used_memory = memory_injected
             return self._success(run, output, "model", usage)
+
+    @staticmethod
+    def _cancelled(run: _Run) -> bool:
+        try:
+            return bool(run.cancellation_check())
+        except Exception:
+            return True
 
     def _can_call(self, run: _Run, reservation: Decimal) -> bool:
         return (run.attempts < run.invocation.max_attempts

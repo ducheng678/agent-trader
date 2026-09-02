@@ -73,6 +73,7 @@ def workflow_status(view: HarnessSessionView, job: JobRecord | None = None) -> W
     dispatcher_status = job.status if job is not None else None
     if (
         job is not None
+        and view.run_state is RunState.SUCCEEDED
         and job.task_name == "execute_harness_workflow"
         and job.idempotency_key == view.run_id
         and job.request_id == view.trace_id
@@ -456,6 +457,7 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
     @app.post("/v1/workflows/{run_id}:cancel", response_model=WorkflowStatusResponse, tags=["workflows"])
     def cancel_workflow(run_id: str, _: None = Depends(require_api_token)) -> WorkflowStatusResponse:
         kernel = require_harness()
+        resolved_container.cancellation_registry.cancel(run_id)
         kernel.cancel(run_id, "api_cancellation")
         view = workflow_view(kernel, run_id)
         job = resolved_container.task_queue.get_job_by_idempotency_key(run_id)

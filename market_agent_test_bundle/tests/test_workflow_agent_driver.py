@@ -18,6 +18,7 @@ from market_agent.workflow_response_cache import CacheMetadata, CachedResponse, 
 from market_agent.workflow_retry_policy import ProviderError, RetryPolicy
 from market_agent.workflow_semantic_request_cache import SemanticCacheEntry, SemanticRequestCache
 
+TRACE_ID = "1" * 32
 
 class Answer(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -89,7 +90,7 @@ def prompt_release():
 
 def invocation(output_schema=None, **overrides):
     values = dict(
-        trace_id="trace-1", run_id="run-1", task_id="task-1", task_kind="extract",
+        trace_id=TRACE_ID, run_id="run-1", task_id="task-1", task_kind="extract",
         prompt_release_id="release-v1", prompt_release_digest=prompt_release().digest,
         allowed_model_tier=ModelTier.LUNA, deadline_epoch=100.0,
         max_attempts=6, cost_limit_usd=1.0, output_schema_id="answer-v1",
@@ -147,6 +148,27 @@ def memory_summary(**changes):
                                      evidence_ids=("event-1", "event-2")),))
     values.update(changes)
     return CoreExperienceSummary(**values)
+
+
+def test_driver_cancellation_prevents_and_discards_provider_work():
+    cancelled = {"value": True}
+    client = Client(response())
+    driver, _, _ = make_driver(client)
+
+    before = driver.execute(invocation(), cancellation_check=lambda: cancelled["value"])
+    assert before.failure is not None and before.failure.code == "cancelled"
+    assert client.requests == []
+
+    cancelled["value"] = False
+
+    def cancel_during_call(_request):
+        cancelled["value"] = True
+        return response()
+
+    client.outcomes[:] = [cancel_during_call]
+    during = driver.execute(invocation(), cancellation_check=lambda: cancelled["value"])
+    assert during.failure is not None and during.failure.code == "cancelled"
+    assert len(client.requests) == 1
 
 
 def test_driver_rechecks_summary_expiry_when_reused_with_reported_age_zero():
@@ -421,10 +443,10 @@ def test_driver_prefers_safe_semantic_cache_and_preserves_trace():
 
     assert result.origin == "semantic_cache"
     assert result.output == {"answer": "stable"}
-    assert result.trace_id == "trace-1"
+    assert result.trace_id == TRACE_ID
     assert client.requests == []
     assert observer.events[-1].event_type == "task_completed"
-    assert {event.trace_id for event in observer.events} == {"trace-1"}
+    assert {event.trace_id for event in observer.events} == {TRACE_ID}
 
 
 def test_fixed_cache_precedes_semantic_cache():
@@ -480,7 +502,7 @@ def test_deep_json_returns_typed_malformed_output_and_terminal_audit(depth):
     assert len(client.requests) == 1
     assert clock.waits == []
     assert observer.events[-1].event_type == "task_failed"
-    assert {event.trace_id for event in observer.events} == {result.trace_id} == {"trace-1"}
+    assert {event.trace_id for event in observer.events} == {result.trace_id} == {TRACE_ID}
     assert not {"fallback_selected", "task_completed", "retry_scheduled"} & {event.event_type for event in observer.events}
 
 
@@ -489,7 +511,7 @@ def test_model_request_has_stable_prefix_then_canonical_user_context():
     client = Client(response(), response())
     driver, _, _ = make_driver(client)
     assert driver.execute(invocation()).output == {"answer": "known"}
-    driver.execute(invocation(user_payload={"query": "different"}, trace_id="trace-2"))
+    driver.execute(invocation(user_payload={"query": "different"}, trace_id="2" * 32))
     first, second = client.requests
     assert first.messages[0][0] == "system"
     assert first.messages[0][1].startswith("Stable released prefix.")
@@ -498,7 +520,7 @@ def test_model_request_has_stable_prefix_then_canonical_user_context():
     assert "internally" in first.messages[0][1]
     assert "private payload" not in first.messages[0][1]
     assert first.messages[1] == ("user", '{"context":"private payload","query":"supported answer"}')
-    assert first.trace_id == "trace-1"
+    assert first.trace_id == TRACE_ID
     assert first.output_schema_digest == schema().digest
     assert first.temperature == 0.0
     assert first.cost_limit_usd == 0.1
@@ -636,8 +658,8 @@ def test_audit_contains_only_trace_bound_hashes_and_redacted_metadata():
     driver, observer, _ = make_driver(client)
     result = driver.execute(invocation(user_payload={"query": secret}))
     encoded = json.dumps([e.model_dump(mode="json") for e in observer.events])
-    assert result.trace_id == "trace-1"
-    assert {e.trace_id for e in observer.events} == {"trace-1"}
+    assert result.trace_id == TRACE_ID
+    assert {e.trace_id for e in observer.events} == {TRACE_ID}
     assert secret not in encoded
     assert "known" not in encoded
     assert all(e.input_hash and len(e.input_hash) == 64 for e in observer.events)
@@ -968,7 +990,7 @@ def test_driver_events_can_be_recorded_by_existing_audit_writer(tmp_path):
     store = AuditStore(tmp_path / "driver-audit.sqlite3")
     driver, _, _ = make_driver(Client(TimeoutError(), response()), audit_observer=AuditWriter(store))
     result = driver.execute(invocation())
-    events = store.list(trace_id="trace-1")
+    events = store.list(trace_id=TRACE_ID)
     assert result.output == {"answer": "known"}
     assert events[-1].event_type == "task_completed"
     assert [e.sequence for e in events] == list(range(1, len(events) + 1))

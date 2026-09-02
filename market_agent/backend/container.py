@@ -11,6 +11,7 @@ from market_agent.backend.observability import MetricsRegistry, configure_struct
 from market_agent.backend.settings import BackendSettings
 from market_agent.backend.task_queue import BackgroundTaskQueue
 from market_agent.backend.trace_observability import BackendObservability
+from market_agent.workflow_cancellation import WorkflowCancellationRegistry
 
 
 @dataclass
@@ -33,8 +34,11 @@ class BackendContainer:
     harness_application: Any = None
     harness_completion_candidate_factory: Any = None
     prompt_release_manager: Any = None
+    cancellation_registry: WorkflowCancellationRegistry | None = None
 
     def __post_init__(self) -> None:
+        if self.cancellation_registry is None:
+            self.cancellation_registry = WorkflowCancellationRegistry()
         if self.harness_application is not None:
             application_kernel = getattr(self.harness_application, "kernel", None)
             if self.harness_kernel is None or application_kernel is not self.harness_kernel:
@@ -104,6 +108,7 @@ class BackendContainer:
             harness_kernel=harness_kernel,
             harness_application=harness_application,
             harness_completion_candidate_factory=harness_completion_candidate_factory,
+            cancellation_registry=WorkflowCancellationRegistry(),
         )
         try:
             from market_agent.backend.memory_maintenance import MemoryMaintenanceScheduler
@@ -184,9 +189,13 @@ class BackendContainer:
                 production_application = application_factory()
                 container.harness_application = HarnessWorkflowApplication(
                     kernel=container.harness_kernel,
-                    run_workflow=production_application.run_workflow,
+                    run_workflow=lambda request: production_application.run_workflow(
+                        request,
+                        cancellation_signal=container.cancellation_registry.signal(request.workflow_id),
+                    ),
                     completion_candidate_factory=container.harness_completion_candidate_factory,
                     accepted_result_committer=production_application.commit_accepted_result,
+                    cancellation_signal_factory=container.cancellation_registry.signal,
                 )
 
             container.agent_service = register_agent_tasks(

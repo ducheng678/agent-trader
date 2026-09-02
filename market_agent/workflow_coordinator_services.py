@@ -48,7 +48,8 @@ class AgentCoordinatorServices:
                  tenant_id: str, deadline_epoch: float,
                  memory_context: CoreExperienceSummary | None = None,
                  memory_scope: str | None = None,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 cancellation_check: Callable[[], bool] = lambda: False) -> None:
         if type(driver) is not AgentDriver or type(issuer) is not CapabilityIssuer:
             raise TypeError("coordinator services require host-owned driver and issuer")
         self._driver = driver
@@ -58,6 +59,7 @@ class AgentCoordinatorServices:
         self._clock = clock
         self._memory = memory_context
         self._memory_scope = memory_scope
+        self._cancellation_check = cancellation_check
         self._decision_contexts: dict[str, ContextSummary] = {}
         self.verifier = ObjectiveDecisionVerifier(
             context_factory=self._verification_context,
@@ -78,7 +80,8 @@ class AgentCoordinatorServices:
                           grant=grant, authorize=self._authorize_task,
                           memory_context=self._memory,
                           memory_tenant_id=self._tenant if self._memory is not None else None,
-                          memory_scope=self._memory_scope if self._memory is not None else None)
+                          memory_scope=self._memory_scope if self._memory is not None else None,
+                          cancellation_check=self._cancellation_check)
         if result.status.value != "completed":
             return None
         return DecisionDraft.model_validate(json.loads(result.summary))
