@@ -4,7 +4,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 import json
 import math
+import re
 import time
+import unicodedata
 from typing import Any, Protocol
 
 
@@ -85,7 +87,8 @@ class HistoricalAnswerRecord:
 
 
 class HistoricalAnswerCache(Protocol):
-    def lookup(self, vector: tuple[float, ...], metadata: HistoricalAnswerMetadata, *, now: float) -> HistoricalAnswerRecord | None: ...
+    def lookup(self, vector: tuple[float, ...], metadata: HistoricalAnswerMetadata, *, now: float,
+               query_text: str) -> HistoricalAnswerRecord | None: ...
     def put(self, record: HistoricalAnswerRecord) -> None: ...
     def cleanup(self, *, now: float) -> int: ...
 
@@ -100,18 +103,82 @@ def _similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:
     return math.fsum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
 
 
+_NEGATION = re.compile(
+    r"(?:不能|不会|不得|不|没|无|否|未|禁止)|\b(?:not|no|never|without|cannot|can't|won't)\b",
+    re.IGNORECASE,
+)
+_NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])")
+_ENTITY = re.compile(r"\b[A-Z][A-Z0-9._-]{1,15}\b")
+_ASCII_WORD = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
+_CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+
+
+def _normalized_query(value: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise HistoricalCacheError("historical cache query text is invalid")
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _intent(value: str) -> str:
+    checks = (
+        ("reason", ("为什么", "原因", "why")),
+        ("method", ("如何", "怎么", "怎样", "how")),
+        ("definition", ("什么", "是什么", "what")),
+        ("capability", ("会", "能", "可以", "是否", "can", "could")),
+    )
+    for name, markers in checks:
+        if any(marker in value for marker in markers):
+            return name
+    return "statement"
+
+
+def _lexical_features(value: str) -> frozenset[str]:
+    features = set(_ASCII_WORD.findall(value))
+    for run in _CJK_RUN.findall(value):
+        if len(run) == 1:
+            features.add(run)
+        else:
+            features.update(run[index:index + 2] for index in range(len(run) - 1))
+    return frozenset(features)
+
+
+def _queries_compatible(query_text: str, candidate_text: str) -> bool:
+    query = _normalized_query(query_text)
+    candidate = _normalized_query(candidate_text)
+    if query == candidate:
+        return True
+    if bool(_NEGATION.search(query)) != bool(_NEGATION.search(candidate)):
+        return False
+    if _intent(query) != _intent(candidate):
+        return False
+    if tuple(_NUMBER.findall(query)) != tuple(_NUMBER.findall(candidate)):
+        return False
+    query_entities = frozenset(_ENTITY.findall(unicodedata.normalize("NFKC", query_text)))
+    candidate_entities = frozenset(_ENTITY.findall(unicodedata.normalize("NFKC", candidate_text)))
+    if query_entities != candidate_entities:
+        return False
+    query_features, candidate_features = _lexical_features(query), _lexical_features(candidate)
+    if not query_features or not candidate_features:
+        return False
+    coverage = len(query_features & candidate_features) / min(len(query_features), len(candidate_features))
+    return coverage >= 0.5
+
+
 class InMemoryHistoricalAnswerCache:
     def __init__(self) -> None:
         self._entries: dict[str, HistoricalAnswerRecord] = {}
 
-    def lookup(self, vector: tuple[float, ...], metadata: HistoricalAnswerMetadata, *, now: float) -> HistoricalAnswerRecord | None:
+    def lookup(self, vector: tuple[float, ...], metadata: HistoricalAnswerMetadata, *, now: float,
+               query_text: str) -> HistoricalAnswerRecord | None:
         if not math.isfinite(now):
             raise HistoricalCacheError("lookup time must be finite")
+        query_text = _normalized_query(query_text)
         candidates = (
             (record, _similarity(vector, record.request_vector))
             for record in self._entries.values()
             if record.metadata.expires_at > now and record.metadata.invalidation_reason is None
             and record.metadata.compatible_with(metadata)
+            and _queries_compatible(query_text, record.request_text)
         )
         matched = [(record, score) for record, score in candidates if score > 0.95]
         if not matched:
@@ -168,29 +235,54 @@ class PostgresHistoricalAnswerCache:
                 )
             connection.commit()
 
-    def lookup(self, vector: tuple[float, ...], metadata: HistoricalAnswerMetadata, *, now: float) -> HistoricalAnswerRecord | None:
+    def lookup(self, vector: tuple[float, ...], metadata: HistoricalAnswerMetadata, *, now: float,
+               query_text: str) -> HistoricalAnswerRecord | None:
         if len(vector) != self._dimension or not math.isfinite(now):
             raise HistoricalCacheError("historical cache lookup is invalid")
+        query_text = _normalized_query(query_text)
         rendered_vector = "[" + ",".join(repr(value) for value in vector) + "]"
-        expected = json.dumps(asdict(metadata), sort_keys=True)
+        compatibility = (
+            metadata.model_id,
+            metadata.model_version,
+            metadata.embedding_model,
+            metadata.embedding_version,
+            metadata.prompt_release_digest,
+            metadata.output_schema_digest,
+            metadata.safety_policy_version,
+            metadata.locale,
+            metadata.context_fingerprint,
+            metadata.knowledge_fingerprint,
+            metadata.category,
+        )
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT entry_id,request_text,request_embedding::text,response,metadata,request_timestamp,response_timestamp FROM historical_answer_cache WHERE tenant_scope=%s AND metadata=%s::jsonb AND expires_at>%s AND invalidation_reason IS NULL AND 1-(request_embedding <=> %s::vector)>0.95 ORDER BY request_embedding <=> %s::vector,response_timestamp,entry_id LIMIT 1",
-                    (metadata.tenant_scope, expected, now, rendered_vector, rendered_vector),
+                    "SELECT entry_id,request_text,request_embedding::text,response,metadata,request_timestamp,response_timestamp "
+                    "FROM historical_answer_cache WHERE tenant_scope=%s "
+                    "AND metadata->>'model_id'=%s AND metadata->>'model_version'=%s "
+                    "AND metadata->>'embedding_model'=%s AND metadata->>'embedding_version'=%s "
+                    "AND metadata->>'prompt_release_digest'=%s AND metadata->>'output_schema_digest'=%s "
+                    "AND metadata->>'safety_policy_version'=%s AND metadata->>'locale'=%s "
+                    "AND metadata->>'context_fingerprint'=%s AND metadata->>'knowledge_fingerprint'=%s "
+                    "AND metadata->>'category'=%s AND expires_at>%s AND invalidation_reason IS NULL "
+                    "AND 1-(request_embedding <=> %s::vector)>0.95 "
+                    "ORDER BY request_embedding <=> %s::vector,response_timestamp,entry_id LIMIT 20",
+                    (metadata.tenant_scope, *compatibility, now, rendered_vector, rendered_vector),
                 )
-                row = cursor.fetchone()
-        if row is None:
-            return None
-        entry_id, request_text, encoded_vector, response, saved_metadata, request_timestamp, response_timestamp = row
-        parsed_vector = tuple(float(value) for value in str(encoded_vector).strip("[]").split(",") if value)
-        if isinstance(response, str):
-            response = json.loads(response)
-        if isinstance(saved_metadata, str):
-            saved_metadata = json.loads(saved_metadata)
-        return HistoricalAnswerRecord(str(entry_id), str(request_text), parsed_vector, dict(response),
-                                      float(request_timestamp), float(response_timestamp),
-                                      HistoricalAnswerMetadata(**dict(saved_metadata)))
+                rows = cursor.fetchall()
+        for row in rows:
+            entry_id, request_text, encoded_vector, response, saved_metadata, request_timestamp, response_timestamp = row
+            parsed_vector = tuple(float(value) for value in str(encoded_vector).strip("[]").split(",") if value)
+            if isinstance(response, str):
+                response = json.loads(response)
+            if isinstance(saved_metadata, str):
+                saved_metadata = json.loads(saved_metadata)
+            record = HistoricalAnswerRecord(str(entry_id), str(request_text), parsed_vector, dict(response),
+                                            float(request_timestamp), float(response_timestamp),
+                                            HistoricalAnswerMetadata(**dict(saved_metadata)))
+            if record.metadata.compatible_with(metadata) and _queries_compatible(query_text, record.request_text):
+                return record
+        return None
 
     def cleanup(self, *, now: float) -> int:
         with self._connect() as connection:

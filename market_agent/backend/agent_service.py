@@ -40,7 +40,6 @@ class AgentPlaybookService:
                 "generate_playbook payload is invalid",
                 {"errors": exc.errors(include_url=False, include_input=False)},
             ) from exc
-        engine = self._get_engine()
         arguments = dict(
             user_query=request.user_query,
             event_tape=request.event_tape,
@@ -54,7 +53,13 @@ class AgentPlaybookService:
         )
         if not self._legacy_engine:
             arguments.update(trace_id=request.trace_id, tenant_id=request.tenant_id)
-        playbook, report = engine.get_playbook(**arguments)
+        # The engine/application instance is deliberately shared because it
+        # owns stateful runtime resources. Keep construction and invocation in
+        # one critical section so concurrent queue workers cannot mutate that
+        # state at the same time.
+        with self._engine_lock:
+            engine = self._get_engine()
+            playbook, report = engine.get_playbook(**arguments)
         return {"playbook": playbook.to_dict(), "report": report}
 
 

@@ -721,9 +721,9 @@ def _render_report(result: WorkflowResult, mode: WorkflowMode, tenant_id: str) -
 
 
 def _is_static_information(request: WorkflowRequest, mode: WorkflowMode) -> bool:
+    del mode  # Cache safety is determined by volatile context, not scheduler origin.
     return (
-        mode is WorkflowMode.PASSIVE
-        and not request.event_tape
+        not request.event_tape
         and not request.recent_events
         and request.trigger_event is None
         and request.trade_symbol_context is None
@@ -789,7 +789,12 @@ def _lookup_historical_answer(*, request: WorkflowRequest, mode: WorkflowMode, t
         return None
     try:
         vector = dependencies.embedding_client.embed(request.user_query, deadline_epoch=deadline_epoch)
-        record = dependencies.historical_answer_cache.lookup(vector, metadata, now=now)
+        record = dependencies.historical_answer_cache.lookup(
+            vector,
+            metadata,
+            now=now,
+            query_text=request.user_query,
+        )
         if record is None:
             return None
         return _cached_informational_result(
