@@ -55,6 +55,7 @@ class CoordinatorRuntime:
     memory_tenant_id: str | None = None
     memory_scope: str | None = None
     risk_policy: RiskPolicy = RiskPolicy()
+    cancellation_check: Callable[[], bool] = lambda: False
 
     def services_for(self, request: WorkflowRequest) -> WorkflowServices:
         request = WorkflowRequest.model_validate(request)
@@ -81,6 +82,7 @@ class CoordinatorRuntime:
                 memory_context=self.memory_context,
                 memory_tenant_id=self.memory_tenant_id,
                 memory_scope=self.memory_scope,
+                cancellation_check=self.cancellation_check,
             ))
 
         def remaining_after(state: WorkflowBudgetState, plan_value: CoordinatorPlan) -> WorkflowBudgetState:
@@ -121,6 +123,7 @@ class CoordinatorRuntime:
                     memory_context=self.memory_context,
                     memory_tenant_id=self.memory_tenant_id,
                     memory_scope=self.memory_scope,
+                    cancellation_check=self.cancellation_check,
                 ))
 
                 replaced = set(directive.task_ids)
@@ -145,5 +148,6 @@ class CoordinatorRuntime:
             technical=self.technical,
             verify=self.verify,
             finalize=self.finalize,
+            cancelled=self.cancellation_check,
             risk_policy=self.risk_policy,
         )

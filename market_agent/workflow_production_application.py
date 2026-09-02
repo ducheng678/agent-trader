@@ -163,6 +163,7 @@ class ProductionWorkflowApplication:
         request: WorkflowRequest,
         *,
         tenant_id: str | None = None,
+        cancellation_signal: Any = None,
     ) -> WorkflowResult:
         dependencies = self._get_dependencies()
         request = WorkflowRequest.model_validate(request)
@@ -206,6 +207,7 @@ class ProductionWorkflowApplication:
             memory_context=memory,
             memory_scope=memory_scope if memory is not None else None,
             clock=dependencies.clock,
+            cancellation_check=(cancellation_signal.is_cancelled if cancellation_signal is not None else lambda: False),
         )
 
         def contexts(plan: CoordinatorPlan) -> Mapping[str, ContextSummary]:
@@ -267,25 +269,43 @@ class ProductionWorkflowApplication:
             memory_context=memory,
             memory_tenant_id=bound_tenant if memory is not None else None,
             memory_scope=memory_scope if memory is not None else None,
+            cancellation_check=(cancellation_signal.is_cancelled if cancellation_signal is not None else lambda: False),
         )
         result = dependencies.workflow_factory().invoke(request, runtime.services_for(request))
         if result.trace_id != admitted_trace or result.workflow_id != request.workflow_id:
             raise RuntimeError("coordinated workflow returned a cross-trace result")
         if not dependencies.audit_writer.healthy:
             raise RuntimeError("required workflow audit is unavailable")
+        return result
+
+    def commit_accepted_result(
+        self,
+        request: WorkflowRequest,
+        result: WorkflowResult,
+        *,
+        tenant_id: str | None = None,
+    ) -> None:
+        """Persist candidate-derived state only after Harness acceptance."""
+
+        dependencies = self._get_dependencies()
+        request = WorkflowRequest.model_validate(request)
+        result = WorkflowResult.model_validate(result)
+        if (result.workflow_id, result.trace_id) != (request.workflow_id, request.trace_id):
+            raise RuntimeError("accepted workflow result identity does not match request")
+        bound_tenant = _bind_tenant(tenant_id, dependencies.settings.tenant_id)
+        mode = (WorkflowMode.PASSIVE if request.trigger_reason == "passive_event_trigger"
+                else WorkflowMode.ACTIVE)
+        prompt_release_digest = dependencies.prompt_release_manager.current().release_digest
         dependencies.completion_hook(result)
-        if result.trace_id != admitted_trace:
-            raise RuntimeError("completion hook received a cross-trace result")
         _store_historical_answer(
             request=request,
             result=result,
             mode=mode,
             tenant_id=bound_tenant,
-            started_at=started_at,
+            started_at=dependencies.clock(),
             prompt_release_digest=prompt_release_digest,
             dependencies=dependencies,
         )
-        return result
 
     def get_playbook(
         self,
@@ -721,9 +741,9 @@ def _render_report(result: WorkflowResult, mode: WorkflowMode, tenant_id: str) -
 
 
 def _is_static_information(request: WorkflowRequest, mode: WorkflowMode) -> bool:
+    del mode  # Cache safety is determined by volatile context, not scheduler origin.
     return (
-        mode is WorkflowMode.PASSIVE
-        and not request.event_tape
+        not request.event_tape
         and not request.recent_events
         and request.trigger_event is None
         and request.trade_symbol_context is None
@@ -789,7 +809,12 @@ def _lookup_historical_answer(*, request: WorkflowRequest, mode: WorkflowMode, t
         return None
     try:
         vector = dependencies.embedding_client.embed(request.user_query, deadline_epoch=deadline_epoch)
-        record = dependencies.historical_answer_cache.lookup(vector, metadata, now=now)
+        record = dependencies.historical_answer_cache.lookup(
+            vector,
+            metadata,
+            now=now,
+            query_text=request.user_query,
+        )
         if record is None:
             return None
         return _cached_informational_result(
