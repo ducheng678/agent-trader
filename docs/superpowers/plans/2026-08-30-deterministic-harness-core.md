@@ -50,7 +50,7 @@
 - Consumes: existing `BudgetSettlement`, `BudgetSnapshot`, and `WorkflowBudgetLedger`.
 - Produces: `BudgetOverflowError.settlement: BudgetSettlement`; node snapshots constrained by workflow-global remaining attempts.
 
-- [ ] **Step 1: Write failing regression tests**
+- [x] **Step 1: Write failing regression tests**
 
 ```python
 def test_overflow_error_exposes_committed_settlement(ledger, reservation, overflow_usage):
@@ -75,7 +75,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_budget_routi
 
 Expected: failures show the missing `settlement` attribute and a positive node count after global exhaustion.
 
-- [ ] **Step 3: Implement committed-settlement exceptions and global-cap snapshots**
+- [x] **Step 3: Implement committed-settlement exceptions and global-cap snapshots**
 
 ```python
 class BudgetOverflowError(BudgetExceededError):
@@ -103,7 +103,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_budget_routi
 
 Expected: all budget-routing tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_budget.py market_agent_test_bundle/tests/test_workflow_budget_routing.py
@@ -121,7 +121,7 @@ git commit -m "fix: expose committed workflow budget overflow"
 - Consumes: `ContractModel`, `Digest`, `ShortText`, `Text`, and `WorkflowMode`.
 - Produces: `RunState`, `WorkItemState`, `AttemptState`, `OutcomeKind`, `HarnessOutcome`, `TaskKind`, `RiskClass`, `PinnedVersions`, `StageSpec`, `WorkerSpec`, `WorkItemSpec`, `HarnessPlan`, `HarnessTransition`, `ProgressTargetSet`, `ProgressVector`, `LeaseToken`, and `HarnessSessionView.empty()`.
 
-- [ ] **Step 1: Write failing strict-contract tests**
+- [x] **Step 1: Write failing strict-contract tests**
 
 ```python
 def test_worker_spec_requires_three_to_five_phases():
@@ -146,7 +146,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_harness_cont
 
 Expected: collection fails because `workflow_harness_contracts` does not exist.
 
-- [ ] **Step 3: Implement exact enums and frozen models**
+- [x] **Step 3: Implement exact enums and frozen models**
 
 ```python
 class RunState(str, Enum):
@@ -188,7 +188,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_harness_cont
 
 Expected: both files pass and legacy contracts remain import compatible.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_contracts.py market_agent/workflow_harness_contracts.py market_agent_test_bundle/tests/test_workflow_harness_contracts.py
@@ -207,7 +207,7 @@ git commit -m "feat: add deterministic harness contracts"
 - Consumes: Harness contracts from Task 2.
 - Produces: `HarnessEvent`, `HarnessEventStore` protocol, `SQLiteHarnessEventStore.append/load/snapshot/acquire_lease`, and `fold_events(events)`.
 
-- [ ] **Step 1: Write failing event-store and replay tests**
+- [x] **Step 1: Write failing event-store and replay tests**
 
 ```python
 def test_sequence_advances_for_every_event_but_revision_only_for_transitions(store):
@@ -232,7 +232,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_session.py -
 
 Expected: missing module during collection.
 
-- [ ] **Step 3: Implement canonical events, hash chain, SQLite WAL, and fold**
+- [x] **Step 3: Implement canonical events, hash chain, SQLite WAL, and fold**
 
 ```python
 def canonical_event_hash(values: Mapping[str, object]) -> str:
@@ -258,7 +258,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_session.py m
 
 Expected: all tests pass; corrupt current rows fail closed and positive legacy signatures still migrate.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_session.py market_agent/workflow_audit.py market_agent_test_bundle/tests/test_workflow_session.py market_agent_test_bundle/tests/test_workflow_audit.py
@@ -275,7 +275,7 @@ git commit -m "feat: add canonical harness event replay"
 - Consumes: `HarnessSessionView`, `HarnessTransition`, state enums, lease and fencing contracts.
 - Produces: `GlobalTaskStateMachine.validate`, `GlobalTaskStateMachine.apply`, and `PermanentFailureDecision`.
 
-- [ ] **Step 1: Write failing transition-table tests**
+- [x] **Step 1: Write failing transition-table tests**
 
 ```python
 @pytest.mark.parametrize(
@@ -309,7 +309,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_state_machin
 
 Expected: collection fails because the state-machine module is missing.
 
-- [ ] **Step 3: Implement pure transition maps and guards**
+- [x] **Step 3: Implement pure transition maps and guards**
 
 ```python
 RUN_EDGES: Mapping[RunState, frozenset[RunState]] = MappingProxyType({
@@ -336,7 +336,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_state_machin
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_state_machine.py market_agent_test_bundle/tests/test_workflow_state_machine.py
@@ -355,7 +355,7 @@ git commit -m "feat: add global harness state machine"
 - Consumes: `WorkflowRequest`, `WorkflowMode`, `StageSpec`, `WorkerSpec`, and `HarnessPlan`.
 - Produces: `WorkerRegistry.get/all`, `PlanTemplateRegistry.get`, and `PlanCompiler.compile(request, pinned_versions)`.
 
-- [ ] **Step 1: Write failing deterministic-registry tests**
+- [x] **Step 1: Write failing deterministic-registry tests**
 
 ```python
 def test_active_template_uses_only_explicit_validated_request_fields(compiler):
@@ -376,7 +376,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_worker_regis
 
 Expected: collection fails for missing registry modules.
 
-- [ ] **Step 3: Implement immutable registries and compiler**
+- [x] **Step 3: Implement immutable registries and compiler**
 
 ```python
 class WorkerRegistry:
@@ -409,7 +409,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_worker_regis
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_worker_registry.py market_agent/workflow_plan_registry.py market_agent_test_bundle/tests/test_workflow_worker_registry.py market_agent_test_bundle/tests/test_workflow_plan_registry.py
@@ -426,7 +426,7 @@ git commit -m "feat: add deterministic harness plan registries"
 - Consumes: fingerprint and progress contracts from Task 2.
 - Produces: `ActionFingerprint`, `ResultFingerprint`, `ActionObservationFingerprint`, `StateFingerprint`, `CycleSignature`, `SeverityPolicy`, `ProgressDecision`, `build_action_fingerprint`, `build_result_fingerprint`, `build_state_fingerprint`, `compare_progress`, and `LoopGuard.observe_action_result/observe_checkpoint/authorize_recovery`.
 
-- [ ] **Step 1: Write failing loop and progress tests**
+- [x] **Step 1: Write failing loop and progress tests**
 
 ```python
 def test_third_identical_action_result_stops_work(loop_guard):
@@ -458,7 +458,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_loop_guard.p
 
 Expected: missing module during collection.
 
-- [ ] **Step 3: Implement canonical hashing and bounded observations**
+- [x] **Step 3: Implement canonical hashing and bounded observations**
 
 ```python
 def detect_cycle(states: Sequence[str]) -> tuple[str, ...] | None:
@@ -487,7 +487,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_loop_guard.p
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_loop_guard.py market_agent_test_bundle/tests/test_workflow_loop_guard.py
@@ -504,7 +504,7 @@ git commit -m "feat: add deterministic harness loop guard"
 - Consumes: frozen ProgressTargetSet, accepted evidence metadata, conflict records, source registry, and event-folded state.
 - Produces: `ConfidenceCalibratorArtifact`, `ConfidenceFeatureSpec`, `ConfidenceObservation`, `ConfidenceFeatureVector`, `ConfidenceGate.evaluate/decide`, and `ConfidenceDecision`.
 
-- [ ] **Step 1: Write failing calibration tests**
+- [x] **Step 1: Write failing calibration tests**
 
 ```python
 def test_model_self_confidence_never_changes_harness_score(gate):
@@ -531,7 +531,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_confidence_c
 
 Expected: missing module during collection.
 
-- [ ] **Step 3: Implement immutable artifacts and deterministic feature scoring**
+- [x] **Step 3: Implement immutable artifacts and deterministic feature scoring**
 
 ```python
 class ConfidenceGate:
@@ -553,7 +553,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_confidence_c
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_confidence_calibration.py market_agent_test_bundle/tests/test_workflow_confidence_calibration.py
@@ -571,7 +571,7 @@ git commit -m "feat: add fail-closed harness confidence gate"
 - Consumes: committed `HarnessPlan`, `HarnessTransition`, and folded `HarnessSessionView`.
 - Produces: `ExecutionBackend` protocol, `ExecutionHandle`, and `LangGraphExecutionBackend.register/apply_committed_transition/resume/cancel`.
 
-- [ ] **Step 1: Write failing backend-boundary tests**
+- [x] **Step 1: Write failing backend-boundary tests**
 
 ```python
 def test_raw_worker_candidate_cannot_select_edge(backend, plan, view):
@@ -591,7 +591,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_execution_ba
 
 Expected: missing module during collection.
 
-- [ ] **Step 3: Implement protocol and committed-transition adapter**
+- [x] **Step 3: Implement protocol and committed-transition adapter**
 
 ```python
 class ExecutionBackend(Protocol):
@@ -616,7 +616,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_execution_ba
 
 Expected: all tests pass with the legacy facade compatible.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_execution_backend.py market_agent/llm_workflow.py market_agent_test_bundle/tests/test_workflow_execution_backend.py
@@ -633,7 +633,7 @@ git commit -m "feat: add harness execution backend boundary"
 - Consumes: event store, state machine, plan/worker registries, LoopGuard, ConfidenceGate, budget protocol, execution backend, injected clock, and injected randomness.
 - Produces: `HarnessKernel.create/resume/advance/cancel/snapshot`, `RunHandle`, and `HarnessDecision`.
 
-- [ ] **Step 1: Write failing lifecycle and authority tests**
+- [x] **Step 1: Write failing lifecycle and authority tests**
 
 ```python
 def test_create_publishes_only_after_all_dependencies_are_ready(kernel_factory):
@@ -662,7 +662,7 @@ Run: `python -m pytest market_agent_test_bundle/tests/test_workflow_harness.py -
 
 Expected: missing module during collection.
 
-- [ ] **Step 3: Implement deterministic command handlers**
+- [x] **Step 3: Implement deterministic command handlers**
 
 ```python
 class HarnessKernel:
@@ -685,7 +685,7 @@ Run: `python -m pytest -q market_agent_test_bundle/tests/test_workflow_budget_ro
 
 Expected: every Phase 1 and retained Task 1-3 regression passes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add market_agent/workflow_harness.py market_agent_test_bundle/tests/test_workflow_harness.py

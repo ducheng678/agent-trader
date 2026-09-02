@@ -29,7 +29,7 @@
 
 **Interfaces:** `MemoryRepository.append_event/propose_knowledge/activate_knowledge/append_decision/append_outcome/link_lesson/get_by_id`; `ArtifactStore.put/get`.
 
-- [ ] **Step 1: Write failing authority and transaction tests.**
+- [x] **Step 1: Write failing authority and transaction tests.**
 
 ```python
 def test_knowledge_requires_existing_same_tenant_event_evidence(repo):
@@ -42,7 +42,7 @@ def test_event_idempotency_does_not_duplicate_audit_truth(repo):
 
 - [ ] **Step 2: Run `python -m pytest market_agent_test_bundle/tests/test_workflow_memory_storage.py -q`; confirm failure.**
 
-- [ ] **Step 3: Implement strict immutable records, checksum artifacts, and WAL repository.**
+- [x] **Step 3: Implement strict immutable records, checksum artifacts, and WAL repository.**
 
 ```python
 def append_event(self, record: EventRecord, *, trace_id: str, idempotency_key: str) -> EventRecord:
@@ -51,7 +51,7 @@ def append_event(self, record: EventRecord, *, trace_id: str, idempotency_key: s
 
 - [ ] **Step 4: Add hash, tenant, rollback, revision-CAS, copy/rehydration, and agent-write-denial tests; rerun.**
 
-- [ ] **Step 5: Commit `feat: add governed memory storage`.**
+- [x] **Step 5: Commit `feat: add governed memory storage`.**
 
 ### Task 2: Retrieval, Summary, and Promotion
 
@@ -63,7 +63,7 @@ def append_event(self, record: EventRecord, *, trace_id: str, idempotency_key: s
 
 **Interfaces:** `retrieve_memory(query, repository) -> RetrievalResult`, `build_core_experience_summary(result, token_budget)`, and `promote_candidate(candidate, repository)`.
 
-- [ ] **Step 1: Write failing filtered retrieval and promotion tests.**
+- [x] **Step 1: Write failing filtered retrieval and promotion tests.**
 
 ```python
 def test_summary_preserves_citations_and_conflicts(repository):
@@ -77,7 +77,7 @@ def test_circular_provenance_cannot_be_promoted(repository):
 
 - [ ] **Step 2: Run the two test files; confirm failure.**
 
-- [ ] **Step 3: Implement version/freshness filters, stable ranking, bounded conflict summaries, and verified-outcome promotion.**
+- [x] **Step 3: Implement version/freshness filters, stable ranking, bounded conflict summaries, and verified-outcome promotion.**
 
 ```python
 eligible = [r for r in records if r.tenant_id == query.tenant_id and r.expires_at > query.now]
@@ -85,7 +85,7 @@ eligible = [r for r in records if r.tenant_id == query.tenant_id and r.expires_a
 
 - [ ] **Step 4: Add tenant/version mismatch, stale/weak/conflicting miss, anti-injection, no-memory, and agent-write-denial tests; rerun.**
 
-- [ ] **Step 5: Commit `feat: add governed memory retrieval and promotion`.**
+- [x] **Step 5: Commit `feat: add governed memory retrieval and promotion`.**
 
 ### Task 3: Lifecycle Forgetting and Integration Gate
 
@@ -96,7 +96,7 @@ eligible = [r for r in records if r.tenant_id == query.tenant_id and r.expires_a
 
 **Interfaces:** `LifecycleWorker.plan(scope, now)`, `apply(plan, limits)`, and `effective_confidence(record, now, policy)`; driver accepts only `CoreExperienceSummary` as dynamic context.
 
-- [ ] **Step 1: Write failing decay/protection/lifecycle tests.**
+- [x] **Step 1: Write failing decay/protection/lifecycle tests.**
 
 ```python
 def test_referenced_or_held_event_never_reaches_purge(worker):
@@ -106,7 +106,7 @@ def test_referenced_or_held_event_never_reaches_purge(worker):
 
 - [ ] **Step 2: Run lifecycle test; confirm failure.**
 
-- [ ] **Step 3: Implement dry-run lifecycle actions, archive/tombstone/purge guards, idempotent cleanup, and summary-only driver boundary.**
+- [x] **Step 3: Implement dry-run lifecycle actions, archive/tombstone/purge guards, idempotent cleanup, and summary-only driver boundary.**
 
 ```python
 if record.legal_hold or record.referenced_by or record.lifecycle is Lifecycle.ACTIVE:
@@ -115,7 +115,7 @@ if record.legal_hold or record.referenced_by or record.lifecycle is Lifecycle.AC
 
 - [ ] **Step 4: Add decay, holds, cleanup idempotency, expired-evidence gap, trace audit, and driver forbidden-import tests; run all three Task suites.**
 
-- [ ] **Step 5: Commit `feat: add governed memory forgetting lifecycle`; run compileall, memory-targeted pytest, and `git diff --check`.**
+- [x] **Step 5: Commit `feat: add governed memory forgetting lifecycle`; run compileall, memory-targeted pytest, and `git diff --check`.**
 
 ## PostgreSQL / pgvector Adapter Note
 
