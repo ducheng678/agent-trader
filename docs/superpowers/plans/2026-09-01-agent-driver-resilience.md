@@ -46,7 +46,7 @@ silently falling back to cross-tenant or in-memory data.
 
 **Interfaces:** `AgentInvocation`, `AgentResult`, `AgentFailure`, `ModelTier`, `PromptRelease`, and `PromptReleaseRegistry.render(invocation) -> tuple[str, str]`.
 
-- [ ] **Step 1: Write failing strict-model tests.**
+- [x] **Step 1: Write failing strict-model tests.**
 
 ```python
 def test_invocation_rejects_missing_trace_and_unbounded_limits():
@@ -60,7 +60,7 @@ def test_result_rejects_raw_text_and_extra_fields():
 
 - [ ] **Step 2: Run `python -m pytest market_agent_test_bundle/tests/test_workflow_agent_contracts.py -q`; confirm it fails before implementation.**
 
-- [ ] **Step 3: Implement immutable strict contracts and canonical rendering.**
+- [x] **Step 3: Implement immutable strict contracts and canonical rendering.**
 
 ```python
 class PromptRelease(StrictModel):
@@ -74,7 +74,7 @@ def render(self, invocation: AgentInvocation) -> tuple[str, str]:
 
 - [ ] **Step 4: Add prefix-order, dynamic-system-value denial, and unsupported-tier tests; run both contract tests.**
 
-- [ ] **Step 5: Commit `feat: add agent driver contracts and prompt releases`.**
+- [x] **Step 5: Commit `feat: add agent driver contracts and prompt releases`.**
 
 ### Task 2: Retry and Circuit Policies
 
@@ -86,7 +86,7 @@ def render(self, invocation: AgentInvocation) -> tuple[str, str]:
 
 **Interfaces:** `RetryPolicy.decide(error, attempt, deadline, remaining_cost, now, random)` and `CircuitBreaker.acquire(model, task_kind, now)` / `record(..., success, now)`.
 
-- [ ] **Step 1: Write failing retry and breaker tests.**
+- [x] **Step 1: Write failing retry and breaker tests.**
 
 ```python
 def test_retry_uses_full_jitter_but_stops_before_deadline():
@@ -99,11 +99,11 @@ def test_breaker_admits_only_one_half_open_probe():
 
 - [ ] **Step 2: Run both test files; confirm failure.**
 
-- [ ] **Step 3: Implement closed error classification, `uniform(0, min(cap, base * 2**attempt))`, and model/task-keyed states.**
+- [x] **Step 3: Implement closed error classification, `uniform(0, min(cap, base * 2**attempt))`, and model/task-keyed states.**
 
 - [ ] **Step 4: Add 408/409/429/5xx retry, auth/schema denial, Retry-After, cost stop, cooldown/reopen, and isolation tests; rerun.**
 
-- [ ] **Step 5: Commit `feat: add retry and circuit policies`.**
+- [x] **Step 5: Commit `feat: add retry and circuit policies`.**
 
 ### Task 3: Safe Cache and Fallback
 
@@ -118,7 +118,7 @@ def test_breaker_admits_only_one_half_open_probe():
 
 **Interfaces:** `ExactResponseCache.get/put`, `SemanticRequestCache.lookup(query, metadata, now)`, and `FallbackPolicy.next(current_tier, failure)`.
 
-- [ ] **Step 1: Write failing cache and fallback tests.**
+- [x] **Step 1: Write failing cache and fallback tests.**
 
 ```python
 def test_similarity_at_threshold_is_a_miss():
@@ -133,7 +133,7 @@ def test_fallback_ends_with_exact_abstention():
 
 - [ ] **Step 2: Run the three cache/fallback test files; confirm failure.**
 
-- [ ] **Step 3: Implement TTL metadata gates, deterministic ranking, local knowledge citations, and one-way downgrade.**
+- [x] **Step 3: Implement TTL metadata gates, deterministic ranking, local knowledge citations, and one-way downgrade.**
 
 ```python
 eligible = similarity > 0.95 and entry.expires_at > now and entry.metadata == metadata
@@ -142,7 +142,7 @@ return sorted(eligible, key=lambda e: (-e.similarity, e.created_at, e.entry_id))
 
 - [ ] **Step 4: Add expiry cleanup, tenant/release/schema/model mismatch, fixed-seed, citation, and no-upgrade tests; rerun.**
 
-- [ ] **Step 5: Commit `feat: add safe response caches and fallback policy`.**
+- [x] **Step 5: Commit `feat: add safe response caches and fallback policy`.**
 
 ### Task 4: Compose and Audit AgentDriver
 
@@ -153,7 +153,7 @@ return sorted(eligible, key=lambda e: (-e.similarity, e.created_at, e.entry_id))
 
 **Interfaces:** `AgentDriver.execute(invocation) -> AgentResult`; injected `ModelClient`, `AuditObserver`, clock, and randomness only.
 
-- [ ] **Step 1: Write failing ordered-flow tests.**
+- [x] **Step 1: Write failing ordered-flow tests.**
 
 ```python
 def test_driver_prefers_safe_cache_and_preserves_trace(observer):
@@ -166,8 +166,8 @@ def test_driver_rejects_malformed_provider_output_before_fallback():
 
 - [ ] **Step 2: Run `python -m pytest market_agent_test_bundle/tests/test_workflow_agent_driver.py -q`; confirm failure.**
 
-- [ ] **Step 3: Implement the ordered cache → model/retry/circuit → downgrade → knowledge → abstain path, emitting redacted trace-bound audit events.**
+- [x] **Step 3: Implement the ordered cache → model/retry/circuit → downgrade → knowledge → abstain path, emitting redacted trace-bound audit events.**
 
 - [ ] **Step 4: Add strict-schema, circuit/downgrade, unsafe-cache, trace, and forbidden-import tests; run all seven new test files.**
 
-- [ ] **Step 5: Commit `feat: compose auditable resilient agent driver`, then run compileall, workflow-targeted pytest, and `git diff --check`.**
+- [x] **Step 5: Commit `feat: compose auditable resilient agent driver`, then run compileall, workflow-targeted pytest, and `git diff --check`.**
