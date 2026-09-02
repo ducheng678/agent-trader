@@ -186,6 +186,7 @@ class BackendContainer:
                     kernel=container.harness_kernel,
                     run_workflow=production_application.run_workflow,
                     completion_candidate_factory=container.harness_completion_candidate_factory,
+                    accepted_result_committer=production_application.commit_accepted_result,
                 )
 
             container.agent_service = register_agent_tasks(

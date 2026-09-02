@@ -112,6 +112,22 @@ def test_backend_rejects_production_settings_without_api_token(tmp_path):
         ).validate()
 
 
+def test_job_repository_can_find_dispatcher_job_by_idempotency_key(tmp_path):
+    from market_agent.backend.database import JobRepository
+
+    repository = JobRepository(tmp_path / "jobs.sqlite3")
+    created, _ = repository.create_or_get_job(
+        "execute_harness_workflow",
+        {"workflow_id": "workflow-1"},
+        "workflow-1",
+        3,
+        "trace-1",
+    )
+
+    assert repository.get_job_by_idempotency_key("workflow-1") == created
+    assert repository.get_job_by_idempotency_key("missing") is None
+
+
 def test_backend_retries_transient_tasks_and_records_event(tmp_path):
     from market_agent.backend.container import BackendContainer
     from market_agent.backend.errors import RetryableTaskError

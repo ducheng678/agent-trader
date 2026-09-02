@@ -262,7 +262,10 @@ def _request(**updates: object) -> WorkflowRequest:
         "workflow_id": "run-1",
         "trace_id": "trace-1",
         "user_query": "summarize the current market",
-        "trigger_reason": "api_request",
+        # This unit-test compiler intentionally declares only the passive
+        # informational template. Active admission is covered by the plan
+        # registry tests with a complete active registry.
+        "trigger_reason": "passive_event_trigger",
     }
     values.update(updates)
     return WorkflowRequest(**values)

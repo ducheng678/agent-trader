@@ -32,6 +32,7 @@ class HarnessWorkflowExecution:
 
 
 WorkflowRunner = Callable[[WorkflowRequest], WorkflowResult]
+AcceptedResultCommitter = Callable[[WorkflowRequest, WorkflowResult], object]
 CompletionCandidateFactory = Callable[
     [WorkflowRequest, WorkflowResult, HarnessSessionView], dict[str, object]
 ]
@@ -52,14 +53,18 @@ class HarnessWorkflowApplication:
         kernel: HarnessKernel,
         run_workflow: WorkflowRunner,
         completion_candidate_factory: CompletionCandidateFactory | None = None,
+        accepted_result_committer: AcceptedResultCommitter | None = None,
     ) -> None:
         if type(kernel) is not HarnessKernel or not callable(run_workflow):
             raise TypeError("Harness application requires a kernel and host workflow runner")
         if completion_candidate_factory is not None and not callable(completion_candidate_factory):
             raise TypeError("completion candidate factory must be host-owned and callable")
+        if accepted_result_committer is not None and not callable(accepted_result_committer):
+            raise TypeError("accepted result committer must be host-owned and callable")
         self._kernel = kernel
         self._run_workflow = run_workflow
         self._completion_candidate_factory = completion_candidate_factory
+        self._accepted_result_committer = accepted_result_committer
 
     @property
     def kernel(self) -> HarnessKernel:
@@ -128,6 +133,18 @@ class HarnessWorkflowApplication:
                 decisions.append(decision)
                 completion_candidate = None
         view = self._kernel.snapshot(handle.run_id)
+        if (
+            view.run_state is RunState.SUCCEEDED
+            and result is not None
+            and self._accepted_result_committer is not None
+        ):
+            try:
+                self._accepted_result_committer(request, result)
+            except Exception as exc:
+                # Fail closed: a result whose required durable commit failed
+                # is not eligible to leave the queue adapter.
+                error = type(exc).__name__
+                result = None
         return HarnessWorkflowExecution(
             handle=handle,
             view=view,
