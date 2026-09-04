@@ -228,6 +228,78 @@ def _contradicting_evidence(record: KnowledgeRevision | DecisionLesson, records:
     return tuple(sorted(identifiers))
 
 
+def _record_references(record: Record) -> tuple[str, ...]:
+    """Return bounded repository references needed to verify one candidate.
+
+    Vector stores return only the nearest memory candidates.  Evidence and
+    lineage remain separate durable records, so the retrieval boundary loads
+    those records on demand before running the same provenance checks used by
+    the SQLite path.  The model never receives this raw expansion.
+    """
+
+    references: list[str] = []
+    for field in (
+        "evidence_ids", "lineage_ids", "contradicting_ids", "derived_from",
+    ):
+        values = getattr(record, field, ())
+        if isinstance(values, (tuple, list)):
+            references.extend(value for value in values if isinstance(value, str))
+    for field in ("decision_id", "outcome_id", "supersedes_id"):
+        value = getattr(record, field, None)
+        if isinstance(value, str):
+            references.append(value)
+    provenance = getattr(record, "provenance", None)
+    derived = getattr(provenance, "derived_from", ())
+    if isinstance(derived, (tuple, list)):
+        references.extend(value for value in derived if isinstance(value, str))
+    return tuple(sorted(set(references)))
+
+
+def _retrieval_records(
+    query: MemoryQuery, repository: MemoryRepository,
+) -> tuple[tuple[Record, ...], dict[str, Record]]:
+    """Select pgvector candidates and hydrate only their evidence ancestry.
+
+    ``PostgresMemoryRepository.vector_candidates`` is an optional capability;
+    repositories without it (including SQLite) retain their deterministic
+    full-snapshot behavior.  A vector adapter failure is intentionally allowed
+    to propagate to the caller's fail-closed retrieval result instead of
+    silently turning a production vector outage into an unbounded table scan.
+    """
+
+    vector_candidates = getattr(repository, "vector_candidates", None)
+    if query.embedding and callable(vector_candidates):
+        candidates = tuple(
+            record for record in vector_candidates(query)
+            if isinstance(record, (KnowledgeRevision, DecisionLesson))
+            and record.tenant_id == query.tenant_id
+        )[: query.top_k]
+        records: dict[str, Record] = {record.record_id: record for record in candidates}
+        pending = list(reversed(candidates))
+        seen: set[str] = set(records)
+        # Evidence graphs are host data, never model instructions.  Keep the
+        # expansion bounded so a malformed/cyclic store cannot exhaust a
+        # request; the ancestry validators still reject missing/cyclic links.
+        while pending and len(seen) < 2048:
+            current = pending.pop()
+            for identifier in _record_references(current):
+                if identifier in seen:
+                    continue
+                seen.add(identifier)
+                related = repository.get_by_id(identifier, tenant_id=query.tenant_id)
+                if related is None or related.tenant_id != query.tenant_id:
+                    continue
+                records[related.record_id] = related
+                pending.append(related)
+        return candidates, records
+
+    snapshot = tuple(
+        record for record in repository.list_records(tenant_id=query.tenant_id)
+        if record.tenant_id == query.tenant_id
+    )
+    return snapshot, {record.record_id: record for record in snapshot}
+
+
 def _tokens(text: str) -> set[str]:
     return set(re.findall(r"\w+", text.casefold()))
 
@@ -257,16 +329,13 @@ def retrieve_memory(query: MemoryQuery, repository: MemoryRepository) -> Retriev
     query = MemoryQuery.model_validate(query)
     base = dict(tenant_id=query.tenant_id, scope=query.scope, now=query.now)
     try:
-        snapshot = repository.list_records(tenant_id=query.tenant_id)
-    except (MemoryIntegrityError, OSError, sqlite3.DatabaseError):
+        candidates, records = _retrieval_records(query, repository)
+    except (MemoryIntegrityError, OSError, sqlite3.DatabaseError, RuntimeError, ValueError):
         return RetrievalResult(**base, status="failed", omissions=("retrieval_failed",))
-    # Recheck tenant even for adapter implementations; foreign IDs never become
-    # evidence or diagnostics. A snapshot avoids per-record read inconsistencies.
-    records = {record.record_id: record for record in snapshot if record.tenant_id == query.tenant_id}
     matches = []
     omissions: set[str] = set()
     omitted_count = 0
-    for record in records.values():
+    for record in candidates:
         if not isinstance(record, (KnowledgeRevision, DecisionLesson)):
             continue
         if not _eligible_memory(record, query):
