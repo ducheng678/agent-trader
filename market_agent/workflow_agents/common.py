@@ -17,6 +17,7 @@ from market_agent.workflow_contracts import (
 from market_agent.workflow_context_summary import ContextHandoff
 from market_agent.workflow_memory_retrieval import CoreExperienceSummary
 from market_agent.workflow_prompt_release import PromptRelease, PromptReleaseRegistry, canonical_json
+from market_agent.workflow_prompt_config import WorkflowPromptPin
 
 
 T = TypeVar("T", bound=ContractModel)
@@ -137,17 +138,22 @@ def checked_context(task: AgentTask, context: ContextSummary | ContextHandoff) -
 
 
 def build_invocation(task: AgentTask, context: ContextSummary | ContextHandoff, *, deadline_epoch: float,
-                     attempt: int = 0, correction_context: dict | None = None) -> AgentInvocation:
+                     attempt: int = 0, correction_context: dict | None = None,
+                     execution_node: str = "dispatch",
+                     prompt_pin: WorkflowPromptPin | None = None) -> AgentInvocation:
     summary = checked_context(task, context)
     profile = profile_for(task.task_type)
     tier = ModelTier(task.model_tier.value.rsplit("-", 1)[1])
-    release, schema = profile.release(), profile.output_schema()
+    schema = profile.output_schema()
+    release = (prompt_pin.component(profile.profile_id, schema.digest).release
+               if prompt_pin is not None else profile.release())
     payload = {"task": task.model_dump(mode="json"), "context_summary": summary.model_dump(mode="json"),
                "context_trust": "untrusted_evidence"}
     if correction_context is not None:
         raise ValueError("corrections require the bounded reflection correction interface")
     return AgentInvocation(trace_id=task.trace_id, run_id=task.workflow_id, task_id=task.task_id,
         task_kind="extract" if tier is ModelTier.LUNA else "coordinator" if tier is ModelTier.SOL else "analyze",
+        execution_node=execution_node,
         prompt_release_id=release.release_id, prompt_release_digest=release.digest, allowed_model_tier=tier,
         deadline_epoch=deadline_epoch, attempt=attempt, max_attempts=task.maximum_retries + 1,
         cost_limit_usd=task.reserved_cost, output_schema_id=schema.schema_id,
@@ -188,17 +194,23 @@ def report_result(task: AgentTask, context: ContextSummary | ContextHandoff, res
 
 def run_node(task: AgentTask, context: ContextSummary | ContextHandoff, driver: AgentDriver, *,
              deadline_epoch: float, grant: object, authorize: Callable[[AgentTask, object], None],
+             execution_node: str = "dispatch",
              memory_context: CoreExperienceSummary | None = None,
              memory_tenant_id: str | None = None,
              memory_scope: str | None = None,
+             prompt_pin: WorkflowPromptPin | None = None,
              cancellation_check: Callable[[], bool] = lambda: False) -> AgentReport:
     checked_context(task, context)
     if grant is None or not callable(authorize):
         raise PermissionError("specialist dispatch requires a host-issued grant and authorizer")
     authorize(task, grant)
-    invocation = build_invocation(task, context, deadline_epoch=deadline_epoch)
+    invocation = build_invocation(
+        task, context, deadline_epoch=deadline_epoch, execution_node=execution_node,
+        prompt_pin=prompt_pin,
+    )
     return report_result(task, context, driver.execute(
         invocation,
+        prompt_pin=prompt_pin,
         memory_context=memory_context,
         memory_tenant_id=memory_tenant_id,
         memory_scope=memory_scope,

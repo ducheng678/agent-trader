@@ -11,7 +11,7 @@ import re
 import sqlite3
 import subprocess
 from threading import RLock
-from typing import Callable, Iterator, Protocol
+from typing import Callable, Iterable, Iterator, Protocol
 
 from pydantic import Field, model_validator
 
@@ -49,6 +49,77 @@ class PromptPin:
     output_schema_hash: str
     manifest_hash: str
     release: PromptRelease
+
+
+@dataclass(frozen=True, slots=True)
+class PromptReleaseComponent:
+    """One agent-specific release frozen into a workflow-wide prompt pin."""
+
+    profile_id: str
+    output_schema_digest: str
+    release: PromptRelease
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowPromptPin:
+    """Immutable base release plus every prompt component used by one run."""
+
+    base: PromptPin
+    components: tuple[PromptReleaseComponent, ...]
+    release_digest: str
+
+    @classmethod
+    def capture(
+        cls,
+        base: PromptPin,
+        components: Iterable[tuple[PromptRelease, str]],
+    ) -> WorkflowPromptPin:
+        base = base if isinstance(base, PromptPin) else PromptPin(**base)
+        frozen: list[PromptReleaseComponent] = []
+        for component, schema_digest in components:
+            component = PromptRelease.model_validate(component)
+            if type(schema_digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", schema_digest):
+                raise ValueError("prompt component schema digest is invalid")
+            frozen.append(PromptReleaseComponent(
+                profile_id=component.release_id,
+                output_schema_digest=schema_digest,
+                release=component,
+            ))
+        if not frozen or len({item.profile_id for item in frozen}) != len(frozen):
+            raise ValueError("workflow prompt components must be non-empty and unique")
+        frozen.sort(key=lambda item: item.profile_id)
+        digest = sha256(canonical_json({
+            "base_release_id": base.release_id,
+            "base_release_digest": base.release_digest,
+            "base_manifest_hash": base.manifest_hash,
+            "components": tuple({
+                "profile_id": item.profile_id,
+                "release_digest": item.release.digest,
+                "output_schema_digest": item.output_schema_digest,
+            } for item in frozen),
+        }).encode("utf-8")).hexdigest()
+        return cls(base=base, components=tuple(frozen), release_digest=digest)
+
+    @property
+    def release_id(self) -> str:
+        return self.base.release_id
+
+    def component(self, profile_id: str, output_schema_digest: str) -> PromptReleaseComponent:
+        match = next((item for item in self.components if item.profile_id == profile_id), None)
+        if match is None or match.output_schema_digest != output_schema_digest:
+            raise PromptConfigurationError("invocation is not bound to the workflow prompt pin")
+        return match
+
+    def registry(self) -> PromptReleaseRegistry:
+        return PromptReleaseRegistry(releases=tuple(item.release for item in self.components))
+
+    def system_prefix(self, profile_id: str, output_schema_digest: str) -> str:
+        component = self.component(profile_id, output_schema_digest)
+        return (
+            self.base.release.stable_system_prefix.rstrip()
+            + "\n"
+            + component.release.stable_system_prefix.lstrip()
+        )
 
 
 @dataclass(frozen=True, slots=True)

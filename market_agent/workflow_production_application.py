@@ -24,7 +24,7 @@ from market_agent.models import Condition, EntryPlan, EntryScenario, StrategyDec
 from market_agent.playbook import GenericPlaybook
 from market_agent.workflow_agent_contracts import ModelTier as DriverModelTier
 from market_agent.workflow_agent_driver import AgentDriver, CacheRequest
-from market_agent.workflow_agents.common import output_schemas
+from market_agent.workflow_agents.common import output_schemas, prompt_release_registry
 from market_agent.workflow_audit import AuditEvent, AuditPayload, AuditStore, AuditWriter
 from market_agent.workflow_capabilities import CapabilityGrant, CapabilityIssuer, CapabilityScope
 from market_agent.workflow_circuit_breaker import CircuitBreaker
@@ -66,14 +66,30 @@ from market_agent.workflow_memory_retrieval import (
     build_core_experience_summary,
     retrieve_memory,
 )
+from market_agent.workflow_memory_result_writer import AcceptedOutcomeProof
 from market_agent.workflow_openai_client import OpenAIModelClient
-from market_agent.workflow_prompt_config import default_prompt_manager
+from market_agent.workflow_observation import (
+    AttemptUsage,
+    CoreNodeName,
+    ExecutionObservationCollector,
+    TokenUsage,
+    WorkflowExecution,
+)
+from market_agent.workflow_prompt_config import (
+    PromptPin,
+    WorkflowPromptPin,
+    default_prompt_manager,
+)
 from market_agent.workflow_prompt_release import canonical_json
-from market_agent.workflow_reflection_agent import reflection_output_schema
+from market_agent.workflow_reflection_agent import (
+    reflection_output_schema,
+    reflection_release,
+)
 from market_agent.workflow_response_cache import CacheMetadata, ExactResponseCache
 from market_agent.workflow_retry_policy import RetryPolicy
 from market_agent.workflow_semantic_request_cache import SemanticRequestCache
 from market_agent.workflow_service_factory import CoordinatorRuntime
+from market_agent.workflow_tracing import TraceContext
 
 
 _TRACE_ID = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -96,8 +112,8 @@ class _SystemClock:
         time.sleep(seconds)
 
 
-DriverFactory = Callable[[str], AgentDriver]
-CompletionHook = Callable[[WorkflowResult], object]
+DriverFactory = Callable[..., AgentDriver]
+CompletionHook = Callable[[WorkflowRequest, WorkflowResult, AcceptedOutcomeProof], object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +128,7 @@ class ProductionDependencies:
     prompt_release_manager: Any = None
     workflow_factory: Callable[[], CoordinatedWorkflow] = CoordinatedWorkflow
     clock: Callable[[], float] = time.time
+    trace_observability: Any = None
 
 
 class ProductionWorkflowApplication:
@@ -123,6 +140,10 @@ class ProductionWorkflowApplication:
         self._dependency_factory = dependency_factory
         self._dependencies: ProductionDependencies | None = None
         self._construction_lock = threading.RLock()
+        self._prompt_pin_lock = threading.RLock()
+        self._prompt_bindings: dict[
+            tuple[str, str], tuple[WorkflowPromptPin | None, str]
+        ] = {}
 
     @classmethod
     def from_backend(
@@ -134,6 +155,9 @@ class ProductionWorkflowApplication:
         historical_answer_cache: HistoricalAnswerCache | None = None,
         prompt_release_manager: Any = None,
         completion_hook: CompletionHook,
+        local_knowledge_base: LocalKnowledgeBase | None = None,
+        trace_observability: Any = None,
+        audit_writer: Any = None,
     ) -> ProductionWorkflowApplication:
         checked = settings.validate()
 
@@ -145,6 +169,9 @@ class ProductionWorkflowApplication:
                 historical_answer_cache=historical_answer_cache,
                 prompt_release_manager=prompt_release_manager,
                 completion_hook=completion_hook,
+                local_knowledge_base=local_knowledge_base,
+                trace_observability=trace_observability,
+                audit_writer=audit_writer,
             )
 
         return cls(build)
@@ -165,13 +192,36 @@ class ProductionWorkflowApplication:
         tenant_id: str | None = None,
         cancellation_signal: Any = None,
     ) -> WorkflowResult:
+        return self.execute_workflow(
+            request,
+            tenant_id=tenant_id,
+            cancellation_signal=cancellation_signal,
+        ).result
+
+    def execute_workflow(
+        self,
+        request: WorkflowRequest,
+        *,
+        tenant_id: str | None = None,
+        cancellation_signal: Any = None,
+        checkpoint_sink: Callable[[Any], object] | None = None,
+    ) -> WorkflowExecution:
         dependencies = self._get_dependencies()
         request = WorkflowRequest.model_validate(request)
         admitted_trace = request.trace_id
         bound_tenant = _bind_tenant(tenant_id, dependencies.settings.tenant_id)
-        prompt_release_digest = dependencies.prompt_release_manager.current().release_digest
+        prompt_pin, prompt_release_digest = _capture_workflow_prompt_pin(
+            dependencies.prompt_release_manager
+        )
+        _trace_component(dependencies.trace_observability, request, "agent_started", "started", "coordinator")
+        self._remember_prompt_binding(request, prompt_pin, prompt_release_digest)
         mode = (WorkflowMode.PASSIVE if request.trigger_reason == "passive_event_trigger"
                 else WorkflowMode.ACTIVE)
+        observations = ExecutionObservationCollector(
+            request.workflow_id,
+            request.trace_id,
+            checkpoint_sink=checkpoint_sink,
+        )
         started_at = dependencies.clock()
         mode_cap = 130.0 if mode is WorkflowMode.PASSIVE else 300.0
         deadline_epoch = started_at + min(
@@ -187,7 +237,33 @@ class ProductionWorkflowApplication:
             dependencies=dependencies,
         )
         if cached is not None:
-            return cached
+            _trace_component(dependencies.trace_observability, request, "cache_hit", "succeeded", "cache")
+            observations.record_attempt(AttemptUsage(
+                workflow_id=request.workflow_id,
+                trace_id=request.trace_id,
+                task_id="historical-cache",
+                attempt=0,
+                node=CoreNodeName.PLAN,
+                provider="host",
+                provider_request_id="historical-cache-" + sha256(
+                    f"{request.workflow_id}:{prompt_release_digest}".encode("utf-8")
+                ).hexdigest()[:48],
+                model_id="historical-cache",
+                model_tier=None,
+                pricing_version="host-zero-v1",
+                tokens=TokenUsage.zero(),
+                estimated_cost_usd=0.0,
+                latency_ms=0,
+                source="historical_cache",
+            ))
+            return WorkflowExecution(
+                result=cached,
+                usage=observations.usage(),
+                checkpoints=(),
+                completion_kind="historical_cache",
+                prompt_release_digest=prompt_release_digest,
+            )
+        _trace_component(dependencies.trace_observability, request, "cache_miss", "unknown", "cache")
         records = _request_context_records(request, started_at)
         memory_scope = "default"
         memory = _retrieve_core_memory(
@@ -197,7 +273,11 @@ class ProductionWorkflowApplication:
             deadline_epoch=deadline_epoch,
             dependencies=dependencies,
         )
-        driver = dependencies.driver_factory(bound_tenant)
+        _trace_component(
+            dependencies.trace_observability, request, "memory_completed",
+            "succeeded" if memory is not None else "unknown", "memory",
+        )
+        driver = dependencies.driver_factory(bound_tenant, observations.record_attempt)
         issuer = CapabilityIssuer(clock=dependencies.clock)
         coordinator = AgentCoordinatorServices(
             driver=driver,
@@ -208,6 +288,7 @@ class ProductionWorkflowApplication:
             memory_scope=memory_scope if memory is not None else None,
             clock=dependencies.clock,
             cancellation_check=(cancellation_signal.is_cancelled if cancellation_signal is not None else lambda: False),
+            prompt_pin=prompt_pin,
         )
 
         def contexts(plan: CoordinatorPlan) -> Mapping[str, ContextSummary]:
@@ -269,19 +350,32 @@ class ProductionWorkflowApplication:
             memory_context=memory,
             memory_tenant_id=bound_tenant if memory is not None else None,
             memory_scope=memory_scope if memory is not None else None,
+            prompt_pin=prompt_pin,
             cancellation_check=(cancellation_signal.is_cancelled if cancellation_signal is not None else lambda: False),
+            execution_observer=observations,
         )
-        result = dependencies.workflow_factory().invoke(request, runtime.services_for(request))
+        try:
+            result = dependencies.workflow_factory().invoke(request, runtime.services_for(request))
+        except Exception:
+            _trace_component(dependencies.trace_observability, request, "agent_failed", "failed", "coordinator")
+            raise
         if result.trace_id != admitted_trace or result.workflow_id != request.workflow_id:
             raise RuntimeError("coordinated workflow returned a cross-trace result")
         if not dependencies.audit_writer.healthy:
             raise RuntimeError("required workflow audit is unavailable")
-        return result
+        _trace_component(dependencies.trace_observability, request, "agent_completed", "succeeded", "coordinator")
+        return WorkflowExecution(
+            result=result,
+            usage=observations.usage(),
+            checkpoints=observations.checkpoints(),
+            prompt_release_digest=prompt_release_digest,
+        )
 
     def commit_accepted_result(
         self,
         request: WorkflowRequest,
         result: WorkflowResult,
+        proof: AcceptedOutcomeProof,
         *,
         tenant_id: str | None = None,
     ) -> None:
@@ -290,13 +384,29 @@ class ProductionWorkflowApplication:
         dependencies = self._get_dependencies()
         request = WorkflowRequest.model_validate(request)
         result = WorkflowResult.model_validate(result)
+        proof = AcceptedOutcomeProof.model_validate(proof)
         if (result.workflow_id, result.trace_id) != (request.workflow_id, request.trace_id):
             raise RuntimeError("accepted workflow result identity does not match request")
+        try:
+            proof.verify(request, result)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
         bound_tenant = _bind_tenant(tenant_id, dependencies.settings.tenant_id)
         mode = (WorkflowMode.PASSIVE if request.trigger_reason == "passive_event_trigger"
                 else WorkflowMode.ACTIVE)
-        prompt_release_digest = dependencies.prompt_release_manager.current().release_digest
-        dependencies.completion_hook(result)
+        with self._prompt_pin_lock:
+            binding = self._prompt_bindings.get((request.workflow_id, request.trace_id))
+        if binding is None:
+            raise RuntimeError("accepted workflow ingress prompt binding is unavailable")
+        _prompt_pin, prompt_release_digest = binding
+        if proof.prompt_release_digest != prompt_release_digest:
+            raise RuntimeError("accepted workflow prompt proof does not match ingress pin")
+        try:
+            dependencies.completion_hook(request, result, proof)
+        except Exception:
+            _trace_component(dependencies.trace_observability, request, "commit_failed", "failed", "service")
+            raise
+        _trace_component(dependencies.trace_observability, request, "commit_completed", "succeeded", "service")
         _store_historical_answer(
             request=request,
             result=result,
@@ -306,6 +416,22 @@ class ProductionWorkflowApplication:
             prompt_release_digest=prompt_release_digest,
             dependencies=dependencies,
         )
+
+    def _remember_prompt_binding(
+        self,
+        request: WorkflowRequest,
+        pin: WorkflowPromptPin | None,
+        release_digest: str,
+    ) -> None:
+        key = (request.workflow_id, request.trace_id)
+        binding = (pin, release_digest)
+        with self._prompt_pin_lock:
+            existing = self._prompt_bindings.get(key)
+            if existing is not None and existing != binding:
+                raise RuntimeError("workflow prompt pin changed after ingress")
+            self._prompt_bindings[key] = binding
+            while len(self._prompt_bindings) > 1024:
+                self._prompt_bindings.pop(next(iter(self._prompt_bindings)))
 
     def get_playbook(
         self,
@@ -344,6 +470,27 @@ class ProductionWorkflowApplication:
         return _generic_playbook(result, request), _render_report(result, mode, tenant)
 
 
+def _capture_workflow_prompt_pin(manager: Any) -> tuple[WorkflowPromptPin | None, str]:
+    """Freeze the active base release and every executable prompt component."""
+
+    current = manager.current()
+    if not isinstance(current, PromptPin):
+        # Lightweight test/legacy compositions expose only a release digest.
+        digest = getattr(current, "release_digest", None)
+        if type(digest) is not str:
+            raise RuntimeError("active prompt release is unavailable")
+        return None, digest
+    schemas = {item.schema_id: item.digest for item in output_schemas()}
+    components = [
+        (release, schemas[release.release_id])
+        for release in prompt_release_registry().releases
+    ]
+    reflection_schema = reflection_output_schema()
+    components.append((reflection_release(), reflection_schema.digest))
+    pin = WorkflowPromptPin.capture(current, tuple(components))
+    return pin, pin.release_digest
+
+
 def _production_dependencies(
     *,
     settings: BackendSettings,
@@ -352,6 +499,9 @@ def _production_dependencies(
     historical_answer_cache: HistoricalAnswerCache | None,
     prompt_release_manager: Any | None,
     completion_hook: CompletionHook,
+    local_knowledge_base: LocalKnowledgeBase | None = None,
+    trace_observability: Any = None,
+    audit_writer: Any = None,
 ) -> ProductionDependencies:
     if not callable(completion_hook):
         raise TypeError("production completion hook must be host-owned and callable")
@@ -361,12 +511,12 @@ def _production_dependencies(
     repository_root = Path(__file__).resolve().parents[1]
     prompt_manager = prompt_release_manager or default_prompt_manager(
         registry_path=settings.prompt_registry_path, git_root=repository_root)
-    audit_writer = AuditWriter(AuditStore(settings.audit_database_path))
+    audit_writer = audit_writer or AuditWriter(AuditStore(settings.audit_database_path))
     exact_cache = ExactResponseCache()
     breaker = CircuitBreaker(failure_threshold=3, cooldown=30.0)
     fallback = FallbackPolicy(
         (DriverModelTier.SOL, DriverModelTier.TERRA, DriverModelTier.LUNA),
-        knowledge_base=LocalKnowledgeBase(),
+        knowledge_base=local_knowledge_base or LocalKnowledgeBase(),
     )
     clock = _SystemClock()
     model_client = OpenAIModelClient(
@@ -392,7 +542,10 @@ def _production_dependencies(
         DriverModelTier.LUNA: settings.workflow_luna_model_version,
     }
 
-    def driver_factory(tenant_id: str) -> AgentDriver:
+    def driver_factory(
+        tenant_id: str,
+        attempt_observer: Callable[[AttemptUsage], object],
+    ) -> AgentDriver:
         def cache_context(invocation: Any) -> CacheRequest:
             now = clock.now()
             ttl = settings.workflow_response_cache_ttl_seconds
@@ -426,6 +579,7 @@ def _production_dependencies(
             exact_cache=exact_cache,
             semantic_cache=semantic_cache,
             cache_context=cache_context,
+            attempt_observer=attempt_observer,
         )
 
     return ProductionDependencies(
@@ -438,7 +592,25 @@ def _production_dependencies(
         historical_answer_cache=historical_answer_cache,
         prompt_release_manager=prompt_manager,
         clock=clock.now,
+        trace_observability=trace_observability,
     )
+
+
+def _trace_component(observer: Any, request: WorkflowRequest, event: str, status: str, component: str) -> None:
+    if observer is None:
+        return
+    try:
+        observer.record_component(
+            TraceContext(trace_id=request.trace_id, span_id=sha256(
+                f"{component}:{event}:{request.workflow_id}".encode("utf-8")
+            ).hexdigest()[:16]),
+            event=event, status=status, component=component,
+            workflow_id=request.workflow_id,
+        )
+    except Exception:
+        # Observability must never turn a valid workflow into an invalid one;
+        # the backend readiness/metrics path reports sink failures separately.
+        return
 
 
 def _admit_trace_id(value: str | None) -> str:

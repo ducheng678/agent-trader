@@ -73,6 +73,35 @@ class BackendObservability:
         self.sink.record(event)
         self.logger.emit(event)
 
+    def query(self, trace_id: str, *, after_sequence: int = 0, limit: int = 100) -> TracePage:
+        """Unified trace repository entrypoint used by API and operators."""
+
+        return self.sink.query(trace_id, after_sequence=after_sequence, limit=limit)
+
+    def record_component(
+        self,
+        trace: TraceContext,
+        *,
+        event: str,
+        status: str,
+        component: str,
+        workflow_id: str | None = None,
+        task_id: str | None = None,
+        **fields,
+    ) -> None:
+        """Record a bounded structured event for any workflow component.
+
+        Component labels stay in the event body, while metrics remain
+        low-cardinality.  The supplied TraceContext is validated before the
+        event is accepted, so cross-request records cannot enter the stream.
+        """
+
+        actor = component if component in {"queue", "coordinator", "specialist", "reflection", "driver", "cache", "memory", "tool", "service", "ingress"} else "service"
+        self.record(StructuredEvent.create(
+            TraceContext.model_validate(trace), event=event, actor=actor, status=status,
+            workflow_id=workflow_id, task_id=task_id, **fields,
+        ))
+
     def started(self, trace: TraceContext, *, request_id: str, malformed_upstream: bool = False) -> None:
         self.record(StructuredEvent.create(trace, event="request_started", actor="ingress", status="started",
                     workflow_id=request_id, reason="invalid_input" if malformed_upstream else "none"))

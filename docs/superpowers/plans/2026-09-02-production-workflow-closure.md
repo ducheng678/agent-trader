@@ -123,12 +123,12 @@
 **Interfaces:**
 - Produces: typed node checkpoint observer and aggregate `WorkflowUsage`.
 
-- [ ] **Step 1: Add failing tests** that require one Harness checkpoint per core node and exact aggregate usage settlement.
-- [ ] **Step 2: Add typed usage/checkpoint contracts.**
-- [ ] **Step 3: Emit checkpoints from plan, dispatch, recovery, decision, reflection, risk, and assembly nodes.**
-- [ ] **Step 4: Replace fixed Harness usage with aggregate provider usage.**
-- [ ] **Step 5: Make Harness work-item inventory correspond to actual coordinator tasks.**
-- [ ] **Step 6: Run replay, loop, budget, graph, and integration tests.**
+- [x] **Step 1: Add failing tests** that require one Harness checkpoint per core node and exact aggregate usage settlement.
+- [x] **Step 2: Add typed usage/checkpoint contracts.**
+- [x] **Step 3: Emit checkpoints from plan, dispatch, recovery, decision, reflection, risk, and assembly nodes.**
+- [x] **Step 4: Replace fixed Harness usage with aggregate provider usage.**
+- [x] **Step 5: Make Harness work-item inventory correspond to actual coordinator tasks.**
+- [x] **Step 6: Run replay, loop, budget, graph, and integration tests.**
 
 ### Task 7: Pin prompts, complete correction and memory promotion
 
@@ -143,11 +143,11 @@
 **Interfaces:**
 - Produces: ingress `PromptPin`, deterministic patch generator, verified outcome commit, and bounded promotion scheduler.
 
-- [ ] **Step 1: Add failing tests** for mid-workflow prompt activation, successful objective patch, rewrite fallback, verified outcome, and promotion eligibility.
-- [ ] **Step 2: Pass one prompt pin through all Agent invocations.**
-- [ ] **Step 3: Implement verifier-error-driven field patching with objective improvement checks.**
-- [ ] **Step 4: Record verified accepted outcomes and trigger host-controlled promotion evaluation.**
-- [ ] **Step 5: Run prompt, reflection, and memory tests.**
+- [x] **Step 1: Add failing tests** for mid-workflow prompt activation, successful objective patch, rewrite fallback, verified outcome, and promotion eligibility.
+- [x] **Step 2: Pass one prompt pin through all Agent invocations.**
+- [x] **Step 3: Implement verifier-error-driven field patching with objective improvement checks.**
+- [x] **Step 4: Record verified accepted outcomes and trigger host-controlled promotion evaluation.**
+- [x] **Step 5: Run prompt, reflection, and memory tests.**
 
 ### Task 8: Complete distributed execution, unified tracing, tools, knowledge, and evaluation gate
 
@@ -160,9 +160,9 @@
 **Interfaces:**
 - Produces: Redis-backed durable dispatch worker, shared production authorities, unified trace repository, explicit tool capabilities, populated knowledge provider, and executable evaluation quality gate.
 
-- [ ] **Step 1: Add failing integration tests** for cross-process recovery and unified trace retrieval.
-- [ ] **Step 2: Implement Redis durable dispatch and shared production state.**
-- [ ] **Step 3: Add real readiness probes and admin authorization scope.**
-- [ ] **Step 4: Wire bounded tools and configured local knowledge through capability grants.**
-- [ ] **Step 5: Add evaluation CLI and CI quality gate using the versioned dataset.**
-- [ ] **Step 6: Run the complete verification and security suites, synchronize both repositories, and commit.**
+- [x] **Step 1: Add failing integration tests** for cross-process recovery and unified trace retrieval.
+- [x] **Step 2: Implement Redis durable dispatch and shared production state.**
+- [x] **Step 3: Add real readiness probes and admin authorization scope.**
+- [x] **Step 4: Wire bounded tools and configured local knowledge through capability grants.**
+- [x] **Step 5: Add evaluation CLI and CI quality gate using the versioned dataset.**
+- [x] **Step 6: Run the complete verification and security suites, synchronize both repositories, and commit.**

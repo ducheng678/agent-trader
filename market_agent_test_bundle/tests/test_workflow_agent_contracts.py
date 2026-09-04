@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import pytest
 from pydantic import ValidationError
 
@@ -43,6 +45,32 @@ def test_invocation_and_result_are_immutable():
         invocation.trace_id = "trace-2"
     with pytest.raises(TypeError):
         result.output["answer"] = "changed"
+
+
+def test_structured_result_arrays_survive_revalidation_and_remain_immutable():
+    result = AgentResult(
+        trace_id="trace-1",
+        output={"answer": "known", "citations": ["source-1"]},
+        usage=AgentUsage(input_tokens=1, output_tokens=1, cost_usd=0.01, model_tier=ModelTier.LUNA),
+    )
+
+    checked = AgentResult.model_validate(result)
+
+    assert checked.output["citations"] == ("source-1",)
+    with pytest.raises(AttributeError):
+        checked.output["citations"].append("source-2")
+
+
+def test_immutable_json_arrays_serialize_without_pydantic_warnings():
+    result = AgentResult(
+        trace_id="trace-1",
+        output={"answer": "known", "citations": ["source-1"]},
+        usage=AgentUsage(input_tokens=1, output_tokens=1, cost_usd=0.01, model_tier=ModelTier.LUNA),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert result.model_dump(mode="json")["output"]["citations"] == ["source-1"]
 
 
 def test_model_copy_revalidates_invocation_and_result_updates():

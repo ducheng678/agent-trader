@@ -24,7 +24,9 @@ from market_agent.workflow_contracts import (
     WorkflowResult,
 )
 from market_agent.workflow_graph import DecisionBuilder, DecisionVerifier, TechnicalSelector, WorkflowServices
+from market_agent.workflow_observation import ExecutionObservationCollector
 from market_agent.workflow_memory_retrieval import CoreExperienceSummary
+from market_agent.workflow_prompt_config import WorkflowPromptPin
 from market_agent.workflow_risk_gate import RiskPolicy
 
 
@@ -54,8 +56,10 @@ class CoordinatorRuntime:
     memory_context: CoreExperienceSummary | None = None
     memory_tenant_id: str | None = None
     memory_scope: str | None = None
+    prompt_pin: WorkflowPromptPin | None = None
     risk_policy: RiskPolicy = RiskPolicy()
     cancellation_check: Callable[[], bool] = lambda: False
+    execution_observer: ExecutionObservationCollector | None = None
 
     def services_for(self, request: WorkflowRequest) -> WorkflowServices:
         request = WorkflowRequest.model_validate(request)
@@ -82,6 +86,8 @@ class CoordinatorRuntime:
                 memory_context=self.memory_context,
                 memory_tenant_id=self.memory_tenant_id,
                 memory_scope=self.memory_scope,
+                prompt_pin=self.prompt_pin,
+                execution_node="dispatch",
                 cancellation_check=self.cancellation_check,
             ))
 
@@ -123,6 +129,8 @@ class CoordinatorRuntime:
                     memory_context=self.memory_context,
                     memory_tenant_id=self.memory_tenant_id,
                     memory_scope=self.memory_scope,
+                    prompt_pin=self.prompt_pin,
+                    execution_node="recover",
                     cancellation_check=self.cancellation_check,
                 ))
 
@@ -150,4 +158,5 @@ class CoordinatorRuntime:
             finalize=self.finalize,
             cancelled=self.cancellation_check,
             risk_policy=self.risk_policy,
+            execution_observer=self.execution_observer,
         )

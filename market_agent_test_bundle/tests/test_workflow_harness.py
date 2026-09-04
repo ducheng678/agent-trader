@@ -28,7 +28,37 @@ from market_agent.workflow_confidence_calibration import (
     artifact_payload,
     confidence_snapshot_hashes,
 )
-from market_agent.workflow_contracts import WorkflowMode, WorkflowRequest
+from market_agent.workflow_contracts import (
+    Action,
+    AgentReport,
+    AgentTask,
+    CoordinatorPlan,
+    DecisionDraft,
+    KnowledgeStatus,
+    ModelTier,
+    ReportStatus,
+    SummaryCompleteness,
+    TaskDifficulty,
+    TaskType,
+    WorkflowMode,
+    WorkflowRequest,
+)
+from market_agent.workflow_agent_contracts import AgentUsage, ModelTier as DriverModelTier
+from market_agent.workflow_agent_driver import AgentDriver, ModelResponse
+from market_agent.workflow_agents.common import profile_for
+from market_agent.workflow_capabilities import CapabilityIssuer
+from market_agent.workflow_circuit_breaker import CircuitBreaker
+from market_agent.workflow_coordinator_services import AgentCoordinatorServices
+from market_agent.workflow_fallback import FallbackPolicy
+from market_agent.workflow_graph import CoordinatedWorkflow, WorkflowServices
+from market_agent.workflow_prompt_release import PromptReleaseRegistry, canonical_json
+from market_agent.workflow_reflection_agent import (
+    ObjectiveCheck,
+    reflection_output_schema,
+    reflection_release,
+)
+from market_agent.workflow_retry_policy import RetryPolicy
+from market_agent.openai_usage import UsageTokens as PricedUsageTokens, estimate_workflow_usage_cost
 from market_agent.workflow_execution_backend import (
     CommittedExecutionSnapshot,
     CommittedTransitionReceipt,
@@ -74,6 +104,16 @@ from market_agent.workflow_loop_guard import (
     build_action_fingerprint,
     build_result_fingerprint,
     build_state_fingerprint,
+)
+from market_agent.workflow_observation import (
+    AttemptUsage,
+    CheckpointDecision,
+    CoreNodeName,
+    ExecutionObservationCollector,
+    NodeOutcome,
+    ObservedWorkItem,
+    TaskRetryState,
+    TokenUsage,
 )
 from market_agent.workflow_plan_registry import (
     PlanCompiler,
@@ -1145,6 +1185,44 @@ def test_bound_confidence_success_finishes_succeeded_not_degraded(tmp_path):
     assert terminal.no_trade is False
 
 
+def test_succeeded_run_exposes_a_host_verified_terminal_receipt(tmp_path):
+    import market_agent.workflow_execution_backend as backend_module
+
+    material: dict[str, object] = {}
+
+    def gate_factory(plan: HarnessPlan) -> ConfidenceGate:
+        gate, observation, artifact = _confidence_material(plan)
+        material.update(observation=observation, artifact=artifact)
+        return gate
+
+    kernel, _, _, _ = _kernel(tmp_path, confidence_gate_factory=gate_factory)
+    request = _request()
+    handle = kernel.create(request)
+    _advance_to_running(kernel, handle.run_id)
+    kernel.advance(
+        handle.run_id,
+        candidate={
+            "confidence_observation": material["observation"],
+            "confidence_artifact": material["artifact"],
+        },
+    )
+    kernel.advance(
+        handle.run_id,
+        candidate={},
+        observed_execution=True,
+        prompt_release_digest="e" * 64,
+        accepted_result_digest="f" * 64,
+    )
+
+    assert hasattr(backend_module, "verify_committed_transition_receipt")
+    receipt = kernel.terminal_receipt(handle.run_id)
+    assert backend_module.verify_committed_transition_receipt(receipt)
+    assert receipt.post.folded_view.run_state is RunState.SUCCEEDED
+    assert receipt.post.folded_view.request_digest is not None
+    assert receipt.post.folded_view.prompt_release_digest == "e" * 64
+    assert receipt.post.folded_view.accepted_result_digest == "f" * 64
+
+
 def test_gate_snapshot_mismatch_is_permanent_no_trade_for_run(tmp_path):
     def wrong_gate(plan: HarnessPlan) -> ConfidenceGate:
         gate, _, _ = _confidence_material(plan)
@@ -2035,3 +2113,724 @@ def test_run_and_trace_identity_propagate_through_every_event(tmp_path):
         event.transition is None or event.transition.trace_id == handle.trace_id
         for event in events
     )
+
+
+def test_observed_checkpoint_settles_exact_provider_usage_and_replays_v2(tmp_path):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    work_item = ObservedWorkItem(
+        task_id="coordinator-task-1", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.DISPATCH,
+        maximum_retries=1, execution_state="pending",
+    )
+    observations.checkpoint(
+        plan_revision=0, node=CoreNodeName.PLAN,
+        outcome=NodeOutcome.COMPLETED, task_ids=("coordinator-task-1",),
+        completed_task_ids=(), failed_task_ids=(),
+        retry_state=(TaskRetryState(task_id="coordinator-task-1",
+                                    attempts_consumed=0, retries_consumed=0,
+                                    retries_remaining=1),),
+        work_items=(work_item,), action_fingerprint="a" * 64,
+    )
+    plan_permit = kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+    assert plan_permit.decision is CheckpointDecision.CONTINUE
+    observations.record_attempt(AttemptUsage(
+        workflow_id=handle.run_id,
+        trace_id=handle.trace_id,
+        task_id="coordinator-task-1",
+        attempt=0,
+        node=CoreNodeName.DISPATCH,
+        provider="openai",
+        provider_request_id="response-actual-1",
+        model_id="gpt-5.6-terra-2026-08-15",
+        model_tier="terra",
+        pricing_version="openai-standard-2026-08-01",
+        pricing_model_id="gpt-5.6-terra",
+        pricing_band="short",
+        tokens=TokenUsage(
+            input_tokens=100,
+            cached_input_tokens=25,
+            cache_write_tokens=10,
+            output_tokens=20,
+        ),
+        estimated_cost_usd=0.00042,
+        latency_ms=125,
+        source="provider_response",
+    ))
+    observations.checkpoint(
+        plan_revision=0,
+        node=CoreNodeName.DISPATCH,
+        outcome=NodeOutcome.COMPLETED,
+        task_ids=("coordinator-task-1",),
+        completed_task_ids=("coordinator-task-1",),
+        failed_task_ids=(),
+        retry_state=(TaskRetryState(task_id="coordinator-task-1",
+                                    attempts_consumed=1, retries_consumed=0,
+                                    retries_remaining=1),),
+        work_items=(work_item.model_copy(update={
+            "execution_state": "succeeded", "attempt_ids": ("response-actual-1",)
+        }),),
+        action_fingerprint="b" * 64,
+    )
+
+    dispatch_permit = kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+    assert dispatch_permit.decision is CheckpointDecision.CONTINUE
+    assert kernel.coordinator_task_inventory(handle.run_id) == ("coordinator-task-1",)
+    kernel.advance(handle.run_id, candidate={}, workflow_usage=observations.usage())
+
+    authority = next(
+        event for event in reversed(store.load(handle.run_id))
+        if event.event_type == "transition_authorized"
+        and "budget_settlement_evidence" in event.payload
+    )
+    evidence = authority.payload["budget_settlement_evidence"]
+    assert evidence["settlement"]["schema_version"] == "budget-settlement-evidence-v2"
+    settled_usage = json.loads(evidence["settlement"]["workflow_usage_json"])
+    assert settled_usage["aggregate"] == {
+        "schema_version": "v1",
+        "input_tokens": 100,
+        "cached_input_tokens": 25,
+        "cache_write_tokens": 10,
+        "output_tokens": 20,
+        "web_search_tool_calls": 0,
+    }
+    assert authority.payload["budget_delta_tokens"] == 130
+    assert authority.payload["budget_remaining_tokens"] == 670
+    assert authority.payload["budget_delta_attempts"] == 1
+    assert authority.payload["budget_remaining_attempts"] == 9
+    assert authority.payload["budget_delta_cost"] == "0.00042"
+
+    restarted, _, _, _ = _kernel(tmp_path)
+    restarted.resume(handle.run_id)
+    plan = HarnessPlan.model_validate_json(store.load(handle.run_id)[0].payload["plan_json"])
+    assert restarted._budget_state(
+        tuple(store.load(handle.run_id)),
+        plan,
+        restarted._budgets[handle.run_id].snapshot(),
+    ) == (9, Decimal("129.875"), Decimal("0.29958"), 670)
+
+
+def test_harness_rejects_terminal_usage_not_bound_by_latest_checkpoint(tmp_path):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    work_item = ObservedWorkItem(
+        task_id="coordinator-task-1", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.DISPATCH,
+        maximum_retries=1, execution_state="pending",
+    )
+    observations.checkpoint(
+        plan_revision=0,
+        node=CoreNodeName.PLAN,
+        outcome=NodeOutcome.COMPLETED,
+        task_ids=("coordinator-task-1",),
+        completed_task_ids=(),
+        failed_task_ids=(),
+        retry_state=(TaskRetryState(task_id="coordinator-task-1",
+                                    attempts_consumed=0, retries_consumed=0,
+                                    retries_remaining=1),),
+        work_items=(work_item,),
+        action_fingerprint="c" * 64,
+    )
+    kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+    observations.record_attempt(AttemptUsage(
+        workflow_id=handle.run_id,
+        trace_id=handle.trace_id,
+        task_id="coordinator-task-1",
+        attempt=0,
+        node=CoreNodeName.DISPATCH,
+        provider="openai",
+        provider_request_id="response-after-checkpoint",
+        model_id="gpt-5.6-terra",
+        model_tier="terra",
+        pricing_version="openai-standard-2026-08-01",
+        pricing_model_id="gpt-5.6-terra",
+        pricing_band="short",
+        tokens=TokenUsage(input_tokens=3, output_tokens=2),
+        estimated_cost_usd=0.00003,
+        latency_ms=1,
+        source="provider_response",
+    ))
+
+    with pytest.raises(HarnessDependencyError, match="checkpoint"):
+        kernel.advance(handle.run_id, candidate={}, workflow_usage=observations.usage())
+
+
+def test_explicit_historical_cache_usage_settles_without_provider_attempt(tmp_path):
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    observations.record_attempt(AttemptUsage(
+        workflow_id=handle.run_id,
+        trace_id=handle.trace_id,
+        task_id="historical-cache",
+        attempt=0,
+        node=CoreNodeName.PLAN,
+        provider="host",
+        provider_request_id="historical-cache-entry-1",
+        model_id="historical-cache",
+        model_tier=None,
+        pricing_version="host-zero-v1",
+        tokens=TokenUsage.zero(),
+        estimated_cost_usd=0.0,
+        latency_ms=0,
+        source="historical_cache",
+    ))
+
+    kernel.advance(handle.run_id, candidate={}, workflow_usage=observations.usage())
+
+    authority = next(
+        event for event in reversed(store.load(handle.run_id))
+        if event.event_type == "transition_authorized"
+        and "budget_settlement_evidence" in event.payload
+    )
+    assert authority.payload["budget_delta_attempts"] == 0
+    assert authority.payload["budget_delta_tokens"] == 0
+    assert authority.payload["budget_delta_cost"] == "0.0"
+
+
+def test_recovery_checkpoint_preserves_survivors_and_advances_revision(tmp_path):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    original = ObservedWorkItem(
+        task_id="task-original", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.DISPATCH,
+        maximum_retries=1, execution_state="pending",
+    )
+    observations.checkpoint(
+        plan_revision=0, node=CoreNodeName.PLAN,
+        outcome=NodeOutcome.COMPLETED, task_ids=("task-original",),
+        completed_task_ids=(), failed_task_ids=(),
+        retry_state=(TaskRetryState(task_id="task-original", attempts_consumed=0,
+                                    retries_consumed=0, retries_remaining=1),),
+        work_items=(original,), action_fingerprint="0" * 64,
+    )
+    kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+    observations.checkpoint(
+        plan_revision=0,
+        node=CoreNodeName.DISPATCH,
+        outcome=NodeOutcome.COMPLETED,
+        task_ids=("task-original",),
+        completed_task_ids=("task-original",),
+        failed_task_ids=(),
+        retry_state=(TaskRetryState(task_id="task-original", attempts_consumed=0,
+                                    retries_consumed=0, retries_remaining=1),),
+        work_items=(original.model_copy(update={"execution_state": "succeeded"}),),
+        action_fingerprint="1" * 64,
+    )
+    kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+    recovery = ObservedWorkItem(
+        task_id="task-recovery", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.RECOVER,
+        dependency_ids=("task-original",), maximum_retries=1,
+        execution_state="pending",
+    )
+    observations.checkpoint(
+        plan_revision=1,
+        node=CoreNodeName.RECOVER,
+        outcome=NodeOutcome.COMPLETED,
+        task_ids=("task-original", "task-recovery"),
+        completed_task_ids=("task-original",),
+        failed_task_ids=(),
+        retry_state=(
+            TaskRetryState(task_id="task-original", attempts_consumed=0,
+                           retries_consumed=0, retries_remaining=1),
+            TaskRetryState(task_id="task-recovery", attempts_consumed=0,
+                           retries_consumed=0, retries_remaining=1),
+        ),
+        work_items=(original.model_copy(update={"execution_state": "succeeded"}), recovery),
+        action_fingerprint="2" * 64,
+    )
+
+    kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+
+    assert kernel.coordinator_task_inventory(handle.run_id) == (
+        "task-original", "task-recovery"
+    )
+    recovery_items = {
+        item.task_id: item for item in kernel.checkpoint_history(handle.run_id)[-1].work_items
+    }
+    assert recovery_items["task-original"].owner_node is CoreNodeName.DISPATCH
+    assert recovery_items["task-recovery"].owner_node is CoreNodeName.RECOVER
+    assert recovery_items["task-recovery"].dependency_ids == ("task-original",)
+
+
+def test_graph_recovery_checkpoint_preserves_replaced_task_history(tmp_path):
+    request = _request(trace_id="1" * 32)
+
+    def task(identifier: str, *, parent: str | None = None) -> AgentTask:
+        return AgentTask(
+            task_id=identifier,
+            parent_task_id=parent,
+            workflow_id=request.workflow_id,
+            trace_id=request.trace_id,
+            task_type=TaskType.TECHNICAL,
+            objective="Analyze bounded technical evidence.",
+            context_summary_id=f"summary-{identifier}",
+            allowed_data=("context_summary",),
+            allowed_tools=(),
+            expected_output="technical-v1",
+            acceptance_criteria=("Return one report.",),
+            difficulty=TaskDifficulty.NORMAL,
+            model_tier=ModelTier.TERRA,
+            prompt_version="technical-v1",
+            attempt_timeout_seconds=30,
+            maximum_retries=1,
+            reserved_cost=0.05,
+            remaining_workflow_cost=0.10,
+            analysis_steps=("Inspect evidence.", "Assess setup.", "Return conclusion."),
+            escalation_rule="return_to_coordinator",
+            conflict_return_rule="return_typed_conflict",
+        )
+
+    survivor = task("task-survivor")
+    replaced = task("task-replaced")
+    replacement = task("task-replacement", parent=replaced.task_id)
+    initial = CoordinatorPlan(
+        workflow_id=request.workflow_id,
+        trace_id=request.trace_id,
+        revision=0,
+        mode=WorkflowMode.ACTIVE,
+        tasks=(survivor, replaced),
+    )
+    recovered = CoordinatorPlan(
+        workflow_id=request.workflow_id,
+        trace_id=request.trace_id,
+        revision=1,
+        mode=WorkflowMode.ACTIVE,
+        tasks=(survivor, replacement),
+    )
+
+    def report(task_value: AgentTask, status: ReportStatus) -> AgentReport:
+        return AgentReport(
+            task_id=task_value.task_id,
+            workflow_id=request.workflow_id,
+            trace_id=request.trace_id,
+            status=status,
+            knowledge_status=(
+                KnowledgeStatus.KNOWN
+                if status is ReportStatus.COMPLETED
+                else KnowledgeStatus.INSUFFICIENT
+            ),
+            uncertainty_reason=(None if status is ReportStatus.COMPLETED else "provider_error"),
+            error_category=(None if status is ReportStatus.COMPLETED else "provider_error"),
+            summary="Bounded task outcome.",
+        )
+
+    initial_reports = (
+        report(survivor, ReportStatus.COMPLETED),
+        report(replaced, ReportStatus.FAILED),
+    )
+    recovered_reports = (
+        report(survivor, ReportStatus.COMPLETED),
+        report(replacement, ReportStatus.COMPLETED),
+    )
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(request)
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(
+        request.workflow_id,
+        request.trace_id,
+        checkpoint_sink=lambda checkpoint: kernel.record_checkpoint(handle.run_id, checkpoint),
+    )
+
+    CoordinatedWorkflow().invoke(request, WorkflowServices(
+        plan=lambda _request: initial,
+        dispatch=lambda _plan: initial_reports,
+        recover=lambda _plan, _reports: (recovered, recovered_reports),
+        decide=lambda *_args: None,
+        technical=lambda _reports: None,
+        execution_observer=observations,
+    ))
+
+    recovery = kernel.checkpoint_history(handle.run_id)[2]
+    assert recovery.node is CoreNodeName.RECOVER
+    assert recovery.task_ids == (
+        survivor.task_id,
+        replaced.task_id,
+        replacement.task_id,
+    )
+    items = {item.task_id: item for item in recovery.work_items}
+    assert items[replaced.task_id].owner_node is CoreNodeName.DISPATCH
+    assert items[replaced.task_id].execution_state == "failed"
+    assert items[replacement.task_id].owner_node is CoreNodeName.RECOVER
+    assert items[replacement.task_id].dependency_ids == (replaced.task_id,)
+
+
+def test_harness_rejects_attempt_for_unknown_durable_task(tmp_path):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    observations.record_attempt(AttemptUsage(
+        workflow_id=handle.run_id, trace_id=handle.trace_id,
+        task_id="unknown-task", attempt=0, node=CoreNodeName.PLAN,
+        provider="openai", provider_request_id="unknown-attempt-0",
+        model_id="gpt-5.6-luna", model_tier="luna",
+        pricing_version="openai-standard-2026-08-01",
+        pricing_model_id="gpt-5.6-luna", pricing_band="short",
+        tokens=TokenUsage(input_tokens=1, output_tokens=1),
+        estimated_cost_usd=0.0000014, latency_ms=1,
+        source="provider_response",
+    ))
+    item = ObservedWorkItem(
+        task_id="known-task", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.DISPATCH,
+        maximum_retries=0, execution_state="pending",
+    )
+    observations.checkpoint(
+        plan_revision=0, node=CoreNodeName.PLAN,
+        outcome=NodeOutcome.COMPLETED, task_ids=("known-task",),
+        completed_task_ids=(), failed_task_ids=(),
+        retry_state=(TaskRetryState(
+            task_id="known-task", attempts_consumed=0,
+            retries_consumed=0, retries_remaining=0,
+        ),),
+        work_items=(item,), action_fingerprint="3" * 64,
+    )
+
+    with pytest.raises(HarnessDependencyError, match="unknown durable task"):
+        kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+
+
+def test_harness_rejects_non_contiguous_attempt_ordinals(tmp_path):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    for ordinal in (0, 2):
+        observations.record_attempt(AttemptUsage(
+            workflow_id=handle.run_id, trace_id=handle.trace_id,
+            task_id="task-1", attempt=ordinal, node=CoreNodeName.PLAN,
+            provider="openai", provider_request_id=f"attempt-{ordinal}",
+            model_id="gpt-5.6-luna", model_tier="luna",
+            pricing_version="openai-standard-2026-08-01",
+            pricing_model_id="gpt-5.6-luna", pricing_band="short",
+            tokens=TokenUsage(input_tokens=1, output_tokens=1),
+            estimated_cost_usd=0.0000014, latency_ms=1,
+            source="provider_response",
+        ))
+    item = ObservedWorkItem(
+        task_id="task-1", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.DISPATCH,
+        maximum_retries=2, execution_state="running",
+        attempt_ids=("attempt-0", "attempt-2"),
+    )
+    observations.checkpoint(
+        plan_revision=0, node=CoreNodeName.PLAN,
+        outcome=NodeOutcome.COMPLETED, task_ids=("task-1",),
+        completed_task_ids=(), failed_task_ids=(),
+        retry_state=(TaskRetryState(
+            task_id="task-1", attempts_consumed=2,
+            retries_consumed=1, retries_remaining=1,
+        ),),
+        work_items=(item,), action_fingerprint="4" * 64,
+    )
+
+    with pytest.raises(HarnessDependencyError, match="attempt ordinals"):
+        kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+
+
+def test_harness_rejects_recovery_that_drops_work_or_changes_retry_limit(tmp_path):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    original = ObservedWorkItem(
+        task_id="task-original", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.DISPATCH,
+        maximum_retries=1, execution_state="pending",
+    )
+    retry = TaskRetryState(
+        task_id="task-original", attempts_consumed=0,
+        retries_consumed=0, retries_remaining=1,
+    )
+    for node in (CoreNodeName.PLAN, CoreNodeName.DISPATCH):
+        observations.checkpoint(
+            plan_revision=0, node=node, outcome=NodeOutcome.COMPLETED,
+            task_ids=("task-original",), completed_task_ids=(),
+            failed_task_ids=(), retry_state=(retry,), work_items=(original,),
+            action_fingerprint=("5" if node is CoreNodeName.PLAN else "6") * 64,
+        )
+        kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+    replacement = ObservedWorkItem(
+        task_id="task-recovery", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.RECOVER,
+        maximum_retries=2, execution_state="pending",
+    )
+    observations.checkpoint(
+        plan_revision=1, node=CoreNodeName.RECOVER,
+        outcome=NodeOutcome.COMPLETED, task_ids=("task-recovery",),
+        completed_task_ids=(), failed_task_ids=(),
+        retry_state=(TaskRetryState(
+            task_id="task-recovery", attempts_consumed=0,
+            retries_consumed=0, retries_remaining=2,
+        ),),
+        work_items=(replacement,), action_fingerprint="7" * 64,
+    )
+
+    with pytest.raises(HarnessDependencyError, match="recovery inventory"):
+        kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+
+
+def test_harness_rejects_recovery_with_unknown_parent(tmp_path):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    original = ObservedWorkItem(
+        task_id="task-original", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.DISPATCH,
+        maximum_retries=0, execution_state="pending",
+    )
+    retry = TaskRetryState(
+        task_id="task-original", attempts_consumed=0,
+        retries_consumed=0, retries_remaining=0,
+    )
+    for node in (CoreNodeName.PLAN, CoreNodeName.DISPATCH):
+        observations.checkpoint(
+            plan_revision=0, node=node, outcome=NodeOutcome.COMPLETED,
+            task_ids=("task-original",), completed_task_ids=(),
+            failed_task_ids=(), retry_state=(retry,), work_items=(original,),
+            action_fingerprint=("8" if node is CoreNodeName.PLAN else "9") * 64,
+        )
+        kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+    recovery = ObservedWorkItem(
+        task_id="task-recovery", task_kind="technical",
+        worker_id="technical-agent", owner_node=CoreNodeName.RECOVER,
+        dependency_ids=("missing-parent",), maximum_retries=0,
+        execution_state="pending",
+    )
+    observations.checkpoint(
+        plan_revision=1, node=CoreNodeName.RECOVER,
+        outcome=NodeOutcome.COMPLETED,
+        task_ids=("task-original", "task-recovery"),
+        completed_task_ids=(), failed_task_ids=(), retry_state=(
+            retry,
+            TaskRetryState(task_id="task-recovery", attempts_consumed=0,
+                           retries_consumed=0, retries_remaining=0),
+        ), work_items=(original, recovery), action_fingerprint="a" * 64,
+    )
+
+    with pytest.raises(HarnessDependencyError, match="dependency"):
+        kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+
+
+def test_terminal_checkpoint_permit_forbids_later_checkpoint(tmp_path):
+    kernel, _, _, _ = _kernel(tmp_path)
+    handle = kernel.create(_request())
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(handle.run_id, handle.trace_id)
+    observations.record_attempt(AttemptUsage(
+        workflow_id=handle.run_id, trace_id=handle.trace_id, task_id="task-1",
+        attempt=0, node=CoreNodeName.PLAN, provider="openai",
+        provider_request_id="response-over-budget", model_id="gpt-5.6-sol",
+        model_tier="sol", pricing_version="openai-standard-2026-08-01",
+        pricing_model_id="gpt-5.6-sol", pricing_band="long",
+        tokens=TokenUsage(input_tokens=100_000, output_tokens=100_000),
+        estimated_cost_usd=3.8, latency_ms=1, source="provider_response",
+    ))
+    item = ObservedWorkItem(
+        task_id="task-1", task_kind="technical", worker_id="technical-agent",
+        owner_node=CoreNodeName.DISPATCH, maximum_retries=0,
+        execution_state="running", attempt_ids=("response-over-budget",),
+    )
+    retry = TaskRetryState(
+        task_id="task-1", attempts_consumed=1,
+        retries_consumed=0, retries_remaining=0,
+    )
+    observations.checkpoint(
+        plan_revision=0, node=CoreNodeName.PLAN,
+        outcome=NodeOutcome.COMPLETED, task_ids=("task-1",),
+        completed_task_ids=(), failed_task_ids=(), retry_state=(retry,),
+        work_items=(item,), action_fingerprint="a" * 64,
+    )
+    permit = kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+    assert permit.decision is CheckpointDecision.DEGRADE
+    observations.checkpoint(
+        plan_revision=0, node=CoreNodeName.DISPATCH,
+        outcome=NodeOutcome.COMPLETED, task_ids=("task-1",),
+        completed_task_ids=(), failed_task_ids=(), retry_state=(retry,),
+        work_items=(item,), action_fingerprint="b" * 64,
+    )
+
+    with pytest.raises(HarnessDependencyError, match="terminal checkpoint permit"):
+        kernel.record_checkpoint(handle.run_id, observations.checkpoints()[-1])
+
+
+def test_composed_decision_and_reflection_usage_is_node_bound_durable_and_settled(tmp_path):
+    """Exercise the real driver/coordinator/graph/Harness composition.
+
+    This is deliberately not a fabricated observation: each attempt is emitted
+    by ``AgentDriver`` while the graph checkpoint sink persists it through the
+    real Harness.  The test guards the production seam where decision and
+    reflection used to inherit the generic ``dispatch`` node and therefore
+    could not be admitted to the durable inventory.
+    """
+
+    class Clock:
+        def now(self):
+            return 1.0
+
+        def sleep(self, _seconds):
+            raise AssertionError("this bounded happy path must not retry")
+
+    class Audit:
+        def record(self, _event):
+            return None
+
+    request = _request(trace_id="1" * 32)
+    task = AgentTask(
+        task_id="technical-1", workflow_id=request.workflow_id,
+        trace_id=request.trace_id, task_type=TaskType.TECHNICAL,
+        objective="Analyze bounded technical evidence.", context_summary_id="summary-1",
+        allowed_data=("context_summary",), allowed_tools=(),
+        expected_output="technical-v1", acceptance_criteria=("Return one report.",),
+        difficulty=TaskDifficulty.NORMAL, model_tier=ModelTier.TERRA,
+        prompt_version="technical-v1", attempt_timeout_seconds=30,
+        maximum_retries=0, reserved_cost=0.05, remaining_workflow_cost=0.10,
+        analysis_steps=("Read evidence.", "Check setup.", "Return result."),
+        escalation_rule="return_to_coordinator", conflict_return_rule="return_typed_conflict",
+    )
+    plan = CoordinatorPlan(
+        workflow_id=request.workflow_id, trace_id=request.trace_id,
+        revision=0, mode=WorkflowMode.PASSIVE, tasks=(task,),
+    )
+    report = AgentReport(
+        task_id=task.task_id, workflow_id=request.workflow_id,
+        trace_id=request.trace_id, status=ReportStatus.COMPLETED,
+        knowledge_status=KnowledgeStatus.KNOWN, uncertainty_reason=None,
+        summary="Technical evidence is bounded and current.", evidence_refs=("source-1",),
+    )
+    decision = DecisionDraft(
+        knowledge_status=KnowledgeStatus.KNOWN, uncertainty_reason=None,
+        action=Action.NO_TRADE, execute_now=False, decision_confidence=0.8,
+    )
+    decision_payload = decision.model_dump(mode="json")
+    decision_hash = sha256(canonical_json(decision_payload).encode("utf-8")).hexdigest()
+    decision_schema_hash = sha256(
+        canonical_json(DecisionDraft.model_json_schema()).encode("utf-8")
+    ).hexdigest()
+    checks = [ObjectiveCheck(code=code, status="pass").model_dump(mode="json") for code in (
+        "schema_valid", "numeric_consistency", "direction_consistency",
+        "evidence_support", "uncertainty_consistency", "risk_invariants",
+    )]
+    decision_content = canonical_json({
+        "conclusion": "supported",
+        "result": decision_payload,
+        "evidence_refs": ["source-1"],
+    })
+    reflection_content = canonical_json({
+        "conclusion": "supported",
+        "review": {
+            "target_hash": decision_hash,
+            "output_schema_hash": decision_schema_hash,
+            "checks": checks,
+        },
+    })
+
+    def response(content, tier, request_id):
+        tokens = PricedUsageTokens(input_tokens=10, output_tokens=5)
+        return ModelResponse(
+            content=content,
+            usage=AgentUsage(
+                input_tokens=10, output_tokens=5,
+                cost_usd=float(estimate_workflow_usage_cost(
+                    f"gpt-5.6-{tier.value}", "short", tokens,
+                )),
+                model_tier=tier, provider="openai", provider_request_id=request_id,
+                model_id=f"gpt-5.6-{tier.value}",
+                pricing_version="openai-standard-2026-08-01",
+                pricing_model_id=f"gpt-5.6-{tier.value}", pricing_band="short",
+            ),
+        )
+
+    class Client:
+        def __init__(self):
+            self.requests = []
+            self.outcomes = [
+                response(decision_content, DriverModelTier.TERRA, "decision-response-1"),
+                response(reflection_content, DriverModelTier.LUNA, "reflection-response-1"),
+            ]
+
+        def invoke(self, value):
+            self.requests.append(value)
+            return self.outcomes.pop(0)
+
+    kernel, store, _, _ = _kernel(tmp_path)
+    handle = kernel.create(request)
+    _advance_to_running(kernel, handle.run_id)
+    observations = ExecutionObservationCollector(
+        request.workflow_id,
+        request.trace_id,
+        checkpoint_sink=lambda checkpoint: kernel.record_checkpoint(handle.run_id, checkpoint),
+    )
+    client = Client()
+    clock = Clock()
+    driver = AgentDriver(
+        model_client=client, audit_observer=Audit(), clock=clock,
+        random=lambda _low, high: high,
+        prompt_releases=PromptReleaseRegistry(releases=(
+            profile_for(TaskType.DECISION_PLANNER).release(), reflection_release(),
+        )),
+        output_schemas=(
+            profile_for(TaskType.DECISION_PLANNER).output_schema(),
+            reflection_output_schema(),
+        ),
+        retry_policy=RetryPolicy(max_attempts=2, base_delay=0.01),
+        circuit_breaker=CircuitBreaker(failure_threshold=3, cooldown=1.0),
+        fallback_policy=FallbackPolicy((
+            DriverModelTier.SOL, DriverModelTier.TERRA, DriverModelTier.LUNA,
+        )),
+        model_costs={
+            DriverModelTier.SOL: 0.2,
+            DriverModelTier.TERRA: 0.05,
+            DriverModelTier.LUNA: 0.01,
+        },
+        attempt_observer=observations.record_attempt,
+    )
+    coordinator = AgentCoordinatorServices(
+        driver=driver, issuer=CapabilityIssuer(clock=clock.now), tenant_id="tenant-a",
+        deadline_epoch=100.0, clock=clock.now,
+    )
+    result = CoordinatedWorkflow().invoke(request, WorkflowServices(
+        plan=lambda _request: plan,
+        dispatch=lambda _plan: (report,),
+        recover=lambda current, reports: (current, reports),
+        decide=coordinator.decide,
+        technical=coordinator.technical,
+        verify=coordinator.verifier,
+        execution_observer=observations,
+    ))
+
+    assert result.knowledge_status is KnowledgeStatus.KNOWN
+    assert tuple(attempt.node for attempt in observations.usage().attempts) == (
+        CoreNodeName.DECIDE, CoreNodeName.REFLECT,
+    )
+    inventory = kernel.coordinator_task_inventory(handle.run_id)
+    attempt_task_ids = tuple(attempt.task_id for attempt in observations.usage().attempts)
+    assert attempt_task_ids[0] in inventory
+    assert attempt_task_ids[1] in inventory
+    assert attempt_task_ids[0] != attempt_task_ids[1]
+    assert tuple(item.owner_node for item in observations.checkpoints()[-1].work_items[-2:]) == (
+        CoreNodeName.DECIDE, CoreNodeName.REFLECT,
+    )
+
+    kernel.advance(
+        handle.run_id, candidate={}, workflow_usage=observations.usage(),
+        observed_execution=True,
+    )
+    authority = next(
+        event for event in reversed(store.load(handle.run_id))
+        if event.event_type == "transition_authorized"
+        and "budget_settlement_evidence" in event.payload
+    )
+    settled = json.loads(authority.payload["budget_settlement_evidence"]["settlement"]["workflow_usage_json"])
+    assert [item["node"] for item in settled["attempts"]] == ["decide", "reflect"]
+    assert settled["provider_attempt_count"] == 2

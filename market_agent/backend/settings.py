@@ -84,6 +84,8 @@ class BackendSettings:
     prompt_cache_namespace: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_PROMPT_CACHE_NAMESPACE", "market-agent-workflow-v1"))
     workflow_request_deadline_seconds: float = field(default_factory=lambda: _float_value("MARKET_AGENT_WORKFLOW_DEADLINE_SECONDS", 120.0))
     workflow_response_cache_ttl_seconds: float = field(default_factory=lambda: _float_value("MARKET_AGENT_WORKFLOW_CACHE_TTL_SECONDS", 300.0))
+    local_knowledge_path: Path = field(default_factory=lambda: Path(_environment_value("MARKET_AGENT_LOCAL_KNOWLEDGE_PATH", "config/local_knowledge.jsonl")))
+    admin_capability_secret: str = field(default_factory=lambda: _environment_value("MARKET_AGENT_ADMIN_CAPABILITY_SECRET"))
 
     @classmethod
     def from_env(cls) -> "BackendSettings":

@@ -52,9 +52,19 @@ def _require_id(value: str) -> str:
 
 def _require_trace_id(value: str) -> str:
     _require_safe_text(value)
-    if not re.fullmatch(r"[0-9a-fA-F]{32}", value) or not int(value, 16):
-        raise ValueError("audit trace identifiers must be nonzero W3C trace IDs")
-    return value
+    # New production traces are always W3C identifiers.  Keep accepting the
+    # bounded ``trace-*`` identifiers used by persisted pre-W3C audit fixtures
+    # so reopening and querying an existing audit database remains compatible.
+    # The request/HTTP boundary still validates the strict W3C TraceContext
+    # type, therefore this compatibility path cannot create a non-canonical
+    # production request trace.
+    if re.fullmatch(r"[0-9a-fA-F]{32}", value):
+        if not int(value, 16):
+            raise ValueError("audit trace identifiers must be nonzero W3C trace IDs")
+        return value
+    if re.fullmatch(r"trace-[a-z0-9_-]{1,56}", value):
+        return value
+    raise ValueError("audit trace identifiers must be nonzero W3C trace IDs or bounded legacy trace IDs")
 
 
 def _require_code(value: str) -> str:

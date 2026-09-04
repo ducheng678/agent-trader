@@ -92,7 +92,7 @@
         "conclusion": {
           "enum": [
             "answer",
-            "��֪��",
+            "不知道",
             "no_trade"
           ],
           "title": "Conclusion",

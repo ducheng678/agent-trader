@@ -13,6 +13,7 @@ from market_agent.local_knowledge_base import KnowledgeDocument, LocalKnowledgeB
 from market_agent.workflow_agent_contracts import AgentInvocation, AgentUsage, ModelTier
 from market_agent.workflow_circuit_breaker import CircuitBreaker
 from market_agent.workflow_fallback import FallbackPolicy
+from market_agent.workflow_observation import CoreNodeName, ExecutionObservationCollector, TokenUsage
 from market_agent.workflow_prompt_release import PromptRelease, PromptReleaseRegistry, canonical_json
 from market_agent.workflow_response_cache import CacheMetadata, CachedResponse, ExactCacheKey, ExactResponseCache
 from market_agent.workflow_retry_policy import ProviderError, RetryPolicy
@@ -104,7 +105,11 @@ def invocation(output_schema=None, **overrides):
 def response(content='{"answer":"known"}', tier=ModelTier.LUNA, cost=0.01):
     return api().ModelResponse(
         content=content,
-        usage=AgentUsage(input_tokens=4, output_tokens=2, cost_usd=cost, model_tier=tier),
+        usage=AgentUsage(
+            input_tokens=4, output_tokens=2, cost_usd=cost, model_tier=tier,
+            pricing_version="openai-standard-2026-08-01",
+            pricing_model_id=f"gpt-5.6-{tier.value}", pricing_band="short",
+        ),
     )
 
 
@@ -487,6 +492,113 @@ def test_driver_rejects_malformed_provider_output_without_retry_or_fallback(cont
     assert "fallback_selected" not in [event.event_type for event in observer.events]
 
 
+def test_malformed_provider_output_still_records_authoritative_attempt_usage() -> None:
+    observations = ExecutionObservationCollector("run-1", TRACE_ID)
+    provider_response = api().ModelResponse(
+        content='{"answer": 4}',
+        usage=AgentUsage(
+            input_tokens=40,
+            cached_input_tokens=12,
+            output_tokens=7,
+            web_search_tool_calls=2,
+            cost_usd=0.01,
+            model_tier=ModelTier.LUNA,
+            provider_request_id="response-malformed",
+            model_id="gpt-5.6-luna-2026-08-15",
+            pricing_version="openai-standard-2026-08-01",
+        ),
+    )
+    driver, _, _ = make_driver(
+        Client(provider_response), attempt_observer=observations.record_attempt
+    )
+
+    result = driver.execute(invocation(execution_node="recover"))
+
+    assert result.failure is not None and result.failure.code == "malformed_output"
+    usage = observations.usage()
+    assert len(usage.attempts) == 1
+    assert usage.attempts[0].provider_request_id == "response-malformed"
+    assert usage.attempts[0].node is CoreNodeName.RECOVER
+    assert usage.attempts[0].tokens == TokenUsage(
+        input_tokens=40,
+        cached_input_tokens=12,
+        output_tokens=7,
+        web_search_tool_calls=2,
+    )
+
+
+def test_retry_without_provider_usage_counts_attempt_and_does_not_invent_tokens() -> None:
+    observations = ExecutionObservationCollector("run-1", TRACE_ID)
+    client = Client(ProviderError(status_code=503), response())
+    driver, _, _ = make_driver(client, attempt_observer=observations.record_attempt)
+
+    result = driver.execute(invocation())
+
+    assert result.failure is None
+    usage = observations.usage()
+    assert usage.provider_attempt_count == 2
+    assert usage.unverified_provider_attempt_count == 1
+    assert usage.attempts[0].tokens is None
+    assert usage.attempts[0].source == "provider_usage_unavailable"
+    assert usage.aggregate == TokenUsage(input_tokens=4, output_tokens=2)
+
+
+def test_usage_over_reservation_is_recorded_before_budget_failure() -> None:
+    observations = ExecutionObservationCollector("run-1", TRACE_ID)
+    provider_response = api().ModelResponse(
+        content='{"answer":"known"}',
+        usage=AgentUsage(
+            input_tokens=0, output_tokens=100_000, cost_usd=0.12,
+            model_tier=ModelTier.LUNA, provider="openai",
+            provider_request_id="response-over-reservation",
+            model_id="gpt-5.6-luna",
+            pricing_version="openai-standard-2026-08-01",
+            pricing_model_id="gpt-5.6-luna", pricing_band="short",
+        ),
+    )
+    driver, _, _ = make_driver(
+        Client(provider_response), attempt_observer=observations.record_attempt
+    )
+
+    result = driver.execute(invocation(pricing_band="short"))
+
+    assert result.failure is not None and result.failure.code == "budget_exhausted"
+    assert observations.usage().attempts[0].source == "provider_response"
+    assert observations.usage().attempts[0].tokens == TokenUsage(
+        input_tokens=0, output_tokens=100_000
+    )
+    assert observations.usage().estimated_cost_usd == 0.12
+
+
+def test_fixed_cache_hit_records_explicit_zero_provider_execution() -> None:
+    approved = {schema().digest: {"fixed"}}
+    exact = ExactResponseCache(safe_answers=approved)
+    request_hash = sha256(canonical_json(invocation().user_payload).encode()).hexdigest()
+    exact.put(
+        ExactCacheKey.from_metadata(request_hash, metadata()),
+        {"answer": "fixed"},
+        metadata(),
+        now=0.0,
+    )
+    observations = ExecutionObservationCollector("run-1", TRACE_ID)
+    driver, _, _ = make_driver(
+        Client(),
+        exact_cache=exact,
+        cache_context=lambda inv: cache_request(),
+        safe_answers=approved,
+        attempt_observer=observations.record_attempt,
+    )
+
+    result = driver.execute(invocation())
+
+    assert result.origin == "fixed_cache"
+    usage = observations.usage()
+    assert usage.provider_attempt_count == 0
+    assert usage.execution_count == 1
+    assert usage.attempts[0].source == "fixed_cache"
+    assert usage.aggregate == TokenUsage(input_tokens=0, output_tokens=0)
+
+
 @pytest.mark.parametrize("depth", [3000, 10000])
 def test_deep_json_returns_typed_malformed_output_and_terminal_audit(depth):
     """Parsing and later result freezing must not leak recursion failures or lose the trace."""
@@ -526,13 +638,26 @@ def test_model_request_has_stable_prefix_then_canonical_user_context():
     assert first.cost_limit_usd == 0.1
 
 
+def test_pricing_band_uses_final_rendered_request_not_context_summary_estimate():
+    client = Client(response())
+    driver, _, _ = make_driver(client)
+
+    result = driver.execute(invocation(
+        pricing_band="short",
+        user_payload={"summary_token_estimate": 0, "rendered_payload": "x" * 272_000},
+    ))
+
+    assert result.failure is None
+    assert client.requests[0].pricing_band == "long"
+
+
 def test_transient_retry_keeps_tier_and_honors_retry_after():
     """Retry must wait before calling the same tier and account for the failed reservation."""
     client = Client(ProviderError(status_code=429, retry_after=1.5), response())
     driver, observer, clock = make_driver(client)
     result = driver.execute(invocation())
     assert result.output == {"answer": "known"}
-    assert result.usage.cost_usd == pytest.approx(0.11)
+    assert result.usage.cost_usd == pytest.approx(0.1000032)
     assert [request.model_tier for request in client.requests] == [ModelTier.LUNA, ModelTier.LUNA]
     assert [request.attempt for request in client.requests] == [0, 1]
     assert clock.waits == [1.5]
@@ -558,7 +683,7 @@ def test_retry_exhaustion_downgrades_one_tier_at_a_time():
     result = driver.execute(invocation(task_kind="coordinator", allowed_model_tier=ModelTier.SOL))
     assert result.output == {"answer": "known"}
     assert [request.model_tier for request in client.requests] == [ModelTier.SOL, ModelTier.SOL, ModelTier.TERRA, ModelTier.TERRA, ModelTier.LUNA]
-    assert result.usage.cost_usd == pytest.approx(0.41)
+    assert result.usage.cost_usd == pytest.approx(0.4000032)
     assert sum(event.event_type == "model_downgraded" for event in observer.events) == 2
 
 
@@ -939,7 +1064,7 @@ def test_nested_output_is_validated_without_coercing_or_ignoring_fields():
     assert driver.execute(invocation(output_schema)).failure.code == "malformed_output"
 
 
-@pytest.mark.parametrize("usage", [None, {"input_tokens": 1}, AgentUsage(input_tokens=1, output_tokens=1, cost_usd=0.2, model_tier=ModelTier.LUNA), AgentUsage(input_tokens=1, output_tokens=1, cost_usd=0.01, model_tier=ModelTier.SOL)])
+@pytest.mark.parametrize("usage", [None, {"input_tokens": 1}, AgentUsage(input_tokens=1, output_tokens=1, cost_usd=0.01, model_tier=ModelTier.SOL)])
 def test_invalid_usage_or_wrong_model_cannot_be_a_success(usage):
     client = Client(api().ModelResponse(content='{"answer":"known"}', usage=usage))
     driver, _, _ = make_driver(client)

@@ -363,6 +363,27 @@ def _apply_committed_event(
         ),
         "last_event_hash": event.event_hash,
     }
+    request_digest = event.payload.get("request_digest")
+    if request_digest is not None:
+        if view.request_digest is not None and request_digest != view.request_digest:
+            raise EventIntegrityError("workflow request digest changed during replay")
+        changes["request_digest"] = request_digest
+    prompt_release_digest = event.payload.get("prompt_release_digest")
+    if prompt_release_digest is not None:
+        if (
+            view.prompt_release_digest is not None
+            and prompt_release_digest != view.prompt_release_digest
+        ):
+            raise EventIntegrityError("workflow prompt digest changed during replay")
+        changes["prompt_release_digest"] = prompt_release_digest
+    accepted_result_digest = event.payload.get("accepted_result_digest")
+    if accepted_result_digest is not None:
+        if (
+            view.accepted_result_digest is not None
+            and accepted_result_digest != view.accepted_result_digest
+        ):
+            raise EventIntegrityError("accepted workflow result digest changed during replay")
+        changes["accepted_result_digest"] = accepted_result_digest
     if transition.idempotency_key in view.applied_idempotency_keys:
         raise EventIntegrityError("duplicate transition idempotency key")
 
@@ -714,21 +735,32 @@ class SQLiteHarnessEventStore:
                 separators=(",", ":"),
                 ensure_ascii=False,
             )
-            connection.execute(
-                "INSERT INTO harness_events "
-                "(event_id, run_id, trace_id, sequence, state_revision, event_hash, "
-                "previous_event_hash, event_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    committed.event_id,
-                    committed.run_id,
-                    committed.trace_id,
-                    committed.sequence,
-                    committed.state_revision,
-                    committed.event_hash,
-                    committed.previous_event_hash,
-                    rendered,
-                ),
-            )
+            try:
+                connection.execute(
+                    "INSERT INTO harness_events "
+                    "(event_id, run_id, trace_id, sequence, state_revision, event_hash, "
+                    "previous_event_hash, event_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        committed.event_id,
+                        committed.run_id,
+                        committed.trace_id,
+                        committed.sequence,
+                        committed.state_revision,
+                        committed.event_hash,
+                        committed.previous_event_hash,
+                        rendered,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                # Concurrent callers can race after the optimistic snapshot
+                # check and collide on the append-only trigger.  Normalize
+                # that storage-level race to the domain error consumed by the
+                # Harness retry/stale-revision path.
+                if "append-only" in str(error):
+                    raise OptimisticConcurrencyError(
+                        "append-only event commit raced with another writer"
+                    ) from error
+                raise
             connection.execute(
                 "INSERT INTO harness_outbox "
                 "(event_id, run_id, sequence, event_json) VALUES (?, ?, ?, ?)",

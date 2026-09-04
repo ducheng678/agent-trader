@@ -79,6 +79,14 @@ class PostgresMemoryRepository:
             if cursor.fetchone() is None:
                 raise PostgresMemoryUnavailableError("pgvector extension is unavailable")
 
+    def healthcheck(self) -> bool:
+        """Run a real connection probe without mutating shared state."""
+
+        with self._cursor() as cursor:
+            cursor.execute("SELECT 1")
+            row = cursor.fetchone()
+        return bool(row and row[0] == 1)
+
     def validate_mutation(self, **context: Unpack[WriteArguments]) -> MutationContext:
         return validate_authority(self._authority, context.pop("authority"), **context)
 

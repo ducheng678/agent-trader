@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -46,7 +47,12 @@ class MemoryMaintenanceScheduler:
             plan,
             LifecycleLimits(max_actions=100, max_cleanup=100),
             tenant_id=self._tenant,
-            trace_id="memory-lifecycle-" + now.strftime("%Y%m%d%H"),
+            # Lifecycle writes participate in the same trace contract as
+            # request work.  Derive a stable, non-zero W3C trace id for the
+            # maintenance window instead of passing a prose identifier.
+            trace_id=sha256(
+                f"memory-lifecycle:{self._tenant}:{now.strftime('%Y%m%d%H')}".encode("utf-8")
+            ).hexdigest()[:32],
             idempotency_key=key,
             authority=self._authority,
         )
@@ -62,6 +68,9 @@ class MemoryMaintenanceScheduler:
                 if self._error_observer is not None:
                     try:
                         self._error_observer("memory_maintenance_failed", error)
-                    except Exception:
-                        pass
+                    except Exception as observer_error:
+                        logging.getLogger("market_agent.memory_maintenance").warning(
+                            "memory maintenance error observer failed: %s",
+                            type(observer_error).__name__,
+                        )
             self._stop.wait(self._interval)

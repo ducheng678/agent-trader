@@ -26,10 +26,12 @@ from market_agent.workflow_contracts import (
     WorkflowRequest,
 )
 from market_agent.workflow_prompt_release import canonical_json
+from market_agent.workflow_prompt_config import WorkflowPromptPin
 from market_agent.workflow_memory_retrieval import CoreExperienceSummary
 from market_agent.workflow_reflection_agent import (
     CorrectionContext,
     CorrectionPatch,
+    FieldReplacement,
     ObjectiveReview,
     ReflectionRequest,
     run_reflection,
@@ -48,6 +50,7 @@ class AgentCoordinatorServices:
                  tenant_id: str, deadline_epoch: float,
                  memory_context: CoreExperienceSummary | None = None,
                  memory_scope: str | None = None,
+                 prompt_pin: WorkflowPromptPin | None = None,
                  clock: Callable[[], float] = time.time,
                  cancellation_check: Callable[[], bool] = lambda: False) -> None:
         if type(driver) is not AgentDriver or type(issuer) is not CapabilityIssuer:
@@ -59,6 +62,7 @@ class AgentCoordinatorServices:
         self._clock = clock
         self._memory = memory_context
         self._memory_scope = memory_scope
+        self._prompt_pin = prompt_pin
         self._cancellation_check = cancellation_check
         self._decision_contexts: dict[str, ContextSummary] = {}
         self.verifier = ObjectiveDecisionVerifier(
@@ -66,6 +70,7 @@ class AgentCoordinatorServices:
             reviewer=self._review,
             generate_patch=self._patch,
             generate_rewrite=self._rewrite,
+            cancellation_check=self._cancellation_check,
         )
 
     def decide(self, request: WorkflowRequest, plan: CoordinatorPlan,
@@ -78,13 +83,18 @@ class AgentCoordinatorServices:
         grant = self._grant(task)
         result = run_node(task, context, self._driver, deadline_epoch=self._deadline,
                           grant=grant, authorize=self._authorize_task,
+                          execution_node="decide",
                           memory_context=self._memory,
                           memory_tenant_id=self._tenant if self._memory is not None else None,
                           memory_scope=self._memory_scope if self._memory is not None else None,
+                          prompt_pin=self._prompt_pin,
                           cancellation_check=self._cancellation_check)
         if result.status.value != "completed":
             return None
-        return DecisionDraft.model_validate(json.loads(result.summary))
+        # ``summary`` is the canonical JSON handoff.  Strict models require
+        # enum decoding through the JSON boundary; validating a decoded Python
+        # dict would reject the otherwise valid string enum values.
+        return DecisionDraft.model_validate_json(result.summary)
 
     @staticmethod
     def technical(reports: tuple[AgentReport, ...]) -> TechnicalAnalysis | None:
@@ -166,14 +176,50 @@ class AgentCoordinatorServices:
             self._issuer.authorize_read(supplied, scope=checked, resource="reflection_target")
 
         return run_reflection(request, self._driver, deadline_epoch=self._deadline,
-                              cost_limit_usd=0.02, grant=grant, authorize=authorize)
+                              cost_limit_usd=0.02, grant=grant, authorize=authorize,
+                              prompt_pin=self._prompt_pin,
+                              cancellation_check=self._cancellation_check)
 
     @staticmethod
     def _patch(context: CorrectionContext) -> CorrectionPatch:
-        # Objective field paths decide patch authority. If a coherent minimal
-        # patch cannot be derived without inventing values, correction advances
-        # to the single full-rewrite fallback.
-        raise ValueError("no objective deterministic patch is available")
+        """Return the sole safe deterministic correction for a failed draft.
+
+        Objective verification may identify an invalid numeric or uncertainty
+        field, but it must never invent a replacement price or evidence.  The
+        only universally valid field-level repair is therefore to remove the
+        actionable fields and abstain.  It remains a *patch* (not a new model
+        answer), is fully derived from the verifier error tuple, and is later
+        accepted only when its objective review improves.
+        """
+        context = CorrectionContext.model_validate(context)
+        if not context.error_codes:
+            raise ValueError("objective patch requires verifier errors")
+        safe_codes = {
+            "numeric_consistency",
+            "direction_consistency",
+            "uncertainty_consistency",
+        }
+        if not set(context.error_codes) <= safe_codes:
+            raise ValueError("objective errors do not authorize a deterministic patch")
+        required_paths = {
+            "/action",
+            "/execute_now",
+            "/entry_price",
+            "/stop_price",
+            "/observation_scenario",
+        }
+        if not required_paths <= set(context.field_paths):
+            raise ValueError("safe no-trade patch exceeds objectively reported paths")
+        return CorrectionPatch(
+            target_hash=context.target_hash,
+            replacements=(
+                FieldReplacement(path="/action", value="no_trade"),
+                FieldReplacement(path="/execute_now", value=False),
+                FieldReplacement(path="/entry_price", value=None),
+                FieldReplacement(path="/stop_price", value=None),
+                FieldReplacement(path="/observation_scenario", value=None),
+            ),
+        )
 
     @staticmethod
     def _rewrite(context: CorrectionContext) -> DecisionDraft:

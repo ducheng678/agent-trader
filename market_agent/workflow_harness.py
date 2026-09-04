@@ -14,7 +14,7 @@ from threading import RLock
 from typing import Any, Callable, Mapping, Protocol, cast
 from weakref import WeakValueDictionary
 
-from pydantic import StrictBool, model_validator
+from pydantic import StrictBool, TypeAdapter, model_validator
 
 from market_agent.openai_usage import UsageTokens, estimate_workflow_usage_cost
 from market_agent.workflow_budget import (
@@ -33,10 +33,13 @@ from market_agent.workflow_confidence_calibration import (
 )
 from market_agent.workflow_contracts import (
     ContractModel,
+    Digest,
     NonNegativeInt,
     ShortText,
+    TaskType,
     WorkflowMode,
     WorkflowRequest,
+    canonical_workflow_request_digest,
 )
 from market_agent.workflow_execution_backend import (
     CommittedExecutionSnapshot,
@@ -51,6 +54,7 @@ from market_agent.workflow_execution_backend import (
     canonical_transition_digest,
     canonical_view_digest,
     verify_committed_execution_snapshot,
+    verify_committed_transition_receipt,
 )
 from market_agent.workflow_harness_contracts import (
     HarnessPlan,
@@ -68,6 +72,13 @@ from market_agent.workflow_loop_guard import (
     SemanticCheckpoint,
 )
 from market_agent.workflow_model_routing import policy_for
+from market_agent.workflow_observation import (
+    CheckpointDecision,
+    CheckpointPermit,
+    CoreNodeName,
+    NodeCheckpoint,
+    WorkflowUsage,
+)
 from market_agent.workflow_plan_registry import PlanCompiler
 from market_agent.workflow_session import (
     HarnessEvent,
@@ -252,6 +263,7 @@ _DECISION_REASON_STATES: dict[str, frozenset[RunState]] = {
     "loop_checkpoint_binding_mismatch": frozenset({RunState.DEGRADING}),
     "confidence_context_mismatch": frozenset({RunState.DEGRADING}),
     "confidence_fail_closed": frozenset({RunState.DEGRADING}),
+    "usage_evidence_unavailable": frozenset({RunState.DEGRADING}),
     "safe_no_trade_due_to_degradation": frozenset(
         {RunState.DEGRADING, RunState.DEGRADED}
     ),
@@ -303,12 +315,14 @@ _BUDGET_DECIMAL_FIELDS = frozenset(
 _BUDGET_FIELDS = _BUDGET_INTEGER_FIELDS | _BUDGET_DECIMAL_FIELDS
 _BUDGET_SETTLEMENT_EVIDENCE_KEY = "budget_settlement_evidence"
 _BUDGET_SETTLEMENT_SCHEMA = "budget-settlement-evidence-v1"
+_BUDGET_SETTLEMENT_SCHEMA_V2 = "budget-settlement-evidence-v2"
 _BUDGET_AUTHORITY_TARGETS = {
     "budget_exhausted": RunState.DEGRADING,
     "loop_guard_stopped": RunState.DEGRADING,
     "loop_checkpoint_binding_mismatch": RunState.DEGRADING,
     "confidence_context_mismatch": RunState.DEGRADING,
     "confidence_fail_closed": RunState.DEGRADING,
+    "usage_evidence_unavailable": RunState.DEGRADING,
     "confidence_sufficient": RunState.SUMMARIZING,
 }
 
@@ -330,6 +344,7 @@ _COMMITTED_DECISION_REASONS = frozenset(
         "loop_checkpoint_binding_mismatch",
         "confidence_context_mismatch",
         "confidence_fail_closed",
+        "usage_evidence_unavailable",
         "safe_no_trade_due_to_degradation",
         "cancellation_completed",
     }
@@ -471,7 +486,10 @@ class HarnessKernel:
                 target=RunState.CREATED,
                 reason_code="run_created",
                 backend_handle=None,
-                event_payload={"plan_json": plan.model_dump_json()},
+                event_payload={
+                    "plan_json": plan.model_dump_json(),
+                    "request_digest": canonical_workflow_request_digest(request),
+                },
             )
             snapshot = self._issued_snapshot(plan, view)
             self._execution.commit_registration(prepared.token, snapshot)
@@ -504,6 +522,47 @@ class HarnessKernel:
             raise UnknownHarnessRunError("unknown Harness run")
         return fold_events(events)
 
+    def terminal_receipt(self, run_id: str) -> CommittedTransitionReceipt:
+        """Return a fresh signed receipt only for the current success transition."""
+
+        run_id = _strict_run_id(run_id)
+        events, plan, view = self._load(run_id)
+        if view.run_state is not RunState.SUCCEEDED or not events:
+            raise HarnessDependencyError("terminal success receipt is unavailable")
+        terminal_event = events[-1]
+        transition = terminal_event.transition
+        if (
+            transition is None
+            or transition.entity_kind != "run"
+            or transition.to_state != RunState.SUCCEEDED.value
+            or transition.reason_code != "completed"
+        ):
+            raise HarnessDependencyError("terminal success receipt is stale")
+        pre_view = fold_events(events[:-1])
+        try:
+            receipt = cast(
+                CommittedTransitionReceipt,
+                _fresh_contract(
+                    self._receipt_issuer.issue_transition_receipt(
+                        plan,
+                        transition,
+                        pre_sequence=pre_view.sequence,
+                    ),
+                    CommittedTransitionReceipt,
+                ),
+            )
+        except Exception as error:
+            raise HarnessDependencyError(
+                "host terminal receipt issuer failed"
+            ) from error
+        if receipt.transition_digest != canonical_transition_digest(transition):
+            raise HarnessDependencyError("host terminal receipt changed transition")
+        self._validate_snapshot_value(plan, pre_view, receipt.pre)
+        self._validate_snapshot_value(plan, view, receipt.post)
+        if not verify_committed_transition_receipt(receipt):
+            raise HarnessDependencyError("terminal success receipt is not host verified")
+        return receipt
+
     def handle(self, run_id: str) -> RunHandle:
         """Return a durable run projection without resuming the execution backend."""
         run_id = _strict_run_id(run_id)
@@ -511,11 +570,111 @@ class HarnessKernel:
         return self._handle(plan, view, False)
 
     @_serialized_run
+    def record_checkpoint(
+        self, run_id: str, checkpoint: NodeCheckpoint
+    ) -> CheckpointPermit:
+        """Append one host-created graph checkpoint before execution continues."""
+
+        run_id = _strict_run_id(run_id)
+        events, plan, view = self._load(run_id)
+        if view.run_state is not RunState.RUNNING:
+            raise HarnessDependencyError("checkpoints require a running Harness run")
+        try:
+            checked = NodeCheckpoint.model_validate(
+                checkpoint.model_dump(mode="python")
+            )
+        except Exception as error:
+            raise HarnessDependencyError("execution checkpoint is invalid") from error
+        if (
+            checked.workflow_id != plan.run_id
+            or checked.trace_id != plan.trace_id
+        ):
+            raise HarnessDependencyError("execution checkpoint identity is invalid")
+        committed = self._validated_checkpoints(events, plan)
+        checkpoint_events = tuple(
+            event for event in events if event.event_type == "node_checkpoint_recorded"
+        )
+        if checkpoint_events and self._checkpoint_permit(checkpoint_events[-1]).decision is not CheckpointDecision.CONTINUE:
+            raise HarnessDependencyError("terminal checkpoint permit forbids further execution")
+        if checked.ordinal != len(committed) + 1:
+            raise HarnessDependencyError("execution checkpoint ordinal is invalid")
+        self._validate_checkpoint_sequence((*committed, checked), plan)
+        if committed:
+            prior_attempts = committed[-1].usage.attempts
+            if checked.usage.attempts[: len(prior_attempts)] != prior_attempts:
+                raise HarnessDependencyError("execution checkpoint usage is not append-only")
+        self._ensure_runtime_dependencies(plan)
+        budget = self._budgets[plan.run_id].snapshot()
+        decision = CheckpointDecision.CONTINUE
+        reason = "checkpoint_authorized"
+        try:
+            self._budget_payload_v2(events, plan, budget, checked.usage, (*committed, checked))
+        except BudgetExceededError:
+            decision = CheckpointDecision.DEGRADE
+            reason = "budget_exhausted"
+        if any(event.event_type == "cancellation_requested" for event in events):
+            decision = CheckpointDecision.STOP
+            reason = "cooperative_cancellation"
+        permit = CheckpointPermit(
+            workflow_id=checked.workflow_id,
+            trace_id=checked.trace_id,
+            checkpoint_ordinal=checked.ordinal,
+            checkpoint_digest=checked.canonical_digest(),
+            decision=decision,
+            reason_code=reason,
+        )
+        permit_value = permit.model_dump(mode="json")
+        checkpoint_value = checked.model_dump(mode="json")
+        self._append_observation(
+            plan,
+            view,
+            "node_checkpoint_recorded",
+            {
+                "checkpoint_json": json.dumps(
+                    checkpoint_value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                "checkpoint_digest": self._canonical_digest(checkpoint_value),
+                "permit_json": json.dumps(
+                    permit_value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ),
+                "permit_digest": self._canonical_digest(permit_value),
+            },
+        )
+        return permit
+
+    def coordinator_task_inventory(self, run_id: str) -> tuple[str, ...]:
+        """Return the latest coordinator task inventory bound by a checkpoint."""
+
+        run_id = _strict_run_id(run_id)
+        events, plan, _ = self._load(run_id)
+        checkpoints = self._validated_checkpoints(events, plan)
+        if not checkpoints:
+            return ()
+        latest = checkpoints[-1]
+        if tuple(item.task_id for item in latest.work_items) != latest.task_ids:
+            raise HarnessDependencyError("coordinator inventory is not bound to durable work items")
+        return latest.task_ids
+
+    def checkpoint_history(self, run_id: str) -> tuple[NodeCheckpoint, ...]:
+        """Return replay-validated durable execution checkpoints."""
+
+        run_id = _strict_run_id(run_id)
+        events, plan, _ = self._load(run_id)
+        return self._validated_checkpoints(events, plan)
+
+    @_serialized_run
     def advance(
         self,
         run_id: str,
         *,
         candidate: object = None,
+        workflow_usage: WorkflowUsage | None = None,
+        observed_execution: bool = False,
+        prompt_release_digest: str | None = None,
+        accepted_result_digest: str | None = None,
         expected_state_revision: int | None = None,
     ) -> HarnessDecision:
         run_id = _strict_run_id(run_id)
@@ -595,7 +754,57 @@ class HarnessKernel:
         self._ensure_runtime_dependencies(plan)
         current_snapshot = self._issued_snapshot(plan, view)
         handle = self._execution.resume(plan, view, current_snapshot)
-        target, reason, no_trade, payload = self._policy_decision(events, plan, view, parsed)
+        if type(observed_execution) is not bool:
+            raise InvalidHarnessInputError("observed execution marker must be boolean")
+        if prompt_release_digest is not None:
+            try:
+                prompt_release_digest = TypeAdapter(Digest).validate_python(
+                    prompt_release_digest,
+                    strict=True,
+                )
+            except Exception as error:
+                raise InvalidHarnessInputError(
+                    "observed prompt release digest is invalid"
+                ) from error
+            if not observed_execution:
+                raise InvalidHarnessInputError(
+                    "prompt release digest requires observed execution"
+                )
+            if (
+                view.prompt_release_digest is not None
+                and view.prompt_release_digest != prompt_release_digest
+            ):
+                raise HarnessDependencyError(
+                    "observed prompt release digest changed during execution"
+                )
+        if accepted_result_digest is not None:
+            try:
+                accepted_result_digest = TypeAdapter(Digest).validate_python(
+                    accepted_result_digest,
+                    strict=True,
+                )
+            except Exception as error:
+                raise InvalidHarnessInputError(
+                    "accepted workflow result digest is invalid"
+                ) from error
+            if not observed_execution:
+                raise InvalidHarnessInputError(
+                    "accepted result digest requires observed execution"
+                )
+            if (
+                view.accepted_result_digest is not None
+                and view.accepted_result_digest != accepted_result_digest
+            ):
+                raise HarnessDependencyError(
+                    "accepted workflow result digest changed during execution"
+                )
+        target, reason, no_trade, payload = self._policy_decision(
+            events, plan, view, parsed, workflow_usage, observed_execution
+        )
+        if prompt_release_digest is not None:
+            payload["prompt_release_digest"] = prompt_release_digest
+        if accepted_result_digest is not None:
+            payload["accepted_result_digest"] = accepted_result_digest
         payload["no_trade"] = no_trade
         if candidate_digest is not None:
             payload["candidate_digest"] = candidate_digest
@@ -827,12 +1036,244 @@ class HarnessKernel:
         )
         return parsed, sha256(canonical.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _validated_checkpoints(
+        events: tuple[HarnessEvent, ...], plan: HarnessPlan
+    ) -> tuple[NodeCheckpoint, ...]:
+        checkpoints: list[NodeCheckpoint] = []
+        prior_permit: CheckpointPermit | None = None
+        for event in events:
+            if event.event_type != "node_checkpoint_recorded":
+                continue
+            if prior_permit is not None and prior_permit.decision is not CheckpointDecision.CONTINUE:
+                raise HarnessDependencyError("terminal checkpoint permit has a later checkpoint")
+            if set(event.payload) != {
+                "checkpoint_json", "checkpoint_digest", "permit_json", "permit_digest"
+            }:
+                raise HarnessDependencyError("committed execution checkpoint is not canonical")
+            encoded = event.payload.get("checkpoint_json")
+            digest = event.payload.get("checkpoint_digest")
+            if type(encoded) is not str or type(digest) is not str:
+                raise HarnessDependencyError("committed execution checkpoint is invalid")
+            try:
+                value = json.loads(encoded)
+                if json.dumps(
+                    value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ) != encoded:
+                    raise ValueError("checkpoint JSON is noncanonical")
+                checkpoint = NodeCheckpoint.model_validate_json(encoded)
+            except Exception as error:
+                raise HarnessDependencyError("committed execution checkpoint is invalid") from error
+            if (
+                digest != HarnessKernel._canonical_digest(value)
+                or event.run_id != plan.run_id
+                or event.trace_id != plan.trace_id
+                or checkpoint.workflow_id != plan.run_id
+                or checkpoint.trace_id != plan.trace_id
+                or checkpoint.ordinal != len(checkpoints) + 1
+            ):
+                raise HarnessDependencyError("committed execution checkpoint binding is invalid")
+            if checkpoints:
+                prior_attempts = checkpoints[-1].usage.attempts
+                if checkpoint.usage.attempts[: len(prior_attempts)] != prior_attempts:
+                    raise HarnessDependencyError("committed checkpoint usage is not append-only")
+            permit = HarnessKernel._checkpoint_permit(event)
+            if (
+                permit.workflow_id != checkpoint.workflow_id
+                or permit.trace_id != checkpoint.trace_id
+                or permit.checkpoint_ordinal != checkpoint.ordinal
+                or permit.checkpoint_digest != checkpoint.canonical_digest()
+            ):
+                raise HarnessDependencyError("committed checkpoint permit binding is invalid")
+            checkpoints.append(checkpoint)
+            prior_permit = permit
+        checked = tuple(checkpoints)
+        HarnessKernel._validate_checkpoint_sequence(checked, plan)
+        return checked
+
+    @staticmethod
+    def _checkpoint_permit(event: HarnessEvent) -> CheckpointPermit:
+        permit_json = event.payload.get("permit_json")
+        permit_digest = event.payload.get("permit_digest")
+        try:
+            permit_value = json.loads(cast(str, permit_json))
+            permit = CheckpointPermit.model_validate_json(cast(str, permit_json))
+        except Exception as error:
+            raise HarnessDependencyError("committed checkpoint permit is invalid") from error
+        if (
+            type(permit_json) is not str
+            or type(permit_digest) is not str
+            or json.dumps(permit_value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != permit_json
+            or permit_digest != HarnessKernel._canonical_digest(permit_value)
+        ):
+            raise HarnessDependencyError("committed checkpoint permit is invalid")
+        return permit
+
+    @staticmethod
+    def _validate_checkpoint_sequence(
+        checkpoints: tuple[NodeCheckpoint, ...], plan: HarnessPlan
+    ) -> None:
+        legal = (
+            CoreNodeName.PLAN,
+            CoreNodeName.DISPATCH,
+            CoreNodeName.RECOVER,
+            CoreNodeName.DECIDE,
+            CoreNodeName.REFLECT,
+            CoreNodeName.RISK,
+            CoreNodeName.ASSEMBLE,
+        )
+        if tuple(item.node for item in checkpoints) != legal[: len(checkpoints)]:
+            raise HarnessDependencyError("execution checkpoints are not a legal graph prefix")
+        previous: NodeCheckpoint | None = None
+        for checkpoint in checkpoints:
+            if tuple(item.task_id for item in checkpoint.work_items) != checkpoint.task_ids:
+                raise HarnessDependencyError("checkpoint inventory is not canonical")
+            checkpoint_task_ids = set(checkpoint.task_ids)
+            if any(
+                attempt.task_id not in checkpoint_task_ids
+                for attempt in checkpoint.usage.attempts
+            ):
+                raise HarnessDependencyError(
+                    "provider attempt references an unknown durable task"
+                )
+            retry_by_id = {item.task_id: item for item in checkpoint.retry_state}
+            work_by_id = {item.task_id: item for item in checkpoint.work_items}
+            for task_id in checkpoint.task_ids:
+                retry = retry_by_id[task_id]
+                item = work_by_id[task_id]
+                registered_worker = (
+                    "reflection-agent"
+                    if item.task_kind == "reflection"
+                    else f"{item.task_kind}-agent"
+                )
+                try:
+                    if item.task_kind != "reflection":
+                        TaskType(item.task_kind)
+                except ValueError as error:
+                    raise HarnessDependencyError("checkpoint work item is absent from the task registry") from error
+                if item.worker_id != registered_worker:
+                    raise HarnessDependencyError("checkpoint work-item owner is absent from the task registry")
+                if item.maximum_retries > 3:
+                    raise HarnessDependencyError("checkpoint retry limit is invalid")
+                if not set(item.dependency_ids) <= checkpoint_task_ids:
+                    raise HarnessDependencyError("checkpoint dependency is not durable")
+                task_attempts = tuple(
+                    attempt
+                    for attempt in checkpoint.usage.attempts
+                    if attempt.task_id == task_id
+                )
+                observed_attempt_ids = tuple(
+                    attempt.provider_request_id for attempt in task_attempts
+                )
+                if item.attempt_ids != observed_attempt_ids:
+                    raise HarnessDependencyError("checkpoint work-item attempts are not durable")
+                if tuple(attempt.attempt for attempt in task_attempts) != tuple(
+                    range(len(task_attempts))
+                ):
+                    raise HarnessDependencyError(
+                        "checkpoint task attempt ordinals are not contiguous"
+                    )
+                if (
+                    (task_id in checkpoint.completed_task_ids and item.execution_state != "succeeded")
+                    or (task_id in checkpoint.failed_task_ids and item.execution_state != "failed")
+                ):
+                    raise HarnessDependencyError("checkpoint progress does not match work-item state")
+                if retry.retries_consumed + retry.retries_remaining != item.maximum_retries:
+                    raise HarnessDependencyError("checkpoint retry budget binding is incomplete")
+                actual_attempts = sum(
+                    attempt.task_id == task_id for attempt in checkpoint.usage.attempts
+                )
+                if retry.attempts_consumed != actual_attempts:
+                    raise HarnessDependencyError("checkpoint retry state does not bind observed attempts")
+                if actual_attempts > item.maximum_retries + 1:
+                    raise HarnessDependencyError("checkpoint retry limit was exceeded")
+            if previous is None:
+                if checkpoint.plan_revision != plan.revision:
+                    raise HarnessDependencyError("execution checkpoint plan revision is invalid")
+                new_attempts = checkpoint.usage.attempts
+            else:
+                revision_delta = checkpoint.plan_revision - previous.plan_revision
+                if revision_delta < 0 or revision_delta > 1 or (
+                    revision_delta and checkpoint.node is not CoreNodeName.RECOVER
+                ):
+                    raise HarnessDependencyError("execution checkpoint plan revision is invalid")
+                prior_count = len(previous.task_ids)
+                if checkpoint.task_ids[:prior_count] != previous.task_ids:
+                    raise HarnessDependencyError(
+                        "recovery inventory must preserve durable work"
+                    )
+                if not set(previous.completed_task_ids) <= set(checkpoint.completed_task_ids) or not set(previous.failed_task_ids) <= set(checkpoint.failed_task_ids):
+                    raise HarnessDependencyError("checkpoint progress is not monotonic")
+                previous_retry = {item.task_id: item for item in previous.retry_state}
+                previous_work = {item.task_id: item for item in previous.work_items}
+                state_rank = {
+                    "pending": 0, "running": 1, "succeeded": 2,
+                    "failed": 2, "cancelled": 2,
+                }
+                for task_id in previous.task_ids:
+                    retry = retry_by_id[task_id]
+                    prior = previous_retry[task_id]
+                    work_item = work_by_id[task_id]
+                    prior_work_item = previous_work[task_id]
+                    if (
+                        retry.attempts_consumed < prior.attempts_consumed
+                        or retry.retries_consumed < prior.retries_consumed
+                        or retry.retries_remaining > prior.retries_remaining
+                        or work_item.maximum_retries != prior_work_item.maximum_retries
+                    ):
+                        raise HarnessDependencyError("checkpoint retry state is not monotonic")
+                    prior_terminal = prior_work_item.execution_state in {
+                        "succeeded", "failed", "cancelled"
+                    }
+                    if (
+                        work_item.worker_id != prior_work_item.worker_id
+                        or work_item.owner_node is not prior_work_item.owner_node
+                        or work_item.dependency_ids != prior_work_item.dependency_ids
+                        or work_item.attempt_ids[:len(prior_work_item.attempt_ids)]
+                        != prior_work_item.attempt_ids
+                        or state_rank[work_item.execution_state]
+                        < state_rank[prior_work_item.execution_state]
+                        or (
+                            prior_terminal
+                            and work_item.execution_state
+                            != prior_work_item.execution_state
+                        )
+                    ):
+                        raise HarnessDependencyError("checkpoint work-item transition is not monotonic")
+                for task_id in checkpoint.task_ids[prior_count:]:
+                    item = work_by_id[task_id]
+                    if item.owner_node is not checkpoint.node:
+                        raise HarnessDependencyError(
+                            "new checkpoint work must be owned by the executing node"
+                        )
+                    if checkpoint.node is CoreNodeName.RECOVER and (
+                        not item.dependency_ids
+                        or not set(item.dependency_ids) <= set(previous.task_ids)
+                    ):
+                        raise HarnessDependencyError(
+                            "recovery parent is not a durable predecessor"
+                        )
+                new_attempts = checkpoint.usage.attempts[len(previous.usage.attempts):]
+            if any(attempt.node is not checkpoint.node for attempt in new_attempts):
+                raise HarnessDependencyError("provider attempt is attributed to the wrong graph node")
+            previous = checkpoint
+
+    @staticmethod
+    def _explicit_historical_cache_usage(usage: WorkflowUsage) -> bool:
+        return (
+            usage.execution_count > 0
+            and usage.provider_attempt_count == 0
+            and all(attempt.source == "historical_cache" for attempt in usage.attempts)
+        )
+
     def _policy_decision(
         self,
         events: tuple[HarnessEvent, ...],
         plan: HarnessPlan,
         view: HarnessSessionView,
         candidate: _AdvanceCandidate,
+        workflow_usage: WorkflowUsage | None,
+        observed_execution: bool,
     ) -> tuple[RunState, str, bool, dict[str, object]]:
         initial = _INITIAL_TARGETS.get(view.run_state)
         if initial is not None:
@@ -865,37 +1306,70 @@ class HarnessKernel:
             return RunState.DEGRADING, "budget_exhausted", True, {
                 "policy": "budget"
             }
-        usage = UsageTokens(input_tokens=1, output_tokens=1)
-        if not self._budget_can_reserve(events, plan, budget, usage):
-            return RunState.DEGRADING, "budget_exhausted", True, {
-                "policy": "budget"
+        if workflow_usage is not None:
+            try:
+                checked_usage = WorkflowUsage.model_validate(
+                    workflow_usage.model_dump(mode="python")
+                )
+            except Exception as error:
+                raise HarnessDependencyError("workflow usage is invalid") from error
+            checkpoints = self._validated_checkpoints(events, plan)
+            if (
+                (not checkpoints or checkpoints[-1].usage != checked_usage)
+                and not self._explicit_historical_cache_usage(checked_usage)
+            ):
+                raise HarnessDependencyError(
+                    "terminal workflow usage is not bound by the latest checkpoint"
+                )
+            try:
+                payload.update(
+                    self._budget_payload_v2(
+                        events, plan, budget, checked_usage, checkpoints
+                    )
+                )
+            except BudgetExceededError:
+                return RunState.DEGRADING, "budget_exhausted", True, {
+                    "policy": "budget"
+                }
+        elif observed_execution:
+            return RunState.DEGRADING, "usage_evidence_unavailable", True, {
+                "policy": "observed_usage_required"
             }
-        before = budget
-        try:
-            policy = self._execution_policy_for(plan)
-            reservation = ledger.reserve(
-                node_name=policy.node_name,
-                model=policy.tiers[0].model,
-                band="short",
-                usage=usage,
+        else:
+            # Compatibility path for deterministic replay and direct Phase-1
+            # callers.  The production application supplies WorkflowUsage and
+            # therefore never reaches this synthetic v1 settlement.
+            usage = UsageTokens(input_tokens=1, output_tokens=1)
+            if not self._budget_can_reserve(events, plan, budget, usage):
+                return RunState.DEGRADING, "budget_exhausted", True, {
+                    "policy": "budget"
+                }
+            before = budget
+            try:
+                policy = self._execution_policy_for(plan)
+                reservation = ledger.reserve(
+                    node_name=policy.node_name,
+                    model=policy.tiers[0].model,
+                    band="short",
+                    usage=usage,
+                )
+                settlement = ledger.settle(reservation, usage)
+            except BudgetExceededError:
+                return RunState.DEGRADING, "budget_exhausted", True, {
+                    "policy": "budget"
+                }
+            budget = ledger.snapshot()
+            payload.update(
+                self._budget_payload(
+                    events,
+                    plan,
+                    before,
+                    budget,
+                    usage,
+                    reservation,
+                    settlement,
+                )
             )
-            settlement = ledger.settle(reservation, usage)
-        except BudgetExceededError:
-            return RunState.DEGRADING, "budget_exhausted", True, {
-                "policy": "budget"
-            }
-        budget = ledger.snapshot()
-        payload.update(
-            self._budget_payload(
-                events,
-                plan,
-                before,
-                budget,
-                usage,
-                reservation,
-                settlement,
-            )
-        )
 
         guard: LoopGuard | None = None
         if candidate.action_observation is not None:
@@ -1144,6 +1618,79 @@ class HarnessKernel:
         return {**projection, _BUDGET_SETTLEMENT_EVIDENCE_KEY: settlement_evidence}
 
     @staticmethod
+    def _budget_payload_v2(
+        events: tuple[HarnessEvent, ...],
+        plan: HarnessPlan,
+        snapshot: BudgetSnapshot,
+        usage: WorkflowUsage,
+        checkpoints: tuple[NodeCheckpoint, ...],
+    ) -> dict[str, object]:
+        attempts, seconds, cost, tokens = HarnessKernel._budget_state(
+            events, plan, snapshot
+        )
+        attempt_delta = usage.provider_attempt_count
+        seconds_delta = Decimal(usage.total_latency_ms) / Decimal(1000)
+        cost_delta = Decimal(str(usage.estimated_cost_usd))
+        aggregate = usage.aggregate
+        token_delta = (
+            aggregate.input_tokens
+            + aggregate.cache_write_tokens
+            + aggregate.output_tokens
+        )
+        remaining_attempts = attempts - attempt_delta
+        remaining_seconds = seconds - seconds_delta
+        remaining_cost = cost - cost_delta
+        remaining_tokens = tokens - token_delta
+        if min(remaining_attempts, remaining_tokens) < 0 or min(
+            remaining_seconds, remaining_cost
+        ) < 0:
+            raise BudgetExceededError("observed workflow usage exceeds durable budget")
+        projection: dict[str, object] = {
+            "budget_before_attempts": attempts,
+            "budget_delta_attempts": attempt_delta,
+            "budget_remaining_attempts": remaining_attempts,
+            "budget_before_seconds": format(seconds, "f"),
+            "budget_delta_seconds": format(seconds_delta, "f"),
+            "budget_remaining_seconds": format(remaining_seconds, "f"),
+            "budget_before_cost": format(cost, "f"),
+            "budget_delta_cost": format(cost_delta, "f"),
+            "budget_remaining_cost": format(remaining_cost, "f"),
+            "budget_before_tokens": tokens,
+            "budget_delta_tokens": token_delta,
+            "budget_remaining_tokens": remaining_tokens,
+        }
+        usage_value = usage.model_dump(mode="json")
+        usage_json = json.dumps(
+            usage_value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        checkpoint_digests = [
+            HarnessKernel._canonical_digest(item.model_dump(mode="json"))
+            for item in checkpoints
+        ]
+        settlement_core: dict[str, object] = {
+            "schema_version": _BUDGET_SETTLEMENT_SCHEMA_V2,
+            "charged_cost": format(cost_delta, "f"),
+            "timeout": False,
+            "workflow_usage_json": usage_json,
+            "workflow_usage_digest": HarnessKernel._canonical_digest(usage_value),
+            "checkpoint_digests_json": json.dumps(
+                checkpoint_digests,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ),
+            "projection": projection,
+        }
+        settlement = {
+            **settlement_core,
+            "settlement_digest": HarnessKernel._canonical_digest(settlement_core),
+        }
+        return {**projection, _BUDGET_SETTLEMENT_EVIDENCE_KEY: settlement}
+
+    @staticmethod
     def _canonical_digest(value: object) -> str:
         return sha256(
             json.dumps(
@@ -1304,63 +1851,133 @@ class HarnessKernel:
         settlement = evidence.get("settlement")
         if not isinstance(settlement, Mapping):
             raise HarnessDependencyError("budget settlement evidence is invalid")
-        expected_settlement_keys = {
-            "schema_version",
-            "reservation_id",
-            "charged_cost",
-            "timeout",
-            "usage",
-            "projection",
-            "settlement_digest",
-        }
+        schema_version = settlement.get("schema_version")
+        expected_settlement_keys = (
+            {
+                "schema_version",
+                "reservation_id",
+                "charged_cost",
+                "timeout",
+                "usage",
+                "projection",
+                "settlement_digest",
+            }
+            if schema_version == _BUDGET_SETTLEMENT_SCHEMA
+            else {
+                "schema_version",
+                "charged_cost",
+                "timeout",
+                "workflow_usage_json",
+                "workflow_usage_digest",
+                "checkpoint_digests_json",
+                "projection",
+                "settlement_digest",
+            }
+            if schema_version == _BUDGET_SETTLEMENT_SCHEMA_V2
+            else set()
+        )
         if set(settlement) != expected_settlement_keys:
             raise HarnessDependencyError("budget settlement evidence is not canonical")
         settlement_unsigned = {
             key: value for key, value in settlement.items() if key != "settlement_digest"
         }
         if (
-            settlement.get("schema_version") != _BUDGET_SETTLEMENT_SCHEMA
-            or settlement.get("projection") != projection
+            settlement.get("projection") != projection
             or settlement.get("settlement_digest")
             != HarnessKernel._canonical_digest(settlement_unsigned)
         ):
             raise HarnessDependencyError("budget settlement evidence digest is invalid")
-        reservation_id = settlement.get("reservation_id")
-        if (
-            type(reservation_id) is not str
-            or not reservation_id
-            or reservation_id != reservation_id.strip()
-            or len(reservation_id) > 256
-            or settlement.get("timeout") is not False
-        ):
+        if settlement.get("timeout") is not False:
             raise HarnessDependencyError("budget settlement evidence is invalid")
-        usage_value = settlement.get("usage")
-        if not isinstance(usage_value, Mapping) or set(usage_value) != {
-            "input_tokens",
-            "cached_input_tokens",
-            "cache_write_tokens",
-            "output_tokens",
-            "web_search_tool_calls",
-        }:
-            raise HarnessDependencyError("budget settlement usage is invalid")
-        try:
-            usage = UsageTokens(**usage_value)
-        except Exception as error:
-            raise HarnessDependencyError("budget settlement usage is invalid") from error
-        # Phase 1 performs precisely one bounded event-filter attempt.  This
-        # rejects self-consistent all-zero projections and any synthetic usage
-        # that cannot have been settled by the runtime.
-        expected_usage = UsageTokens(input_tokens=1, output_tokens=1)
-        if usage != expected_usage or projection["budget_delta_attempts"] != 1:
-            raise HarnessDependencyError("budget settlement has no real attempt")
-        expected_tokens = usage.input_tokens + usage.cache_write_tokens + usage.output_tokens
-        if projection["budget_delta_tokens"] != expected_tokens:
-            raise HarnessDependencyError("budget settlement token total is inconsistent")
         charged_cost = HarnessKernel._budget_decimal(settlement.get("charged_cost"))
-        expected_cost = estimate_workflow_usage_cost("gpt-5.6-luna", "short", usage)
-        if charged_cost != expected_cost or charged_cost != Decimal(
-            cast(str, projection["budget_delta_cost"])
-        ):
+        if schema_version == _BUDGET_SETTLEMENT_SCHEMA:
+            reservation_id = settlement.get("reservation_id")
+            if (
+                type(reservation_id) is not str
+                or not reservation_id
+                or reservation_id != reservation_id.strip()
+                or len(reservation_id) > 256
+            ):
+                raise HarnessDependencyError("budget settlement evidence is invalid")
+            usage_value = settlement.get("usage")
+            if not isinstance(usage_value, Mapping) or set(usage_value) != {
+                "input_tokens",
+                "cached_input_tokens",
+                "cache_write_tokens",
+                "output_tokens",
+                "web_search_tool_calls",
+            }:
+                raise HarnessDependencyError("budget settlement usage is invalid")
+            try:
+                usage = UsageTokens(**usage_value)
+            except Exception as error:
+                raise HarnessDependencyError("budget settlement usage is invalid") from error
+            expected_usage = UsageTokens(input_tokens=1, output_tokens=1)
+            if usage != expected_usage or projection["budget_delta_attempts"] != 1:
+                raise HarnessDependencyError("budget settlement has no real attempt")
+            expected_tokens = usage.input_tokens + usage.cache_write_tokens + usage.output_tokens
+            if projection["budget_delta_tokens"] != expected_tokens:
+                raise HarnessDependencyError("budget settlement token total is inconsistent")
+            expected_cost = estimate_workflow_usage_cost("gpt-5.6-luna", "short", usage)
+            if charged_cost != expected_cost:
+                raise HarnessDependencyError("budget settlement cost is inconsistent")
+        else:
+            usage_json = settlement.get("workflow_usage_json")
+            checkpoint_digests_json = settlement.get("checkpoint_digests_json")
+            if type(usage_json) is not str or type(checkpoint_digests_json) is not str:
+                raise HarnessDependencyError("workflow usage settlement is invalid")
+            try:
+                usage_value = json.loads(usage_json)
+                checkpoint_digest_values = json.loads(checkpoint_digests_json)
+                if (
+                    json.dumps(usage_value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                    != usage_json
+                    or json.dumps(checkpoint_digest_values, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                    != checkpoint_digests_json
+                    or not isinstance(checkpoint_digest_values, list)
+                ):
+                    raise ValueError("workflow usage JSON is noncanonical")
+                usage = WorkflowUsage.model_validate_json(usage_json)
+            except Exception as error:
+                raise HarnessDependencyError("workflow usage settlement is invalid") from error
+            canonical_usage = usage.model_dump(mode="json")
+            if (
+                usage.workflow_id != plan.run_id
+                or usage.trace_id != plan.trace_id
+                or settlement.get("workflow_usage_digest")
+                != HarnessKernel._canonical_digest(canonical_usage)
+                or HarnessKernel._canonical_digest(usage_value)
+                != HarnessKernel._canonical_digest(canonical_usage)
+            ):
+                raise HarnessDependencyError("workflow usage settlement binding is invalid")
+            checkpoints = HarnessKernel._validated_checkpoints(prior_events, plan)
+            checkpoint_digests = tuple(
+                HarnessKernel._canonical_digest(item.model_dump(mode="json"))
+                for item in checkpoints
+            )
+            if (
+                (
+                    (not checkpoints or checkpoints[-1].usage != usage)
+                    and not HarnessKernel._explicit_historical_cache_usage(usage)
+                )
+                or tuple(checkpoint_digest_values) != checkpoint_digests
+            ):
+                raise HarnessDependencyError("workflow usage checkpoint binding is invalid")
+            aggregate = usage.aggregate
+            expected_tokens = (
+                aggregate.input_tokens
+                + aggregate.cache_write_tokens
+                + aggregate.output_tokens
+            )
+            if (
+                projection["budget_delta_attempts"] != usage.provider_attempt_count
+                or projection["budget_delta_seconds"]
+                != format(Decimal(usage.total_latency_ms) / Decimal(1000), "f")
+                or projection["budget_delta_tokens"] != expected_tokens
+                or charged_cost != Decimal(str(usage.estimated_cost_usd))
+            ):
+                raise HarnessDependencyError("workflow usage projection is inconsistent")
+        if charged_cost != Decimal(cast(str, projection["budget_delta_cost"])):
             raise HarnessDependencyError("budget settlement cost is inconsistent")
         receipt_json = evidence.get("host_receipt")
         if (

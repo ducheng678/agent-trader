@@ -8,17 +8,23 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 import math
-from typing import Callable, Iterable, Mapping, Protocol
+from typing import Callable, Iterable, Literal, Mapping, Protocol
 
 from pydantic import BaseModel
 
+from market_agent.openai_usage import UsageTokens as PricedUsageTokens, estimate_workflow_usage_cost
 from market_agent.workflow_agent_contracts import AgentFailure, AgentInvocation, AgentResult, AgentUsage, ModelTier
 from market_agent.workflow_audit import AuditEvent, AuditObserver, AuditPayload
 from market_agent.workflow_circuit_breaker import CircuitBreaker
 from market_agent.workflow_fallback import Abstain, Downgrade, FallbackPolicy, UseLocalKnowledge
+from market_agent.workflow_observation import (
+    AttemptUsage,
+    CoreNodeName,
+    TokenUsage,
+)
 from market_agent.workflow_memory_retrieval import CoreExperienceSummary
 from market_agent.workflow_prompt_release import PromptReleaseRegistry, canonical_json
-from market_agent.workflow_prompt_config import PromptReleaseManager
+from market_agent.workflow_prompt_config import PromptPin, PromptReleaseManager, WorkflowPromptPin
 from market_agent.workflow_response_cache import CacheMetadata, ExactCacheKey, ExactResponseCache, require_cache_safe, snapshot_safe_answers
 from market_agent.workflow_retry_policy import RetryPolicy, UniformRandom
 from market_agent.workflow_semantic_request_cache import SemanticCacheEntry, SemanticRequestCache
@@ -42,6 +48,38 @@ _OUTPUT_INSTRUCTIONS = (
 _MEMORY_MAX_BYTES = 8192
 _MEMORY_MAX_AGE_SECONDS = 86400
 _MEMORY_MIN_CONFIDENCE = 0.6
+_SHORT_CONTEXT_MAX_TOKENS = 272_000
+
+
+def rendered_request_token_upper_bound(
+    messages: tuple[tuple[str, str], ...], output_schema_json: str,
+) -> int:
+    """Return a deterministic conservative count for pricing-band admission.
+
+    The provider tokenizer is not available on the trusted host.  A UTF-8 byte
+    count over the final wire-relevant messages and schema is a conservative
+    upper bound for byte-pair tokenizers: one token cannot require fewer than
+    one encoded byte.  This deliberately includes the stable prompt prefix,
+    dynamic payload, output schema, and any injected memory.
+    """
+
+    if not isinstance(messages, tuple) or not isinstance(output_schema_json, str):
+        raise TypeError("rendered request requires canonical messages and schema")
+    frame = canonical_json({
+        "messages": tuple({"role": role, "content": content} for role, content in messages),
+        "output_schema_json": output_schema_json,
+    })
+    return len(frame.encode("utf-8"))
+
+
+def pricing_band_for_rendered_request(
+    messages: tuple[tuple[str, str], ...], output_schema_json: str,
+) -> Literal["short", "long"]:
+    return (
+        "long"
+        if rendered_request_token_upper_bound(messages, output_schema_json) > _SHORT_CONTEXT_MAX_TOKENS
+        else "short"
+    )
 
 
 def _digest(value: object) -> str:
@@ -123,6 +161,7 @@ class ModelRequest:
     deadline_epoch: float
     attempt: int
     cost_limit_usd: float
+    pricing_band: str = "short"
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +201,9 @@ class _Run:
     # expiry must not invalidate an independent, memory-free answer.
     model_result_used_memory: bool = False
     cancellation_check: Callable[[], bool] = lambda: False
+    prompt_releases: PromptReleaseRegistry | None = None
+    prompt_system_prefix: str | None = None
+    prompt_bundle_digest: str | None = None
 
 
 class AgentDriver:
@@ -185,6 +227,7 @@ class AgentDriver:
         safe_answers: Mapping[str, Iterable[str]] | None = None,
         task_tiers: Mapping[str, ModelTier] | None = None,
         verification_hook: Callable[[AgentResult], object] | None = None,
+        attempt_observer: Callable[[AttemptUsage], object] | None = None,
     ) -> None:
         self._client, self._observer, self._clock, self._random = model_client, audit_observer, clock, random
         self._release_manager = prompt_releases if isinstance(prompt_releases, PromptReleaseManager) else None
@@ -204,9 +247,13 @@ class AgentDriver:
         if any(not isinstance(tier, ModelTier) for tier in self._task_tiers.values()):
             raise ValueError("task routing must use declared model tiers")
         self._verification_hook = verification_hook
+        if attempt_observer is not None and not callable(attempt_observer):
+            raise ValueError("attempt observer must be host-owned and callable")
+        self._attempt_observer = attempt_observer
         self._event_number = 0
 
-    def execute(self, invocation: AgentInvocation, *, memory_context: CoreExperienceSummary | None = None,
+    def execute(self, invocation: AgentInvocation, *, prompt_pin: PromptPin | WorkflowPromptPin | None = None,
+                memory_context: CoreExperienceSummary | None = None,
                 memory_tenant_id: str | None = None, memory_scope: str | None = None,
                 cancellation_check: Callable[[], bool] = lambda: False) -> AgentResult:
         """Accept memory only as a validated summary with trusted scope binding.
@@ -215,7 +262,39 @@ class AgentDriver:
         no repository, retrieval callback, or memory writer capability.
         """
         invocation = AgentInvocation.model_validate(invocation)
-        if self._release_manager is not None:
+        pinned_registry: PromptReleaseRegistry | None = None
+        pinned_system_prefix: str | None = None
+        prompt_bundle_digest: str | None = None
+        if isinstance(prompt_pin, WorkflowPromptPin):
+            try:
+                component = prompt_pin.component(
+                    invocation.prompt_release_id,
+                    invocation.output_schema_digest,
+                )
+                if invocation.output_schema_id != component.profile_id:
+                    raise ValueError("invocation schema ID does not match prompt profile")
+                if invocation.prompt_release_digest != component.release.digest:
+                    raise ValueError("invocation prompt digest does not match workflow pin")
+                pinned_registry = prompt_pin.registry()
+                pinned_system_prefix = prompt_pin.system_prefix(
+                    invocation.prompt_release_id,
+                    invocation.output_schema_digest,
+                )
+                prompt_bundle_digest = prompt_pin.release_digest
+            except Exception:
+                return self._failure(invocation.trace_id, "prompt_release_unavailable")
+        elif isinstance(prompt_pin, PromptPin):
+            if (
+                invocation.prompt_release_id != prompt_pin.release_id
+                or invocation.prompt_release_digest != prompt_pin.release_digest
+            ):
+                return self._failure(invocation.trace_id, "prompt_release_unavailable")
+            pinned_registry = PromptReleaseRegistry(releases=(prompt_pin.release,))
+            pinned_system_prefix = None
+            prompt_bundle_digest = prompt_pin.release_digest
+        elif prompt_pin is not None:
+            return self._failure(invocation.trace_id, "prompt_release_unavailable")
+        elif self._release_manager is not None:
             # New runs pin the active Git-tracked release at ingress.  This
             # intentionally leaves in-flight invocations unchanged if a
             # release is activated while their provider call is outstanding.
@@ -232,6 +311,9 @@ class AgentDriver:
             invocation.allowed_model_tier,
             invocation.attempt,
             cancellation_check=cancellation_check,
+            prompt_releases=pinned_registry,
+            prompt_system_prefix=pinned_system_prefix,
+            prompt_bundle_digest=prompt_bundle_digest,
         )
         try:
             self._emit(run, "trace_started", "received")
@@ -257,7 +339,7 @@ class AgentDriver:
                 except (ValueError, TypeError):
                     return self._fail(run, "invalid_memory_context")
             try:
-                self._releases.select(invocation)
+                (run.prompt_releases or self._releases).select(invocation)
                 schema = self._schemas[(invocation.output_schema_id, invocation.output_schema_digest)]
                 desired = self._task_tiers[invocation.task_kind]
                 run.tier = _TIERS[min(_TIERS.index(desired), _TIERS.index(invocation.allowed_model_tier))]
@@ -323,10 +405,11 @@ class AgentDriver:
         context = None
         try:
             if self._cache_context is not None:
-                context = self._cache_context(run.invocation)
+                context = self._bound_cache_context(run)
             if context is not None:
                 meta = context.metadata
-                if (meta.prompt_release_digest != run.invocation.prompt_release_digest
+                expected_prompt = run.prompt_bundle_digest or run.invocation.prompt_release_digest
+                if (meta.prompt_release_digest != expected_prompt
                         or meta.output_schema_digest != schema.digest):
                     raise ValueError("cache binding does not match invocation")
                 require_cache_safe(meta, {"answer": "不知道"}, self._safe_answers)
@@ -394,8 +477,11 @@ class AgentDriver:
                         return self._success(run, output, "local_knowledge")
                 except _AuditFailure:
                     raise
-                except Exception:
-                    pass
+                except Exception as error:
+                    # A malformed local answer is an expected fallback miss;
+                    # preserve the fail-closed path without making an
+                    # optional diagnostic emission a new audit dependency.
+                    _ = type(error).__name__
                 decision = self._fallback.next("local_knowledge", "no_valid_answer")
             if not isinstance(decision, Abstain) or decision.conclusion != "不知道":
                 return self._fail(run, "invalid_fallback")
@@ -408,7 +494,7 @@ class AgentDriver:
         if self._cache_context is None:
             return
         try:
-            context = self._cache_context(run.invocation)
+            context = self._bound_cache_context(run)
             if context is None:
                 return
             metadata = context.metadata
@@ -442,13 +528,37 @@ class AgentDriver:
             # model result. Rejections remain observable as a skipped write.
             self._emit(run, "semantic_cache_write", "rejected", reason="cache_miss")
 
+    def _bound_cache_context(self, run: _Run) -> CacheRequest | None:
+        if self._cache_context is None:
+            return None
+        context = self._cache_context(run.invocation)
+        if context is None:
+            return None
+        if not isinstance(context, CacheRequest):
+            raise TypeError("cache context must be a typed request")
+        expected_component = run.invocation.prompt_release_digest
+        if context.metadata.prompt_release_digest != expected_component:
+            raise ValueError("cache context prompt binding does not match invocation")
+        if run.prompt_bundle_digest is None:
+            return context
+        return replace(
+            context,
+            metadata=replace(
+                context.metadata,
+                prompt_release_digest=run.prompt_bundle_digest,
+            ),
+        )
+
     def _model(self, run: _Run, schema: OutputSchema) -> AgentResult | None:
         per_tier_attempts = 0
         invocation = run.invocation
         try:
             routed = invocation.model_copy(update={"allowed_model_tier": run.tier})
-            release = self._releases.select(routed)
-            system, user = self._releases.render(routed)
+            releases = run.prompt_releases or self._releases
+            release = releases.select(routed)
+            system, user = releases.render(routed)
+            if run.prompt_system_prefix is not None:
+                system = run.prompt_system_prefix
             reservation = self._costs[run.tier]
         except (ValueError, KeyError):
             return None
@@ -473,6 +583,13 @@ class AgentDriver:
                     temperature=release.temperature_for(run.tier), output_schema_id=schema.schema_id,
                     output_schema_digest=schema.digest, output_schema_json=schema.json_schema,
                     deadline_epoch=invocation.deadline_epoch, attempt=run.attempts, cost_limit_usd=float(reservation),
+                    pricing_band="short",
+                )
+                request = replace(
+                    request,
+                    pricing_band=pricing_band_for_rendered_request(
+                        request.messages, request.output_schema_json,
+                    ),
                 )
                 self._emit(run, "prompt_composed", "dispatched")
             except _AuditFailure:
@@ -489,10 +606,29 @@ class AgentDriver:
             run.spent += reservation
             try:
                 if run.memory_context and not run.memory_issued_at <= self._clock.now() < run.memory_expires_at:
-                    request = replace(request, messages=request.messages[:2])
+                    messages = request.messages[:2]
+                    request = replace(
+                        request,
+                        messages=messages,
+                        pricing_band=pricing_band_for_rendered_request(
+                            messages, request.output_schema_json,
+                        ),
+                    )
                 memory_injected = len(request.messages) > 2
+                invoked_at = self._clock.now()
                 response = self._client.invoke(request)
             except Exception as error:
+                latency_ms = max(0, int((self._clock.now() - locals().get("invoked_at", self._clock.now())) * 1000))
+                try:
+                    self._observe_attempt(
+                        run,
+                        request,
+                        usage=None,
+                        latency_ms=latency_ms,
+                        source="provider_usage_unavailable",
+                    )
+                except Exception:
+                    return self._fail(run, "usage_observation_unavailable")
                 retryable = self._retry.is_retryable(error)
                 self._record_circuit(run, success=not retryable, probe=circuit.kind == "probe")
                 if not retryable:
@@ -508,17 +644,45 @@ class AgentDriver:
                     return self._fail(run, "cancelled", reason="cancellation")
                 self._clock.sleep(decision.delay)
                 continue
+            latency_ms = max(0, int((self._clock.now() - invoked_at) * 1000))
+            try:
+                if not isinstance(response, ModelResponse):
+                    raise ValueError("provider returned an invalid envelope")
+                usage = AgentUsage.model_validate(response.usage)
+                if usage.model_tier != run.tier:
+                    raise ValueError("provider usage changed the requested model tier")
+                self._observe_attempt(
+                    run,
+                    request,
+                    usage=usage,
+                    latency_ms=latency_ms,
+                    source="provider_response",
+                )
+                exact_cost = self._exact_attempt_cost(request, usage)
+                if exact_cost > reservation:
+                    self._record_circuit(run, success=True, probe=circuit.kind == "probe")
+                    return self._fail(run, "budget_exhausted", reason="budget_exhausted")
+            except (ValueError, TypeError, RecursionError):
+                try:
+                    self._observe_attempt(
+                        run,
+                        request,
+                        usage=None,
+                        latency_ms=latency_ms,
+                        source="provider_usage_unavailable",
+                    )
+                except Exception:
+                    return self._fail(run, "usage_observation_unavailable")
+                self._record_circuit(run, success=True, probe=circuit.kind == "probe")
+                return self._fail(run, "malformed_output")
+            except Exception:
+                return self._fail(run, "usage_observation_unavailable")
             if self._cancelled(run):
                 self._record_circuit(run, success=True, probe=circuit.kind == "probe")
                 return self._fail(run, "cancelled", reason="cancellation")
             self._record_circuit(run, success=True, probe=circuit.kind == "probe")
             try:
-                if not isinstance(response, ModelResponse):
-                    raise ValueError("provider returned an invalid envelope")
-                usage = AgentUsage.model_validate(response.usage)
-                if usage.model_tier != run.tier or Decimal(str(usage.cost_usd)) > reservation:
-                    raise ValueError("provider usage exceeded the reserved model policy")
-                run.spent += Decimal(str(usage.cost_usd)) - reservation
+                run.spent += exact_cost - reservation
                 output = schema.validate(_strict_object(response.content))
             except (ValueError, TypeError, RecursionError):
                 return self._fail(run, "malformed_output")
@@ -569,9 +733,138 @@ class AgentDriver:
                    "completed" if success else "failed", outcome="succeeded" if success else "failed")
 
     def _success(self, run: _Run, output: dict[str, object], origin: str, usage: AgentUsage | None = None) -> AgentResult:
+        if usage is None:
+            try:
+                self._observe_non_provider(run, origin)
+            except Exception:
+                return self._failure(run.invocation.trace_id, "usage_observation_unavailable")
         return AgentResult(trace_id=run.invocation.trace_id, origin=origin, output=output,
             usage=AgentUsage(input_tokens=usage.input_tokens if usage else 0,
-                output_tokens=usage.output_tokens if usage else 0, cost_usd=float(run.spent), model_tier=run.tier))
+                cached_input_tokens=usage.cached_input_tokens if usage else 0,
+                cache_write_tokens=usage.cache_write_tokens if usage else 0,
+                output_tokens=usage.output_tokens if usage else 0,
+                web_search_tool_calls=usage.web_search_tool_calls if usage else 0,
+                cost_usd=float(run.spent), model_tier=run.tier,
+                provider=usage.provider if usage else "host",
+                provider_request_id=usage.provider_request_id if usage else None,
+                model_id=usage.model_id if usage else None,
+                pricing_version=usage.pricing_version if usage else "host-zero-v1",
+                pricing_model_id=usage.pricing_model_id if usage else None,
+                pricing_band=usage.pricing_band if usage else None))
+
+    @staticmethod
+    def _execution_node(run: _Run) -> CoreNodeName:
+        return CoreNodeName(run.invocation.execution_node)
+
+    @staticmethod
+    def _fallback_request_id(run: _Run, request: ModelRequest, suffix: str) -> str:
+        return "attempt-" + _digest(
+            (
+                run.invocation.run_id,
+                run.invocation.task_id,
+                request.attempt,
+                request.model_tier.value,
+                suffix,
+            )
+        )[:48]
+
+    def _observe_attempt(
+        self,
+        run: _Run,
+        request: ModelRequest,
+        *,
+        usage: AgentUsage | None,
+        latency_ms: int,
+        source: str,
+    ) -> None:
+        if self._attempt_observer is None:
+            return
+        model_id = (
+            usage.model_id if usage is not None and usage.model_id is not None
+            else f"gpt-5.6-{request.model_tier.value}"
+        )
+        request_id = (
+            usage.provider_request_id
+            if usage is not None and usage.provider_request_id is not None
+            else self._fallback_request_id(run, request, source)
+        )
+        exact_cost = (
+            self._exact_attempt_cost(request, usage)
+            if usage is not None
+            else self._costs[run.tier]
+        )
+        self._attempt_observer(AttemptUsage(
+            workflow_id=run.invocation.run_id,
+            trace_id=run.invocation.trace_id,
+            task_id=run.invocation.task_id,
+            attempt=request.attempt,
+            node=self._execution_node(run),
+            provider=usage.provider if usage is not None else "model-adapter",
+            provider_request_id=request_id,
+            model_id=model_id,
+            model_tier=request.model_tier.value,
+            pricing_version=(
+                usage.pricing_version if usage is not None else "reservation-v1"
+            ),
+            pricing_model_id=f"gpt-5.6-{request.model_tier.value}",
+            pricing_band=request.pricing_band,
+            tokens=(TokenUsage(
+                input_tokens=usage.input_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                output_tokens=usage.output_tokens,
+                web_search_tool_calls=usage.web_search_tool_calls,
+            ) if usage is not None else None),
+            estimated_cost_usd=float(exact_cost),
+            latency_ms=latency_ms,
+            source=source,
+        ))
+
+    @staticmethod
+    def _exact_attempt_cost(request: ModelRequest, usage: AgentUsage) -> Decimal:
+        return estimate_workflow_usage_cost(
+            f"gpt-5.6-{request.model_tier.value}",
+            request.pricing_band,
+            PricedUsageTokens(
+                input_tokens=usage.input_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                output_tokens=usage.output_tokens,
+                web_search_tool_calls=usage.web_search_tool_calls,
+            ),
+        )
+
+    def _observe_non_provider(self, run: _Run, origin: str) -> None:
+        if self._attempt_observer is None:
+            return
+        allowed = {
+            "fixed_cache",
+            "semantic_cache",
+            "local_knowledge",
+            "abstention",
+        }
+        if origin not in allowed:
+            raise ValueError("unknown non-provider execution origin")
+        self._attempt_observer(AttemptUsage(
+            workflow_id=run.invocation.run_id,
+            trace_id=run.invocation.trace_id,
+            task_id=run.invocation.task_id,
+            attempt=run.attempts,
+            node=self._execution_node(run),
+            provider="host",
+            provider_request_id=f"{origin}-" + _digest((
+                run.invocation.run_id, run.invocation.task_id, run.attempts, origin
+            ))[:48],
+            model_id=origin,
+            model_tier=None,
+            pricing_version="host-zero-v1",
+            pricing_model_id=None,
+            pricing_band=None,
+            tokens=TokenUsage.zero(),
+            estimated_cost_usd=0.0,
+            latency_ms=0,
+            source=origin,
+        ))
 
     @staticmethod
     def _failure(trace_id: str, code: str) -> AgentResult:

@@ -15,9 +15,9 @@ from market_agent.workflow_contracts import Digest, NonNegativeFinite, NonNegati
 from market_agent.workflow_tracing import TraceContext
 
 
-EventKind = Literal["request_started", "request_completed", "request_failed", "agent_started", "agent_completed", "agent_failed", "tool_started", "tool_completed", "tool_failed", "cache_hit", "cache_miss", "retry_scheduled", "fallback_selected", "memory_completed", "permission_denied"]
+EventKind = Literal["request_started", "request_completed", "request_failed", "queue_started", "queue_completed", "queue_failed", "agent_started", "agent_completed", "agent_failed", "tool_started", "tool_completed", "tool_failed", "cache_hit", "cache_miss", "retry_scheduled", "fallback_selected", "memory_completed", "commit_completed", "commit_failed", "permission_denied"]
 EventStatus = Literal["started", "succeeded", "failed", "degraded", "unknown", "rejected", "skipped"]
-Actor = Literal["ingress", "coordinator", "specialist", "reflection", "driver", "tool", "cache", "memory", "service"]
+Actor = Literal["ingress", "queue", "coordinator", "specialist", "reflection", "driver", "tool", "cache", "memory", "service"]
 
 
 def _json_value(value: object, depth: int = 0) -> object:

@@ -1,0 +1,2 @@
+{"document_id":"runtime-policy-no-orders","text":"The informational workflow does not have exchange order execution authority.","answer":"does not have exchange order execution authority","provenance":"internal-approved:runtime-policy-v1"}
+{"document_id":"runtime-policy-unknown","text":"When supplied evidence is insufficient or conflicting, the workflow returns 不知道.","answer":"returns 不知道","provenance":"internal-approved:runtime-policy-v1"}

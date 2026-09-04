@@ -41,6 +41,7 @@ class ObjectiveDecisionVerifier:
     reviewer: ReflectionReviewer
     generate_patch: PatchGenerator
     generate_rewrite: RewriteGenerator
+    cancellation_check: Callable[[], bool] = lambda: False
     allowed_patch_paths: tuple[str, ...] = (
         "/action",
         "/execute_now",
@@ -61,6 +62,8 @@ class ObjectiveDecisionVerifier:
         reports: tuple[AgentReport, ...],
         decision: DecisionDraft,
     ) -> DecisionDraft | None:
+        if self.cancellation_check():
+            return None
         request = WorkflowRequest.model_validate(request)
         plan = CoordinatorPlan.model_validate(plan)
         reports = tuple(AgentReport.model_validate(report) for report in reports)
@@ -72,6 +75,8 @@ class ObjectiveDecisionVerifier:
             raise ValueError("decision verification context crossed workflow identity")
 
         def reflect(candidate: DecisionDraft) -> ReflectionResult:
+            if self.cancellation_check():
+                raise RuntimeError("decision verification cancelled")
             return reflect_output(
                 candidate,
                 target_kind="decision_planner",
@@ -94,6 +99,7 @@ class ObjectiveDecisionVerifier:
             reflect=reflect,
             allowed_paths=self.allowed_patch_paths,
             output_model=DecisionDraft,
+            cancellation_check=self.cancellation_check,
         )
         if outcome.disposition != "accept" or outcome.output_json is None:
             return None

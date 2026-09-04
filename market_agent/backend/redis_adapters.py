@@ -5,9 +5,10 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 import math
-import random
 import re
+from secrets import SystemRandom
 import threading
+import uuid
 from typing import Any, Protocol
 
 from market_agent.backend.message_bus import MessageEnvelope
@@ -16,6 +17,62 @@ from market_agent.backend.database import JobRecord
 
 class RedisUnavailableError(RuntimeError):
     pass
+
+
+class RedisAuditWriter:
+    """Append-only audit projection backed by the tenant Redis stream."""
+
+    def __init__(self, stream_bus: "RedisStreamMessageBus") -> None:
+        if type(stream_bus) is not RedisStreamMessageBus:
+            raise TypeError("Redis audit writer requires a stream bus")
+        self._bus = stream_bus
+        self._healthy = True
+
+    @property
+    def healthy(self) -> bool:
+        return self._healthy and self._bus.health().status == "ok"
+
+    def record(self, event: Any) -> Any:
+        from market_agent.workflow_audit import AuditEvent
+
+        event = AuditEvent.model_validate(event)
+        trace_id = _require_trace_id(event.trace_id)
+        try:
+            self._bus.publish(MessageEnvelope(
+                topic="audit.event",
+                payload={"trace_id": trace_id, "event": event.model_dump(mode="json")},
+                request_id=event.trace_id,
+                job_id=event.workflow_id,
+            ))
+            return event
+        except Exception as error:
+            self._healthy = False
+            raise RedisUnavailableError("Redis audit append failed") from error
+
+
+class RedisPromptActivationMirror:
+    """Mirror prompt activation/rollback records into shared Redis Streams."""
+
+    def __init__(self, stream_bus: "RedisStreamMessageBus") -> None:
+        if type(stream_bus) is not RedisStreamMessageBus:
+            raise TypeError("Redis prompt mirror requires a stream bus")
+        self._bus = stream_bus
+
+    def __call__(self, activation: Any, pin: Any) -> object:
+        trace_id = sha256(f"prompt:{activation.active_release_id}:{activation.action}".encode()).hexdigest()[:32]
+        self._bus.publish(MessageEnvelope(
+            topic="prompt.activation",
+            payload={
+                "trace_id": trace_id,
+                "release_id": activation.active_release_id,
+                "previous_release_id": activation.previous_release_id,
+                "action": activation.action,
+                "release_digest": pin.release_digest,
+                "manifest_hash": pin.manifest_hash,
+            },
+            request_id=trace_id,
+        ))
+        return activation
 
 
 class RedisSerializationError(ValueError):
@@ -328,17 +385,36 @@ class RedisMessageBusAdapter:
     _RETRY_MAX_SECONDS = 5.0
     _PENDING_IDLE_MS = 60_000
     _PENDING_BATCH_SIZE = 10
+    _jitter = SystemRandom()
 
     def __init__(self, stream_bus: RedisStreamMessageBus, *, group: str = "market-agent-workers") -> None:
         if type(stream_bus) is not RedisStreamMessageBus or not group.strip():
             raise ValueError("Redis message adapter requires a stream bus and consumer group")
         self._bus = stream_bus
         self._group = group
-        self._consumer = "consumer-" + sha256(f"{stream_bus._prefix}:{group}".encode("utf-8")).hexdigest()[:24]
+        # A consumer name must be process/instance unique.  Reusing a stable
+        # name makes two workers steal one another's pending entries and turns
+        # a horizontal deployment into an accidental single consumer.
+        self._consumer = (
+            "consumer-"
+            + sha256(f"{stream_bus._prefix}:{group}".encode("utf-8")).hexdigest()[:16]
+            + "-"
+            + uuid.uuid4().hex[:16]
+        )
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._health_lock = threading.Lock()
         self._consumer_failures: dict[str, str] = {}
+
+    @property
+    def durable_dispatch(self) -> bool:
+        """Whether the adapter can be used as the task dispatch transport."""
+
+        return True
+
+    @property
+    def consumer_name(self) -> str:
+        return self._consumer
 
     def publish(self, message: MessageEnvelope) -> None:
         self._bus.publish(message)
@@ -416,7 +492,7 @@ class RedisMessageBusAdapter:
             self._RETRY_MAX_SECONDS,
             self._RETRY_BASE_SECONDS * (2 ** min(failures - 1, 16)),
         )
-        return random.uniform(exponential / 2.0, exponential)
+        return self._jitter.uniform(exponential / 2.0, exponential)
 
     def _wait_for_retry(self, local_stop: threading.Event, delay_seconds: float) -> bool:
         remaining = delay_seconds

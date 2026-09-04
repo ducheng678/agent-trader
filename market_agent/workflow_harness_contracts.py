@@ -451,6 +451,9 @@ class HarnessSessionView(ContractModel):
     plan_revision: NonNegativeInt = 0
     run_id: ShortText | None = None
     trace_id: ShortText | None = None
+    request_digest: Digest | None = None
+    prompt_release_digest: Digest | None = None
+    accepted_result_digest: Digest | None = None
     run_state: RunState | None = None
     outcome: HarnessOutcome | None = None
     work_item_states: tuple[tuple[ShortText, WorkItemState], ...] = ()

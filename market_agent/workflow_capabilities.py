@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from hashlib import sha256
+import hmac
+import json
 import math
 import re
 import secrets
+import time
 from threading import RLock
 from typing import Callable, Literal, NoReturn
 
@@ -35,6 +39,7 @@ _RESERVED_AUTHORITY = frozenset(
     }
 )
 _STATE_WRITE_PREFIXES = ("invocation.", "ephemeral.")
+Clock = Callable[[], float]
 
 
 def _is_reserved_authority(value: str) -> bool:
@@ -117,7 +122,90 @@ class CapabilityAuthorization:
     expires_at: float
 
 
-Clock = Callable[[], float]
+class SignedCapabilityVerifier:
+    """Small stateless verifier for host-issued administrative capabilities.
+
+    The API never treats the bearer API token as an admin authority.  A host
+    explicitly mints a short-lived, tenant/trace-bound token and the verifier
+    checks its signature, scope, action and expiry on every request.  This is
+    deliberately provider-neutral; a deployment may replace it with a KMS
+    backed issuer without changing the API contract.
+    """
+
+    _MAX_TOKEN_BYTES = 4096
+
+    def __init__(self, secret: str, *, clock: Clock = time.time) -> None:
+        if type(secret) is not str or len(secret.encode("utf-8")) < 32:
+            raise ValueError("admin capability secret must be at least 32 bytes")
+        self._secret = secret.encode("utf-8")
+        self._clock = clock
+
+    def issue(self, *, scope: CapabilityScope, actions: tuple[str, ...], ttl_seconds: float) -> str:
+        if type(scope) is not CapabilityScope:
+            raise TypeError("capability scope must be an exact CapabilityScope")
+        if not actions or len(actions) != len(set(actions)):
+            raise ValueError("admin capability actions must be non-empty and unique")
+        if any(_is_reserved_authority(action) for action in actions):
+            raise ValueError("admin capability actions cannot use reserved authorities")
+        if not math.isfinite(ttl_seconds) or not 0.0 < ttl_seconds <= _MAX_GRANT_SECONDS:
+            raise ValueError("admin capability lifetime is outside the permitted bound")
+        now = float(self._clock())
+        if not math.isfinite(now):
+            raise ValueError("capability clock returned an invalid time")
+        payload = {
+            "scope": scope.model_dump(mode="json"),
+            "actions": tuple(sorted(actions)),
+            "iat": now,
+            "exp": now + ttl_seconds,
+        }
+        body = _b64(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        return body + "." + _b64(hmac.new(self._secret, body.encode("ascii"), sha256).digest())
+
+    def authorize(self, token: str, *, scope: CapabilityScope, action: str) -> CapabilityAuthorization:
+        if type(scope) is not CapabilityScope or type(action) is not str or not action.strip():
+            raise CapabilityDeniedError(CapabilityDenial(
+                code="invalid_admin_capability", kind="service", resource=str(action), scope=scope,
+            ))
+        if type(token) is not str or len(token.encode("utf-8")) > self._MAX_TOKEN_BYTES:
+            raise CapabilityDeniedError(CapabilityDenial(
+                code="invalid_admin_capability", kind="service", resource=action, scope=scope,
+            ))
+        try:
+            body, signature = token.split(".", 1)
+            expected = hmac.new(self._secret, body.encode("ascii"), sha256).digest()
+            if not hmac.compare_digest(_unb64(signature), expected):
+                raise ValueError
+            payload = json.loads(_unb64(body).decode("utf-8"))
+            issued_scope = CapabilityScope.model_validate(payload["scope"])
+            actions = tuple(payload["actions"])
+            issued_at, expires_at = float(payload["iat"]), float(payload["exp"])
+        except Exception as error:
+            raise CapabilityDeniedError(CapabilityDenial(
+                code="invalid_admin_capability", kind="service", resource=action, scope=scope,
+            )) from error
+        now = float(self._clock())
+        if (issued_scope != scope or action not in actions or not math.isfinite(now)
+                or now < issued_at or now >= expires_at or expires_at - issued_at > _MAX_GRANT_SECONDS):
+            raise CapabilityDeniedError(CapabilityDenial(
+                code="admin_capability_scope_or_expiry", kind="service", resource=action,
+                scope=scope,
+            ))
+        return CapabilityAuthorization(
+            grant_id=sha256(token.encode("utf-8")).hexdigest(), kind="service", resource=action,
+            scope=scope, authorized_at=now, expires_at=expires_at,
+        )
+
+
+def _b64(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _unb64(value: str) -> bytes:
+    if type(value) is not str or not value or len(value) > 4096:
+        raise ValueError("invalid capability encoding")
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
 CredentialFactory = Callable[[], str]
 
 

@@ -12,6 +12,7 @@ from market_agent.workflow_agent_driver import AgentDriver
 from market_agent.workflow_agents.common import JsonContractSchema
 from market_agent.workflow_contracts import ContextSummary, Digest, ShortText, Text
 from market_agent.workflow_prompt_release import PromptRelease, canonical_json
+from market_agent.workflow_prompt_config import WorkflowPromptPin
 
 
 CheckCode = Literal["schema_valid", "numeric_consistency", "direction_consistency", "evidence_support", "uncertainty_consistency", "risk_invariants"]
@@ -82,19 +83,29 @@ def reflection_release() -> PromptRelease:
 
 
 def run_reflection(request: ReflectionRequest, driver: AgentDriver, *, deadline_epoch: float,
-                   cost_limit_usd: float, grant: object, authorize: Callable) -> ObjectiveReview:
+                   cost_limit_usd: float, grant: object, authorize: Callable,
+                   prompt_pin: WorkflowPromptPin | None = None,
+                   cancellation_check: Callable[[], bool] = lambda: False) -> ObjectiveReview:
     request = ReflectionRequest.model_validate(request)
+    if cancellation_check():
+        raise RuntimeError("reflection cancelled")
     if grant is None or not callable(authorize):
         raise PermissionError("reflection requires a host-issued grant")
     authorize(request, grant)
-    release, schema = reflection_release(), reflection_output_schema()
+    schema = reflection_output_schema()
+    release = (prompt_pin.component(PROMPT_PROFILE_ID, schema.digest).release
+               if prompt_pin is not None else reflection_release())
     invocation = AgentInvocation(trace_id=request.trace_id, run_id=request.evidence_summary.workflow_id,
         task_id=request.task_id, task_kind="extract", prompt_release_id=release.release_id,
+        execution_node="reflect",
         prompt_release_digest=release.digest, allowed_model_tier=ModelTier.LUNA,
         deadline_epoch=deadline_epoch, max_attempts=1, cost_limit_usd=cost_limit_usd,
         output_schema_id=schema.schema_id, output_schema_digest=schema.digest,
         user_payload=request.model_dump(mode="json"))
-    result = driver.execute(invocation)
+    if cancellation_check():
+        raise RuntimeError("reflection cancelled")
+    result = driver.execute(invocation, prompt_pin=prompt_pin,
+                            cancellation_check=cancellation_check)
     if result.failure is not None or result.trace_id != request.trace_id:
         raise ValueError("objective reflection is unavailable")
     output = ReflectionOutput.model_validate_json(canonical_json(result.output))
@@ -168,7 +179,17 @@ def _checks(target: BaseModel, output_model: type[BaseModel], context: ContextSu
         checks["evidence_support"] = ObjectiveCheck(code="evidence_support", status="fail", evidence_ids=tuple(sorted(known))[:20])
     entry, stop, action = payload.get("entry_price"), payload.get("stop_price"), payload.get("action")
     if entry is not None and stop is not None and ((action == "long" and stop >= entry) or (action == "short" and stop <= entry)):
-        checks["numeric_consistency"] = ObjectiveCheck(code="numeric_consistency", status="fail", field_paths=("/stop_price",))
+        checks["numeric_consistency"] = ObjectiveCheck(
+            code="numeric_consistency",
+            status="fail",
+            field_paths=(
+                "/action",
+                "/execute_now",
+                "/entry_price",
+                "/stop_price",
+                "/observation_scenario",
+            ),
+        )
     if payload.get("knowledge_status") == "insufficient" and action not in (None, "no_trade"):
         checks["uncertainty_consistency"] = ObjectiveCheck(code="uncertainty_consistency", status="fail", field_paths=("/action",))
     return tuple(checks[code] for code in _REQUIRED)
@@ -181,7 +202,16 @@ def reflect_output(target: BaseModel, *, target_kind: CoreKind, context: Context
     model = output_model or type(target)
     local = _checks(target, model, context)
     payload = _payload(target)
-    request = ReflectionRequest(trace_id=context.trace_id, task_id=context.task_id, target_kind=target_kind,
+    # The verification call is a distinct durable action.  It cannot reuse the
+    # decision task identity, otherwise a checkpoint would be unable to bind
+    # the decision and its one permitted reflection attempt independently.
+    reflection_task_id = "reflection-" + _hash({
+        "workflow_id": context.workflow_id,
+        "decision_task_id": context.task_id,
+        "target_kind": target_kind,
+        "target_hash": _hash(payload),
+    })[:48]
+    request = ReflectionRequest(trace_id=context.trace_id, task_id=reflection_task_id, target_kind=target_kind,
         target_hash=_hash(payload), output_schema_hash=_hash(model.model_json_schema()),
         target_json=canonical_json(payload), evidence_summary=context, deterministic_checks=local)
     available = False
@@ -297,7 +327,8 @@ def correct_output(target: BaseModel, reflection: ReflectionResult, *, task_summ
                    generate_patch: Callable[[CorrectionContext], CorrectionPatch],
                    generate_rewrite: Callable[[CorrectionContext], BaseModel],
                    reflect: Callable[[BaseModel], ReflectionResult], allowed_paths: tuple[str, ...],
-                   output_model: type[BaseModel] | None = None) -> CorrectionOutcome:
+                   output_model: type[BaseModel] | None = None,
+                   cancellation_check: Callable[[], bool] = lambda: False) -> CorrectionOutcome:
     reflection = ReflectionResult.model_validate(reflection)
     if reflection.target_hash != _hash(_payload(target)):
         raise ValueError("correction target mismatch")
@@ -309,22 +340,40 @@ def correct_output(target: BaseModel, reflection: ReflectionResult, *, task_summ
             output_json=canonical_json(_payload(current)) if review.disposition == "accept" else None,
             seen_hashes=tuple(seen), final_reflection=review)
     for ordinal, mode in enumerate(("patch", "rewrite"), 1):
+        if cancellation_check():
+            break
         context = build_correction_context(current, review, task_summary=task_summary, retry_ordinal=ordinal)
         modes.append(mode)
         try:
             if mode == "patch":
-                candidate = apply_correction_patch(current, generate_patch(context), allowed_paths=tuple(set(allowed_paths) & set(context.field_paths)), output_model=output_model)
+                reported_paths = set(context.field_paths)
+                bounded_paths = tuple(
+                    path for path in allowed_paths if path in reported_paths
+                )
+                candidate = apply_correction_patch(
+                    current,
+                    generate_patch(context),
+                    allowed_paths=bounded_paths,
+                    output_model=output_model,
+                )
             else:
                 candidate = generate_rewrite(context)
                 candidate = (output_model or type(target)).model_validate_json(canonical_json(_payload(candidate)), strict=True, extra="forbid")
         except Exception:
             continue
         try:
+            if cancellation_check():
+                break
             next_review = ReflectionResult.model_validate(reflect(candidate))
         except Exception:
             break
         digest = _hash(_payload(candidate))
         if not _improves(current, candidate, review, next_review, set(seen)):
+            # One rewrite is the explicit fallback after a patch cannot make
+            # objective progress.  A rewrite that also fails terminates here;
+            # no correction loop is possible.
+            if mode == "patch":
+                continue
             break
         seen.append(digest)
         current, review = candidate, next_review

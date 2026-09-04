@@ -17,6 +17,7 @@ from market_agent.workflow_harness import HarnessKernel
 class HarnessHostBindings:
     kernel: HarnessKernel
     completion_candidate_factory: CompletionCandidateFactory | None = None
+    admin_capability_verifier: object | None = None
 
 
 def _load_factory(reference: str) -> Callable[[], HarnessHostBindings]:
@@ -43,4 +44,5 @@ def create_governed_app_from_environment(
         settings=resolved,
         harness_kernel=bindings.kernel,
         completion_candidate_factory=bindings.completion_candidate_factory,
+        admin_capability_verifier=bindings.admin_capability_verifier,
     )

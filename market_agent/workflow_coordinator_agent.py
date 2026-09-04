@@ -13,6 +13,7 @@ from market_agent.workflow_agent_driver import AgentDriver
 from market_agent.workflow_agents.common import checked_context, profile_for, run_node
 from market_agent.workflow_context_summary import ContextHandoff
 from market_agent.workflow_memory_retrieval import CoreExperienceSummary
+from market_agent.workflow_prompt_config import WorkflowPromptPin
 from market_agent.workflow_contracts import (
     Action, AgentReport, AgentTask, ContextSummary, CoordinatorPlan, DecisionDraft,
     InformationalAnswer, KnowledgeStatus, ModelTier, ReportStatus, RiskAssessment,
@@ -111,6 +112,8 @@ def dispatch_tasks(plan: CoordinatorPlan, contexts: Mapping[str, ContextSummary 
                    memory_context: CoreExperienceSummary | None = None,
                    memory_tenant_id: str | None = None,
                    memory_scope: str | None = None,
+                   prompt_pin: WorkflowPromptPin | None = None,
+                   execution_node: str = "dispatch",
                    cancellation_check: Callable[[], bool] = lambda: False) -> tuple:
     bound = bind_contexts(plan, contexts)
     specs = tuple(DispatchSpec(task, checked_context(task, contexts[task.task_id]), grants[task.task_id]) for task in bound.tasks)
@@ -129,6 +132,8 @@ def dispatch_tasks(plan: CoordinatorPlan, contexts: Mapping[str, ContextSummary 
                                   memory_context=memory_context,
                                   memory_tenant_id=memory_tenant_id,
                                   memory_scope=memory_scope,
+                                  prompt_pin=prompt_pin,
+                                  execution_node=execution_node,
                                   cancellation_check=cancellation_check)
             else:
                 report = driver(spec)

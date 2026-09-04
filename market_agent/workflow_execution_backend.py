@@ -354,6 +354,28 @@ def verify_committed_execution_snapshot(snapshot: object) -> bool:
         return False
 
 
+def verify_committed_transition_receipt(receipt: object) -> bool:
+    """Verify one exact transition receipt against the compiled trust root."""
+
+    try:
+        before = _fresh_receipt(receipt)
+        payload = _canonical_bytes(before)
+        verifier = _load_pinned_execution_receipt_verifier()
+        verified = (
+            verifier.verify(before)
+            and verifier.verify(before.pre)
+            and verifier.verify(before.post)
+        )
+        after = _fresh_receipt(before)
+        return (
+            type(verified) is bool
+            and verified
+            and _canonical_bytes(after) == payload
+        )
+    except Exception:
+        return False
+
+
 _ROUTE_CAPABILITY = object()
 
 

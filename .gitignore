@@ -40,6 +40,7 @@ runtime/
 web_trade/runtime/
 *.log
 *.jsonl
+!config/local_knowledge.jsonl
 *.pid
 *.sock
 *.sqlite3

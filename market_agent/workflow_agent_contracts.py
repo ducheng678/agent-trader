@@ -65,6 +65,10 @@ class AgentInvocation(StrictModel):
     run_id: ShortText = "run"
     task_id: ShortText = "task"
     task_kind: ShortText = "extract"
+    execution_node: Literal[
+        "plan", "dispatch", "recover", "decide", "reflect", "risk", "assemble"
+    ] = "dispatch"
+    pricing_band: Literal["short", "long"] = "short"
     prompt_release_id: ShortText = "default"
     prompt_release_digest: Digest = "0" * 64
     allowed_model_tier: ModelTier = ModelTier.LUNA
@@ -92,9 +96,24 @@ class AgentInvocation(StrictModel):
 
 class AgentUsage(StrictModel):
     input_tokens: NonNegativeInt
+    cached_input_tokens: NonNegativeInt = 0
+    cache_write_tokens: NonNegativeInt = 0
     output_tokens: NonNegativeInt
+    web_search_tool_calls: NonNegativeInt = 0
     cost_usd: NonNegativeFinite
     model_tier: ModelTier
+    provider: ShortText = "model-adapter"
+    provider_request_id: ShortText | None = None
+    model_id: ShortText | None = None
+    pricing_version: ShortText = "reservation-v1"
+    pricing_model_id: Literal["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"] | None = None
+    pricing_band: Literal["short", "long"] | None = None
+
+    @model_validator(mode="after")
+    def validate_cached_tokens(self) -> AgentUsage:
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("cached input tokens cannot exceed input tokens")
+        return self
 
 
 class AgentFailure(StrictModel):

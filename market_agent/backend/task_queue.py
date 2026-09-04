@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -41,6 +42,7 @@ class BackgroundTaskQueue:
         queue_capacity: int,
         default_max_attempts: int,
         retry_delay_seconds: float,
+        trace_observability: Any = None,
     ) -> None:
         worker_count = int(max_workers)
         waiting_capacity = int(queue_capacity)
@@ -59,7 +61,11 @@ class BackgroundTaskQueue:
         self._repository = repository
         self._cache = cache
         self._message_bus = message_bus
+        self._durable_dispatch = bool(getattr(message_bus, "durable_dispatch", False))
+        self._dispatch_unsubscribe: Callable[[], None] | None = None
+        self._reserved_dispatch_ids: set[str] = set()
         self._metrics = metrics
+        self._trace_observability = trace_observability
         self._default_max_attempts = attempt_limit
         self._retry_delay_seconds = retry_delay
         self._handlers: dict[str, TaskHandler] = {}
@@ -93,6 +99,10 @@ class BackgroundTaskQueue:
             if normalized_name in self._handlers:
                 raise ValueError(f"task handler already registered: {normalized_name}")
             self._handlers[normalized_name] = handler
+            if self._durable_dispatch and self._dispatch_unsubscribe is None:
+                self._dispatch_unsubscribe = self._message_bus.subscribe(
+                    "task.dispatch", self._handle_dispatch_message
+                )
         self._start_recovery(normalized_name, handler)
 
     def _start_recovery(self, task_name: str, handler: TaskHandler) -> None:
@@ -165,7 +175,11 @@ class BackgroundTaskQueue:
                                 "task_recovery_queued",
                                 {"attempt_count": job.attempt_count, "reason": "worker_restart"},
                             )
-                        self._submit_reserved(job, handler)
+                        if self._durable_dispatch:
+                            self._reserved_dispatch_ids.add(job.job_id)
+                            self._publish_dispatch(job)
+                        else:
+                            self._submit_reserved(job, handler)
                         release_capacity = False
                         self._metrics.increment("market_agent_task_recovered_total", labels={"task_name": task_name})
             except Exception as exc:
@@ -232,7 +246,12 @@ class BackgroundTaskQueue:
                 if reused:
                     self._metrics.increment("market_agent_task_idempotency_reused_total", labels={"task_name": normalized_name})
                     return TaskSubmission(job=job, reused=True)
-                self._submit_reserved(job, handler)
+                if self._durable_dispatch:
+                    with self._active_jobs_changed:
+                        self._reserved_dispatch_ids.add(job.job_id)
+                    self._publish_dispatch(job)
+                else:
+                    self._submit_reserved(job, handler)
                 release_capacity = False
             self._metrics.increment("market_agent_task_submitted_total", labels={"task_name": normalized_name})
             return TaskSubmission(job=job, reused=False)
@@ -267,6 +286,74 @@ class BackgroundTaskQueue:
         with self._futures_lock:
             self._futures.add(future)
         future.add_done_callback(lambda completed, submitted_job=job: self._task_done(completed, submitted_job))
+
+    def _publish_dispatch(self, job: JobRecord) -> None:
+        """Publish an immutable job envelope to the durable worker stream."""
+
+        trace_id = str(job.payload.get("trace_id") or job.request_id or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", trace_id) or not int(trace_id, 16):
+            raise DependencyUnavailableError(
+                "durable task dispatch requires a nonzero trace_id"
+            )
+        self._message_bus.publish(
+            MessageEnvelope(
+                topic="task.dispatch",
+                payload={
+                    "trace_id": trace_id,
+                    "task_name": job.task_name,
+                    "job_id": job.job_id,
+                    "request_id": job.request_id,
+                    "payload": dict(job.payload),
+                    "attempt_count": job.attempt_count,
+                    "max_attempts": job.max_attempts,
+                },
+                request_id=job.request_id or trace_id,
+                job_id=job.job_id,
+            )
+        )
+        self._metrics.increment(
+            "market_agent_task_dispatch_published_total",
+            labels={"task_name": job.task_name},
+        )
+
+    def _handle_dispatch_message(self, message: MessageEnvelope) -> None:
+        """Consume a Redis task envelope and schedule it exactly once locally.
+
+        Redis acknowledges the envelope after this method returns.  The job
+        repository remains the idempotent source of truth, so an ack before a
+        process crash is recovered from the accepted/running job projection.
+        """
+
+        if message.topic != "task.dispatch" or not isinstance(message.payload, dict):
+            return
+        task_name = message.payload.get("task_name")
+        job_id = message.payload.get("job_id")
+        if not isinstance(task_name, str) or not isinstance(job_id, str):
+            raise ValueError("task dispatch envelope is malformed")
+        with self._handlers_lock:
+            handler = self._handlers.get(task_name)
+        if handler is None:
+            raise UnknownTaskError(f"unknown task: {task_name}")
+        job = self._repository.get_job(job_id)
+        if job is None or job.status in {"succeeded", "failed"}:
+            return
+        reserved = False
+        with self._active_jobs_changed:
+            if job_id in self._reserved_dispatch_ids:
+                self._reserved_dispatch_ids.remove(job_id)
+                reserved = True
+        if not reserved:
+            # A different process may have published the job.  Backpressure is
+            # still enforced; failure leaves the stream entry pending so the
+            # next reclaim cycle can retry it.
+            if not self._capacity.acquire(timeout=1.0):
+                raise TaskQueueFullError("task worker capacity is temporarily exhausted")
+        try:
+            self._submit_reserved(job, handler)
+        except Exception:
+            if not reserved:
+                self._capacity.release()
+            raise
 
     def _task_done(self, future: Future[Any], job: JobRecord) -> None:
         unexpected = None
@@ -311,8 +398,10 @@ class BackgroundTaskQueue:
 
     def _publish(self, topic: str, job: JobRecord, payload: dict[str, Any]) -> None:
         try:
+            message_payload = dict(payload)
+            message_payload.setdefault("trace_id", job.payload.get("trace_id") or job.request_id)
             self._message_bus.publish(
-                MessageEnvelope(topic=topic, payload=payload, request_id=job.request_id, job_id=job.job_id)
+                MessageEnvelope(topic=topic, payload=message_payload, request_id=job.request_id, job_id=job.job_id)
             )
         except Exception as exc:
             self._logger.error(
@@ -363,6 +452,7 @@ class BackgroundTaskQueue:
         with request_context(job.request_id, job.job_id):
             for attempt in range(max(1, job.attempt_count + 1), job.max_attempts + 1):
                 running = self._repository.mark_running(job.job_id, attempt)
+                self._record_trace(job, "queue_started", "started", attempt=attempt)
                 self._publish("task.started", running, {"task_name": running.task_name, "attempt": attempt})
                 started_at = time.perf_counter()
                 try:
@@ -378,6 +468,7 @@ class BackgroundTaskQueue:
                         )
                         self._metrics.increment("market_agent_task_retry_total", labels={"task_name": job.task_name})
                         self._publish("task.retry_scheduled", retrying, {"attempt": attempt, "error": error})
+                        self._record_trace(job, "retry_scheduled", "started", attempt=attempt, reason="provider_error")
                         delay = self._retry_delay_seconds * (2 ** (attempt - 1))
                         if delay > 0 and self._shutdown_event.wait(delay):
                             self._repository.mark_failed(
@@ -389,6 +480,7 @@ class BackgroundTaskQueue:
                     failed = self._repository.mark_failed(job.job_id, error)
                     self._metrics.increment("market_agent_task_failed_total", labels={"task_name": job.task_name})
                     self._publish("task.failed", failed, error)
+                    self._record_trace(job, "queue_failed", "failed", attempt=attempt, reason="provider_error")
                     self._logger.error(
                         "background task failed",
                         exc_info=(type(exc), exc, exc.__traceback__),
@@ -399,13 +491,34 @@ class BackgroundTaskQueue:
                 self._metrics.observe("market_agent_task_duration_seconds", duration, labels={"task_name": job.task_name})
                 self._metrics.increment("market_agent_task_succeeded_total", labels={"task_name": job.task_name})
                 self._publish("task.succeeded", succeeded, {"result": result})
+                self._record_trace(job, "queue_completed", "succeeded", attempt=attempt)
                 return
+
+    def _record_trace(self, job: JobRecord, event: str, status: str, *, attempt: int = 0, reason: str = "none") -> None:
+        observer = self._trace_observability
+        trace_id = str(job.payload.get("trace_id") or job.request_id or "")
+        if observer is None or not re.fullmatch(r"[0-9a-fA-F]{32}", trace_id) or not int(trace_id, 16):
+            return
+        try:
+            from market_agent.workflow_tracing import TraceContext
+            from hashlib import sha256
+            span = sha256(f"queue:{job.job_id}:{attempt}:{event}".encode("utf-8")).hexdigest()[:16]
+            observer.record_component(
+                TraceContext(trace_id=trace_id.lower(), span_id=span), event=event,
+                status=status, component="queue", workflow_id=job.job_id,
+                task_id=job.task_name, attempt=attempt, reason=reason,
+            )
+        except Exception:
+            self._metrics.increment("market_agent_observability_failures_total", labels={"phase": "queue"})
 
     def is_healthy(self) -> bool:
         return not self._shutdown_event.is_set()
 
     def shutdown(self, wait: bool = True) -> None:
         self._shutdown_event.set()
+        if self._dispatch_unsubscribe is not None:
+            self._dispatch_unsubscribe()
+            self._dispatch_unsubscribe = None
         with self._active_jobs_changed:
             self._active_jobs_changed.notify_all()
         with self._recovery_threads_lock:

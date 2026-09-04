@@ -5,9 +5,11 @@ from __future__ import annotations
 # ``workflow_harness_contracts`` and are intentionally not re-exported here.
 
 from enum import Enum
+from hashlib import sha256
+import json
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, JsonValue, StrictBool, StrictFloat, StrictInt, StringConstraints, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, JsonValue, PlainSerializer, StrictBool, StrictFloat, StrictInt, StringConstraints, field_validator, model_validator
 
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
@@ -37,6 +39,16 @@ class FrozenDict(dict[str, JsonValue]):
         return FrozenDict(self)
 
 
+def thaw_json(value: object) -> object:
+    """Restore frozen JSON values before Pydantic validates a model again."""
+
+    if isinstance(value, dict):
+        return {str(key): thaw_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [thaw_json(item) for item in value]
+    return value
+
+
 def freeze_json(value: JsonValue) -> JsonValue:
     if isinstance(value, dict):
         return FrozenDict({key: freeze_json(item) for key, item in value.items()})
@@ -45,7 +57,12 @@ def freeze_json(value: JsonValue) -> JsonValue:
     return value
 
 
-FrozenJsonMapping = Annotated[dict[str, JsonValue], AfterValidator(freeze_json)]
+FrozenJsonMapping = Annotated[
+    dict[str, JsonValue],
+    BeforeValidator(thaw_json),
+    AfterValidator(freeze_json),
+    PlainSerializer(thaw_json, return_type=dict, when_used="always"),
+]
 
 
 class ContractModel(BaseModel):
@@ -184,6 +201,32 @@ class WorkflowRequest(ContractModel):
         if isinstance(value, list):
             return tuple(value)
         return value
+
+
+def canonical_workflow_request_digest(request: WorkflowRequest) -> str:
+    """Bind the complete validated ingress request to canonical JSON bytes."""
+
+    request = WorkflowRequest.model_validate(request)
+    payload = json.dumps(
+        request.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
+
+
+def canonical_workflow_result_digest(result: WorkflowResult) -> str:
+    """Bind the complete validated workflow result to canonical JSON bytes."""
+
+    result = WorkflowResult.model_validate(result)
+    payload = json.dumps(
+        result.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
 
 
 class SourceFact(ContractModel):

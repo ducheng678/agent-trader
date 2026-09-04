@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
 
 from market_agent.backend.cache import TTLCache
-from market_agent.backend.database import JobRepository
+from market_agent.backend.database import JobRepository, PostgresJobRepository
 from market_agent.backend.message_bus import InMemoryMessageBus
 from market_agent.backend.observability import MetricsRegistry, configure_structured_logging
 from market_agent.backend.settings import BackendSettings
@@ -35,6 +36,9 @@ class BackendContainer:
     harness_completion_candidate_factory: Any = None
     prompt_release_manager: Any = None
     cancellation_registry: WorkflowCancellationRegistry | None = None
+    admin_capability_verifier: Any = None
+    local_knowledge_base: Any = None
+    audit_writer: Any = None
 
     def __post_init__(self) -> None:
         if self.cancellation_registry is None:
@@ -61,12 +65,28 @@ class BackendContainer:
         harness_kernel: Any = None,
         harness_application: Any = None,
         harness_completion_candidate_factory: Any = None,
+        admin_capability_verifier: Any = None,
     ) -> "BackendContainer":
         resolved_settings = (settings or BackendSettings.from_env()).validate()
         configure_structured_logging()
-        repository = JobRepository(resolved_settings.database_path)
+        repository: Any = JobRepository(resolved_settings.database_path)
+        if resolved_settings.postgres_dsn:
+            try:
+                import psycopg
+                repository = PostgresJobRepository(
+                    lambda: psycopg.connect(resolved_settings.postgres_dsn)
+                )
+                repository.migrate()
+            except Exception as error:
+                if resolved_settings.environment in {"production", "prod", "staging"}:
+                    raise RuntimeError("configured PostgreSQL job backend is unavailable") from error
         cache: Any = TTLCache(resolved_settings.cache_max_entries, resolved_settings.cache_default_ttl_seconds)
         metrics = MetricsRegistry()
+        trace_observability = observability or BackendObservability.create(
+            event_capacity=resolved_settings.trace_event_capacity,
+            maximum_query=resolved_settings.trace_query_limit,
+            maximum_metric_series=resolved_settings.workflow_metric_series_limit,
+        )
         message_bus: Any = InMemoryMessageBus()
         if resolved_settings.redis_url:
             try:
@@ -74,6 +94,7 @@ class BackendContainer:
                 from market_agent.backend.redis_adapters import (
                     RedisMessageBusAdapter,
                     RedisJobCache,
+                    RedisAuditWriter,
                     RedisStreamMessageBus,
                     RedisTenantCache,
                 )
@@ -96,7 +117,15 @@ class BackendContainer:
             queue_capacity=resolved_settings.task_queue_capacity,
             default_max_attempts=resolved_settings.task_max_attempts,
             retry_delay_seconds=resolved_settings.task_retry_delay_seconds,
+            trace_observability=trace_observability,
         )
+        if admin_capability_verifier is None and resolved_settings.admin_capability_secret:
+            from market_agent.workflow_capabilities import SignedCapabilityVerifier
+            admin_capability_verifier = SignedCapabilityVerifier(
+                resolved_settings.admin_capability_secret
+            )
+        if admin_capability_verifier is not None and not callable(getattr(admin_capability_verifier, "authorize", None)):
+            raise TypeError("admin capability verifier must expose authorize")
         container = cls(
             settings=resolved_settings,
             repository=repository,
@@ -104,11 +133,16 @@ class BackendContainer:
             message_bus=message_bus,
             metrics=metrics,
             task_queue=task_queue,
-            observability=observability,
+            observability=trace_observability,
             harness_kernel=harness_kernel,
             harness_application=harness_application,
             harness_completion_candidate_factory=harness_completion_candidate_factory,
             cancellation_registry=WorkflowCancellationRegistry(),
+            admin_capability_verifier=admin_capability_verifier,
+            audit_writer=(
+                RedisAuditWriter(getattr(message_bus, "_bus"))
+                if resolved_settings.redis_url and hasattr(message_bus, "_bus") else None
+            ),
         )
         try:
             from market_agent.backend.memory_maintenance import MemoryMaintenanceScheduler
@@ -116,6 +150,7 @@ class BackendContainer:
             from market_agent.workflow_memory_lifecycle import LifecycleWorker
             from market_agent.workflow_memory_sqlite import SQLiteMemoryRepository
             from market_agent.workflow_prompt_config import default_prompt_manager
+            from market_agent.local_knowledge_base import LocalKnowledgeBase
 
             memory_authority = object()
             container.memory_authority = memory_authority
@@ -157,11 +192,27 @@ class BackendContainer:
             container.prompt_release_manager = default_prompt_manager(
                 registry_path=resolved_settings.prompt_registry_path,
                 git_root=Path(__file__).resolve().parents[2],
+                audit_hook=(
+                    __import__("market_agent.backend.redis_adapters", fromlist=["RedisPromptActivationMirror"])
+                    .RedisPromptActivationMirror(getattr(message_bus, "_bus"))
+                    if resolved_settings.redis_url and hasattr(message_bus, "_bus") else None
+                ),
                 metric_hook=lambda activation, _pin: container.metrics.increment(
                     "market_agent_prompt_release_actions_total",
                     labels={"action": activation.action},
                 ),
             )
+            try:
+                knowledge_path = resolved_settings.local_knowledge_path
+                if not knowledge_path.is_absolute():
+                    knowledge_path = Path(__file__).resolve().parents[2] / knowledge_path
+                container.local_knowledge_base = LocalKnowledgeBase.from_jsonl(
+                    knowledge_path
+                )
+            except FileNotFoundError:
+                # The local provider is optional in development.  Production
+                # readiness reports the missing configured provider explicitly.
+                container.local_knowledge_base = LocalKnowledgeBase()
 
             def application_factory():
                 from market_agent.workflow_production_application import ProductionWorkflowApplication
@@ -181,6 +232,9 @@ class BackendContainer:
                     historical_answer_cache=container.historical_answer_cache,
                     prompt_release_manager=container.prompt_release_manager,
                     completion_hook=result_writer.record,
+                    local_knowledge_base=container.local_knowledge_base,
+                    trace_observability=container.observability,
+                    audit_writer=container.audit_writer,
                 )
 
             if container.harness_kernel is not None and container.harness_application is None:
@@ -192,6 +246,11 @@ class BackendContainer:
                     run_workflow=lambda request: production_application.run_workflow(
                         request,
                         cancellation_signal=container.cancellation_registry.signal(request.workflow_id),
+                    ),
+                    run_observed_workflow=lambda request, checkpoint_sink: production_application.execute_workflow(
+                        request,
+                        cancellation_signal=container.cancellation_registry.signal(request.workflow_id),
+                        checkpoint_sink=checkpoint_sink,
                     ),
                     completion_candidate_factory=container.harness_completion_candidate_factory,
                     accepted_result_committer=production_application.commit_accepted_result,
@@ -235,7 +294,26 @@ class BackendContainer:
         components = {"database": database_status, "task_queue": task_queue_status,
                       "cache": cache_status, "message_bus": bus_status}
         if self.settings.postgres_dsn:
-            components["postgres"] = "ok" if self.governed_memory_repository is not None else "failed"
+            components["postgres"] = self._probe_postgres()
+        if self.settings.environment in {"production", "prod", "staging"}:
+            components["redis"] = self._probe_redis()
+            components["prompt_registry"] = self._probe_prompt_registry()
+            components["prompt_activation_state"] = (
+                "ok" if self._probe_prompt_registry() == "ok" and self._probe_redis() == "ok" else "failed"
+            )
+            components["model_configuration"] = self._probe_model_configuration()
+            components["local_knowledge"] = (
+                "ok" if bool(getattr(self.local_knowledge_base, "configured", False)) else "failed"
+            )
+            components["completion_evidence_issuer"] = (
+                "ok" if callable(self.harness_completion_candidate_factory) else "failed"
+            )
+            audit_health = getattr(self.audit_writer, "healthy", False)
+            components["audit_state"] = "ok" if audit_health else "failed"
+            components["shared_job_state"] = "ok" if isinstance(self.repository, PostgresJobRepository) else "failed"
+            components["admin_capability"] = (
+                "ok" if self.admin_capability_verifier is not None else "failed"
+            )
         if self.settings.environment in {"production", "prod", "staging"}:
             components["harness"] = (
                 "ok"
@@ -243,6 +321,50 @@ class BackendContainer:
                 else "failed"
             )
         return components
+
+    def _probe_redis(self) -> str:
+        health = getattr(self.message_bus, "health", lambda: None)()
+        return "ok" if getattr(health, "status", "failed") == "ok" else "failed"
+
+    def _probe_postgres(self) -> str:
+        repository = self.governed_memory_repository
+        probe = getattr(repository, "healthcheck", None)
+        if callable(probe):
+            try:
+                return "ok" if probe() else "failed"
+            except Exception:
+                return "failed"
+        return "ok" if repository is not None else "failed"
+
+    def _probe_prompt_registry(self) -> str:
+        manager = self.prompt_release_manager
+        try:
+            return "ok" if manager is not None and manager.current() is not None else "failed"
+        except Exception:
+            return "failed"
+
+    def _probe_model_configuration(self) -> str:
+        api_key = str(os.getenv("OPENAI_API_KEY", "") or "").strip()
+        model_ids = (
+            self.settings.workflow_sol_model_id,
+            self.settings.workflow_terra_model_id,
+            self.settings.workflow_luna_model_id,
+            self.settings.embedding_model_id,
+        )
+        versions = (
+            self.settings.workflow_sol_model_version,
+            self.settings.workflow_terra_model_version,
+            self.settings.workflow_luna_model_version,
+            self.settings.embedding_model_version,
+            self.settings.embedding_vector_version,
+            self.settings.prompt_cache_namespace,
+        )
+        return (
+            "ok"
+            if api_key
+            and all(isinstance(value, str) and value.strip() for value in model_ids + versions)
+            else "failed"
+        )
 
     def shutdown(self) -> None:
         self.task_queue.shutdown(wait=True)

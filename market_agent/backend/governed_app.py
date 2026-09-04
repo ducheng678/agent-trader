@@ -23,6 +23,7 @@ def create_governed_app(
     *,
     harness_kernel: HarnessKernel,
     completion_candidate_factory: CompletionCandidateFactory | None = None,
+    admin_capability_verifier: object | None = None,
     settings: BackendSettings | None = None,
 ) -> FastAPI:
     """Build an API whose workflow path is tied to one trusted Harness host.
@@ -39,5 +40,6 @@ def create_governed_app(
         settings=settings,
         harness_kernel=harness_kernel,
         harness_completion_candidate_factory=completion_candidate_factory,
+        admin_capability_verifier=admin_capability_verifier,
     )
     return create_app(container)

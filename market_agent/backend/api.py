@@ -45,6 +45,7 @@ from market_agent.backend.errors import (
 )
 from market_agent.backend.observability import current_request_id, request_context
 from market_agent.workflow_tracing import TraceContext, TraceId
+from market_agent.workflow_capabilities import CapabilityScope, CapabilityDeniedError
 from market_agent.workflow_contracts import WorkflowRequest, WorkflowResult
 from market_agent.workflow_execution_backend import ExecutionRegistrationError
 from market_agent.workflow_harness import InvalidHarnessInputError, UnknownHarnessRunError
@@ -263,6 +264,26 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
             raise DependencyUnavailableError("prompt release manager is not configured")
         return manager
 
+    def require_admin_capability(request: Request, action: str) -> None:
+        """Require a separate, scoped admin grant for mutating operations."""
+
+        if resolved_container.settings.environment not in {"production", "prod", "staging"}:
+            return
+        verifier = getattr(resolved_container, "admin_capability_verifier", None)
+        token = request.headers.get("X-Admin-Capability")
+        if verifier is None or not token:
+            raise AuthorizationError("scoped admin capability required")
+        scope = CapabilityScope(
+            actor_id=request.headers.get("X-Agent-ID", "admin-api"),
+            task_id="admin-api",
+            tenant_id=resolved_container.settings.tenant_id,
+            trace_id=get_request_trace(request).trace_id,
+        )
+        try:
+            verifier.authorize(token, scope=scope, action=action)
+        except CapabilityDeniedError as error:
+            raise AuthorizationError("scoped admin capability denied") from error
+
     def prompt_release_response(manager: Any) -> PromptReleaseResponse:
         pin = manager.current()
         return PromptReleaseResponse(
@@ -329,7 +350,8 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
         return prompt_release_response(require_prompt_manager())
 
     @app.post("/v1/prompt-releases/{release_id}:activate", response_model=PromptReleaseActivationResponse, tags=["prompts"])
-    def activate_prompt_release(release_id: str, _: None = Depends(require_api_token)) -> PromptReleaseActivationResponse:
+    def activate_prompt_release(request: Request, release_id: str, _: None = Depends(require_api_token)) -> PromptReleaseActivationResponse:
+        require_admin_capability(request, "prompt.activate")
         manager = require_prompt_manager()
         activation = manager.activate(release_id)
         current = prompt_release_response(manager)
@@ -337,7 +359,8 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
                                                previous_release_id=activation.previous_release_id)
 
     @app.post("/v1/prompt-releases:rollback", response_model=PromptReleaseActivationResponse, tags=["prompts"])
-    def rollback_prompt_release(_: None = Depends(require_api_token)) -> PromptReleaseActivationResponse:
+    def rollback_prompt_release(request: Request, _: None = Depends(require_api_token)) -> PromptReleaseActivationResponse:
+        require_admin_capability(request, "prompt.rollback")
         manager = require_prompt_manager()
         activation = manager.rollback_previous()
         current = prompt_release_response(manager)
@@ -455,7 +478,8 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
         return workflow_status(view, job)
 
     @app.post("/v1/workflows/{run_id}:cancel", response_model=WorkflowStatusResponse, tags=["workflows"])
-    def cancel_workflow(run_id: str, _: None = Depends(require_api_token)) -> WorkflowStatusResponse:
+    def cancel_workflow(request: Request, run_id: str, _: None = Depends(require_api_token)) -> WorkflowStatusResponse:
+        require_admin_capability(request, "workflow.cancel")
         kernel = require_harness()
         resolved_container.cancellation_registry.cancel(run_id)
         kernel.cancel(run_id, "api_cancellation")
@@ -515,7 +539,7 @@ def create_app(container: BackendContainer | None = None) -> FastAPI:
                   limit: int = Query(default=100, ge=1, le=500),
                   _: None = Depends(require_api_token)) -> TraceQueryResponse:
         try:
-            page = resolved_container.observability.sink.query(trace_id, after_sequence=after_sequence, limit=limit)
+            page = resolved_container.observability.query(trace_id, after_sequence=after_sequence, limit=limit)
         except Exception:
             raise DependencyUnavailableError("trace query storage is unavailable") from None
         return TraceQueryResponse(trace_id=trace_id,
