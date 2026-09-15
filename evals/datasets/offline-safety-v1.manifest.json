@@ -1,0 +1,12 @@
+{
+  "case_count": 10,
+  "corpus_file": "offline-safety-v1.jsonl",
+  "corpus_sha256": "20622e59a75539798c045356a6230465decb8d979b928a2a243a85791fecc9fb",
+  "dataset_id": "offline-safety-seed-v1",
+  "dataset_version": "v1",
+  "manifest_hash": "dec9193c31107eeb31f6ee9fd00ebb4c3044f33906fde673287f118284678228",
+  "schema_file": "../schema/evaluation-case-v1.schema.json",
+  "schema_sha256": "0183da35fc432b77b2a4260850288170301ffd792894c94db8f3f53cddbddfff",
+  "schema_version": "evaluation-dataset-v1",
+  "split": "holdout"
+}

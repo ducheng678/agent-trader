@@ -1,0 +1,36 @@
+{
+  "snapshots": [
+    {
+      "primary_position": {
+        "account_address": "0x1111111111111111111111111111111111111111",
+        "symbol": "xyz:SKHX",
+        "size": "100",
+        "margin_used_usd": "2200"
+      },
+      "hedge_account": {
+        "position": {
+          "account_address": "0x2222222222222222222222222222222222222222",
+          "symbol": "xyz:SKHX",
+          "size": "0"
+        },
+        "withdrawable_usd": "50000",
+        "taker_fee_rate": "0.00009",
+        "fee_rate_source": "official_hip3_fee_formula",
+        "hip3_fee_formula_verified": true,
+        "account_kind": "subaccount",
+        "ownership_verified": true,
+        "margin_available_verified": true
+      },
+      "funding": {
+        "symbol": "xyz:SKHX",
+        "oracle_price": "212.50",
+        "mark_price": "212.55",
+        "funding_rate": "0.002",
+        "observed_at": "2026-07-10T12:58:25Z",
+        "next_funding_at": "2026-07-10T13:00:00Z",
+        "size_decimals": 3,
+        "market_data_available": true
+      }
+    }
+  ]
+}
