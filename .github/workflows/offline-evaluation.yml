@@ -14,13 +14,14 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Run versioned offline quality gate
+      # Public CI has no host-owned model executor or release credentials.
+      # Recorded fixtures are regression inputs, never a release decision.
+      - name: Verify versioned offline fixtures (non-release)
         run: >-
-          python -m market_agent.evaluation_cli
+          python -m market_agent.evaluation_fixture_cli
           --manifest evals/datasets/offline-safety-v1.manifest.json
-          --code-revision "${{ github.sha }}"
-          --prompt-release-hash
-          0000000000000000000000000000000000000000000000000000000000000000
-          --model-policy-hash
-          0000000000000000000000000000000000000000000000000000000000000000
-          --allow-missing-baseline
+      - name: Verify executed release-gate contract
+        run: >-
+          python -m pytest -q
+          market_agent_test_bundle/tests/test_executed_evaluation.py
+          market_agent_test_bundle/tests/test_evaluation_fixture_cli.py

@@ -32,6 +32,18 @@ passive event-judgment -> conditional technical-pricing flow.
 Existing `OPENAI_*` environment variables, startup commands, JSON Schemas,
 and `DiscretionaryLLMEngine` callers remain compatible.
 
+## Offline evaluation
+
+The push/PR workflow checks the committed recorded dataset and scoring code.
+It does not run the agent or approve a release. The output explicitly reports
+release_eligible=false. Public CI cannot run a host-attested evaluation without
+a configured workflow executor, prompt authority, and model credentials.
+
+For a real release decision, run market_agent.evaluation_cli with
+--execution-mode executed, an explicit --executor-factory, and the current
+host-attested code revision, prompt-release hash, and model-policy hash.
+Recorded results are always rejected by the release gate.
+
 ## Install
 
 Use Python 3.11+.
